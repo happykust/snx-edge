@@ -1,0 +1,3 @@
+[submodule "vendor/snx-rs"]
+	path = vendor/snx-rs
+	url = https://github.com/ancwrd1/snx-rs.git
