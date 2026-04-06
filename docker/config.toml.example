@@ -1,0 +1,33 @@
+[api]
+listen = "0.0.0.0:8080"
+# tls_cert = "/etc/snx-edge/tls/server.crt"
+# tls_key = "/etc/snx-edge/tls/server.key"
+# tls_client_ca = "/etc/snx-edge/tls/ca.crt"  # enables mTLS
+
+[auth]
+jwt_secret_env = "SNX_EDGE_JWT_SECRET"
+user_db = "/var/lib/snx-edge/users.db"
+max_login_attempts = 5
+lockout_duration_minutes = 15
+access_token_ttl_minutes = 15
+refresh_token_ttl_days = 7
+
+[routeros]
+host_env = "ROUTEROS_HOST"
+user_env = "ROUTEROS_USER"
+password_env = "ROUTEROS_PASSWORD"
+tls_skip_verify = false
+comment_tag = "managed-by=snx-edge"
+address_list_vpn = "vpn-clients"
+address_list_bypass = "vpn-bypass"
+routing_table = "vpn-route"
+connection_mark = "vpn-conn"
+routing_mark = "vpn-route"
+auto_setup = false
+
+[logging]
+level = "info"
+buffer_size = 10000
+# file = "/var/log/snx-edge/snx-edge.log"
+max_file_size = "10MB"
+max_files = 3
