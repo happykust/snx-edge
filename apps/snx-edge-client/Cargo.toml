@@ -1,0 +1,41 @@
+[package]
+name = "snx-edge-client"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Tray application for remote management of snx-edge-server"
+
+[dependencies]
+# Async runtime
+tokio.workspace = true
+
+# HTTP + SSE
+reqwest.workspace = true
+reqwest-eventsource.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+
+# GUI
+gtk4.workspace = true
+libadwaita.workspace = true
+ksni.workspace = true
+
+# Auth
+keyring.workspace = true
+chrono.workspace = true
+
+# Logging
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# Utils
+anyhow.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+futures-util.workspace = true
+base64.workspace = true
+dirs-next.workspace = true
