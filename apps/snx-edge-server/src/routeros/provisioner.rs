@@ -34,8 +34,8 @@ impl<'a> Provisioner<'a> {
         // 5. Kill switch: blackhole route
         self.ensure_killswitch(tag).await?;
 
-        // 6. DNS redirect for vpn-clients (UDP + TCP)
-        self.ensure_dns_redirect(tag).await?;
+        // 6. DNS dst-nat for vpn-clients (UDP + TCP) → container
+        self.ensure_dns_redirect(container_ip, tag).await?;
 
         // 7. Block DoT port 853
         self.ensure_dot_block(tag).await?;
@@ -246,7 +246,7 @@ impl<'a> Provisioner<'a> {
         Ok(())
     }
 
-    async fn ensure_dns_redirect(&self, tag: &str) -> Result<(), AppError> {
+    async fn ensure_dns_redirect(&self, container_ip: &str, tag: &str) -> Result<(), AppError> {
         let existing: Vec<NatRule> = self.client.list_managed("/ip/firewall/nat").await?;
         for proto in ["udp", "tcp"] {
             if existing.iter().any(|r| {
@@ -259,7 +259,8 @@ impl<'a> Provisioner<'a> {
                 "src-address-list": self.config.address_list_vpn,
                 "dst-port": "53",
                 "protocol": proto,
-                "action": "redirect",
+                "action": "dst-nat",
+                "to-addresses": container_ip,
                 "comment": tag,
             });
             let _: serde_json::Value = self.client.create("/ip/firewall/nat", &body).await?;
