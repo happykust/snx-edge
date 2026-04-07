@@ -71,6 +71,8 @@ pub struct VpnConfig {
     pub mtu: u16,
     #[serde(default = "default_transport_type")]
     pub transport_type: String,
+    #[serde(default = "default_no_keychain")]
+    pub no_keychain: bool,
 }
 
 fn default_login_type() -> String { "password".to_string() }
@@ -79,6 +81,7 @@ fn default_password_factor() -> u32 { 1 }
 fn default_ike_lifetime() -> u32 { 28800 }
 fn default_mtu() -> u16 { 1350 }
 fn default_transport_type() -> String { "auto".to_string() }
+fn default_no_keychain() -> bool { true }
 
 // === API response types (our own, serializable) ===
 
@@ -136,7 +139,7 @@ pub struct TunnelStatus {
 
 // === Conversion from snxcore types ===
 
-fn map_connection_info(info: &snxcore::model::ConnectionInfo) -> ConnectionInfo {
+fn map_connection_info(info: &snxcore::model::ConnectionInfo, mtu: u16) -> ConnectionInfo {
     ConnectionInfo {
         since: info.since.map(|dt| dt.to_utc()),
         server_name: info.server_name.clone(),
@@ -152,7 +155,7 @@ fn map_connection_info(info: &snxcore::model::ConnectionInfo) -> ConnectionInfo 
             .map(|d| d.to_string())
             .collect(),
         interface_name: info.interface_name.clone(),
-        mtu: 0,
+        mtu,
     }
 }
 
@@ -211,6 +214,7 @@ pub fn build_tunnel_params(vpn: &VpnConfig) -> snxcore::model::params::TunnelPar
     params.no_keepalive = vpn.no_keepalive;
     params.port_knock = vpn.port_knock;
     params.mtu = vpn.mtu;
+    params.keychain = !vpn.no_keychain;
 
     params.log_level = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
 
@@ -231,6 +235,8 @@ pub struct TunnelManager {
     /// Server name from the last connect attempt (used by GET /server/info
     /// when the tunnel is disconnected).
     last_server: Arc<RwLock<Option<String>>>,
+    /// MTU from the last connect config (snxcore doesn't expose it in ConnectionInfo).
+    last_mtu: Arc<RwLock<u16>>,
 }
 
 impl TunnelManager {
@@ -244,6 +250,7 @@ impl TunnelManager {
             tx_bytes: Arc::new(Mutex::new(0)),
             rx_bytes: Arc::new(Mutex::new(0)),
             last_server: Arc::new(RwLock::new(None)),
+            last_mtu: Arc::new(RwLock::new(default_mtu())),
         }
     }
 
@@ -280,6 +287,7 @@ impl TunnelManager {
         if !vpn_config.server.is_empty() {
             *self.last_server.write().await = Some(vpn_config.server.clone());
         }
+        *self.last_mtu.write().await = vpn_config.mtu;
 
         let params = Arc::new(build_tunnel_params(vpn_config));
 
@@ -348,6 +356,7 @@ impl TunnelManager {
         let connector = self.connector.clone();
         let broadcast_tx = self.event_tx.clone();
         let session_ref = self.session.clone();
+        let mtu = *self.last_mtu.read().await;
 
         tokio::spawn(async move {
             while let Some(event) = evt_rx.recv().await {
@@ -371,7 +380,7 @@ impl TunnelManager {
                 match event {
                     TunnelEvent::Connected(info) => {
                         *status.write().await =
-                            ConnectionStatus::Connected(map_connection_info(&info));
+                            ConnectionStatus::Connected(map_connection_info(&info, mtu));
                         let _ = broadcast_tx.send(ServerEvent::ConnectionStatus {
                             status: "connected".to_string(),
                         });
