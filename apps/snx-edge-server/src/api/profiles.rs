@@ -64,8 +64,8 @@ async fn list_profiles(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<Vec<ProfileResponse>>, AppError> {
-    if !has_permission(&claims, "config.read") {
-        return Err(AppError::Forbidden("permission 'config.read' required".to_string()));
+    if !has_permission(&claims, "profiles.read") {
+        return Err(AppError::Forbidden("permission 'profiles.read' required".to_string()));
     }
 
     let profiles = state.db.list_profiles().await?;
@@ -78,8 +78,8 @@ async fn create_profile(
     Extension(claims): Extension<Claims>,
     Json(req): Json<CreateProfileRequest>,
 ) -> Result<(StatusCode, Json<ProfileResponse>), AppError> {
-    if !has_permission(&claims, "config.write") {
-        return Err(AppError::Forbidden("permission 'config.write' required".to_string()));
+    if !has_permission(&claims, "profiles.write") {
+        return Err(AppError::Forbidden("permission 'profiles.write' required".to_string()));
     }
 
     // Validate required fields
@@ -102,8 +102,8 @@ async fn get_profile(
     Extension(claims): Extension<Claims>,
     Path(id): Path<String>,
 ) -> Result<Json<ProfileResponse>, AppError> {
-    if !has_permission(&claims, "config.read") {
-        return Err(AppError::Forbidden("permission 'config.read' required".to_string()));
+    if !has_permission(&claims, "profiles.read") {
+        return Err(AppError::Forbidden("permission 'profiles.read' required".to_string()));
     }
 
     let profile = state.db.get_profile(&id).await?;
@@ -117,8 +117,8 @@ async fn update_profile(
     Path(id): Path<String>,
     Json(req): Json<UpdateProfileRequest>,
 ) -> Result<Json<ProfileResponse>, AppError> {
-    if !has_permission(&claims, "config.write") {
-        return Err(AppError::Forbidden("permission 'config.write' required".to_string()));
+    if !has_permission(&claims, "profiles.write") {
+        return Err(AppError::Forbidden("permission 'profiles.write' required".to_string()));
     }
 
     // Handle secret fields: if "***" keep current value
@@ -163,8 +163,8 @@ async fn upload_certs(
     Path(id): Path<String>,
     mut multipart: Multipart,
 ) -> Result<Json<ProfileResponse>, AppError> {
-    if !has_permission(&claims, "config.write") {
-        return Err(AppError::Forbidden("permission 'config.write' required".to_string()));
+    if !has_permission(&claims, "profiles.write") {
+        return Err(AppError::Forbidden("permission 'profiles.write' required".to_string()));
     }
 
     // Verify profile exists
@@ -249,8 +249,8 @@ async fn export_profile(
     Extension(claims): Extension<Claims>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    if !has_permission(&claims, "config.read") {
-        return Err(AppError::Forbidden("permission 'config.read' required".to_string()));
+    if !has_permission(&claims, "profiles.read") {
+        return Err(AppError::Forbidden("permission 'profiles.read' required".to_string()));
     }
 
     let profile = state.db.get_profile(&id).await?;
@@ -275,8 +275,8 @@ async fn import_profile(
     Extension(claims): Extension<Claims>,
     Json(req): Json<CreateProfileRequest>,
 ) -> Result<(StatusCode, Json<ProfileResponse>), AppError> {
-    if !has_permission(&claims, "config.write") {
-        return Err(AppError::Forbidden("permission 'config.write' required".to_string()));
+    if !has_permission(&claims, "profiles.write") {
+        return Err(AppError::Forbidden("permission 'profiles.write' required".to_string()));
     }
 
     let profile = state.db.create_profile(&req.name, &req.config).await?;
@@ -289,8 +289,8 @@ async fn delete_profile(
     Extension(claims): Extension<Claims>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, AppError> {
-    if !has_permission(&claims, "config.write") {
-        return Err(AppError::Forbidden("permission 'config.write' required".to_string()));
+    if !has_permission(&claims, "profiles.write") {
+        return Err(AppError::Forbidden("permission 'profiles.write' required".to_string()));
     }
 
     state.db.delete_profile(&id).await?;

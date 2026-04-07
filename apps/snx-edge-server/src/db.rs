@@ -493,6 +493,7 @@ impl UserDb {
             "admin" => vec![
                 "tunnel.*",
                 "config.*",
+                "profiles.*",
                 "routing.*",
                 "routing.setup",
                 "routing.teardown",
@@ -504,6 +505,7 @@ impl UserDb {
                 "tunnel.disconnect",
                 "tunnel.status",
                 "config.read",
+                "profiles.read",
                 "routing.clients.*",
                 "routing.bypass.*",
                 "routing.diagnostics",
@@ -512,6 +514,7 @@ impl UserDb {
             "viewer" => vec![
                 "tunnel.status",
                 "config.read",
+                "profiles.read",
                 "routing.read",
                 "logs.read",
             ],
