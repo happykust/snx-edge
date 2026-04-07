@@ -228,6 +228,9 @@ pub struct TunnelManager {
     event_tx: broadcast::Sender<ServerEvent>,
     tx_bytes: Arc<Mutex<u64>>,
     rx_bytes: Arc<Mutex<u64>>,
+    /// Server name from the last connect attempt (used by GET /server/info
+    /// when the tunnel is disconnected).
+    last_server: Arc<RwLock<Option<String>>>,
 }
 
 impl TunnelManager {
@@ -240,6 +243,7 @@ impl TunnelManager {
             event_tx,
             tx_bytes: Arc::new(Mutex::new(0)),
             rx_bytes: Arc::new(Mutex::new(0)),
+            last_server: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -270,6 +274,11 @@ impl TunnelManager {
                 anyhow::bail!("already connected or connecting");
             }
             *status = ConnectionStatus::Connecting;
+        }
+
+        // Remember the server for GET /server/info when disconnected.
+        if !vpn_config.server.is_empty() {
+            *self.last_server.write().await = Some(vpn_config.server.clone());
         }
 
         let params = Arc::new(build_tunnel_params(vpn_config));
@@ -456,6 +465,20 @@ impl TunnelManager {
         let params = build_tunnel_params(vpn_config);
         let info = snxcore::server_info::get(&params).await?;
         Ok(serde_json::to_value(&info)?)
+    }
+
+    /// Return the server name of the current (or last) connection.
+    ///
+    /// Prefers the server from an active `Connected` status; falls back to the
+    /// server remembered from the most recent `connect()` call.
+    pub async fn current_server(&self) -> Option<String> {
+        let status = self.status.read().await;
+        if let ConnectionStatus::Connected(ref info) = *status {
+            return Some(info.server_name.clone());
+        }
+        drop(status);
+
+        self.last_server.read().await.clone()
     }
 
     pub async fn routes(&self) -> Vec<VpnRoute> {

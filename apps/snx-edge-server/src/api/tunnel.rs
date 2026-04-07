@@ -115,6 +115,37 @@ async fn status(
     Ok(Json(state.tunnel.status().await))
 }
 
+/// GET /api/v1/server/info — return info about the current (or last) VPN server.
+async fn server_info_current(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    if !has_permission(&claims, "tunnel.status") {
+        return Err(AppError::Forbidden(
+            "permission 'tunnel.status' required".to_string(),
+        ));
+    }
+
+    let server = state
+        .tunnel
+        .current_server()
+        .await
+        .ok_or_else(|| AppError::NotFound("no server available; connect first or use POST with a server address".to_string()))?;
+
+    let vpn_config = VpnConfig {
+        server,
+        ..VpnConfig::default()
+    };
+
+    let info = state
+        .tunnel
+        .server_info(&vpn_config)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    Ok(Json(info))
+}
+
 /// POST /api/v1/server/info — query Check Point server capabilities.
 async fn server_info(
     State(state): State<AppState>,
@@ -183,6 +214,6 @@ pub fn routes() -> Router<AppState> {
         .route("/tunnel/reconnect", post(reconnect))
         .route("/tunnel/status", get(status))
         .route("/tunnel/challenge", post(challenge))
-        .route("/server/info", post(server_info))
+        .route("/server/info", get(server_info_current).post(server_info))
         .route("/routes", get(vpn_routes))
 }
