@@ -202,14 +202,22 @@ async fn main() -> anyhow::Result<()> {
                     }
                     TrayEvent::Routing => {
                         let api = ctx.api.clone();
-                        glib::idle_add_once(move || {
-                            windows::routing::show_routing_window(api);
+                        let auth = ctx.auth.clone();
+                        glib::spawn_future_local(async move {
+                            let role = auth.role().await.unwrap_or_else(|| "viewer".to_string());
+                            windows::routing::show_routing_window(api, &role);
                         });
                     }
                     TrayEvent::Users => {
                         let api = ctx.api.clone();
-                        glib::idle_add_once(move || {
-                            windows::users::show_users_window(api);
+                        let auth = ctx.auth.clone();
+                        glib::spawn_future_local(async move {
+                            let role = auth.role().await.unwrap_or_else(|| "viewer".to_string());
+                            if role != "admin" {
+                                let _ = show_notification("Access Denied", "Admin access required").await;
+                                return;
+                            }
+                            windows::users::show_users_window(api, &role);
                         });
                     }
                     TrayEvent::Servers => {
@@ -617,8 +625,14 @@ async fn do_disconnect(ctx: &AppContext) {
 
 fn do_about() {
     glib::idle_add_once(|| {
+        // NOTE: AboutWindow is deprecated since libadwaita 1.5 in favor of AboutDialog,
+        // but AboutDialog requires the v1_5 feature flag which is not enabled.
+        // When upgrading to v1_5+, replace with:
+        //   libadwaita::AboutDialog::builder()...build().present(Some(&main_window()));
+        let parent = main_window();
         let about = libadwaita::AboutWindow::builder()
-            .transient_for(&main_window())
+            .transient_for(&parent)
+            .modal(true)
             .application_name("snx-edge")
             .application_icon("network-vpn")
             .version(env!("CARGO_PKG_VERSION"))

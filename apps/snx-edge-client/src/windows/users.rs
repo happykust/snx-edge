@@ -7,7 +7,23 @@ use gtk4::{
 use crate::{api::ApiClient, get_window, main_window, set_window};
 
 /// Show the user management window.
-pub fn show_users_window(api: ApiClient) {
+/// Only admin users are allowed to open this window.
+pub fn show_users_window(api: ApiClient, role: &str) {
+    if role != "admin" {
+        // Non-admin users cannot manage users — show an error
+        let alert = gtk4::AlertDialog::builder()
+            .message("Access Denied")
+            .detail("User management requires admin privileges.")
+            .buttons(["OK"].as_slice())
+            .default_button(0)
+            .build();
+        let parent = get_window("main");
+        glib::spawn_future_local(async move {
+            let _ = alert.choose_future(parent.as_ref()).await;
+        });
+        return;
+    }
+
     if let Some(window) = get_window("users") {
         window.present();
         return;

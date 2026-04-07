@@ -197,6 +197,21 @@ fn append_server_row(
             settings.active_server = Some(idx);
             let _ = settings.save();
             reload_servers(&list_box_ref);
+
+            // Notify user that a restart is required
+            let list_box_ref2 = list_box_ref.clone();
+            glib::spawn_future_local(async move {
+                let parent = list_box_ref2
+                    .root()
+                    .and_then(|r| r.downcast::<gtk4::Window>().ok());
+                let alert = gtk4::AlertDialog::builder()
+                    .message("Server Changed")
+                    .detail("Server changed. Please restart the application to connect to the new server.")
+                    .buttons(["OK"].as_slice())
+                    .default_button(0)
+                    .build();
+                let _ = alert.choose_future(parent.as_ref()).await;
+            });
         });
 
         row_box.append(&default_btn);

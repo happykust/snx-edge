@@ -1,3 +1,6 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use gtk4::{
     Align, Orientation, WrapMode,
     glib::{self, clone},
@@ -111,7 +114,13 @@ pub fn show_logs_window(api: ApiClient) {
     window.add_controller(key_controller);
 
     window.set_child(Some(&outer));
-    window.connect_close_request(|_| {
+
+    // SSE cancellation flag — set when window is closed
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let stop_flag_close = stop_flag.clone();
+
+    window.connect_close_request(move |_| {
+        stop_flag_close.store(true, Ordering::SeqCst);
         set_window("logs", None::<gtk4::Window>);
         glib::Propagation::Proceed
     });
@@ -141,12 +150,12 @@ pub fn show_logs_window(api: ApiClient) {
         });
     });
 
-    // Start SSE streaming
+    // Start SSE streaming with cancellation support
     let api_sse = api.clone();
     let text_view_sse = text_view.clone();
     let scrolled_sse = scrolled.clone();
     let level_dropdown_sse = level_dropdown.clone();
-    start_sse_stream(api_sse, text_view_sse, scrolled_sse, level_dropdown_sse);
+    start_sse_stream(api_sse, text_view_sse, scrolled_sse, level_dropdown_sse, stop_flag);
 
     window.present();
 }
@@ -158,12 +167,12 @@ async fn load_history(
     level_dropdown: &gtk4::DropDown,
 ) {
     let level = selected_level(level_dropdown);
+    let level_param = if level == "all" { None } else { Some(level.clone()) };
 
     let (tx, rx) = async_channel::bounded(1);
     let api2 = api.clone();
-    let level2 = level.clone();
     tokio::spawn(async move {
-        let _ = tx.send(api2.logs_history(200, &level2).await).await;
+        let _ = tx.send(api2.logs_history(200, level_param.as_deref()).await).await;
     });
 
     match rx.recv().await {
@@ -195,14 +204,15 @@ fn start_sse_stream(
     text_view: gtk4::TextView,
     scrolled: gtk4::ScrolledWindow,
     level_dropdown: gtk4::DropDown,
+    stop_flag: Arc<AtomicBool>,
 ) {
     let (tx, rx) = async_channel::unbounded::<String>();
 
-    // SSE reader task
+    // SSE reader task — checks stop_flag and drops tx on exit
     tokio::spawn(async move {
         let base_url = api.base_url().await;
         let token = api.token().await;
-        let url = format!("{}/api/v1/logs/stream", base_url);
+        let url = format!("{}/api/v1/logs", base_url);
 
         let client = reqwest::Client::builder()
             .danger_accept_invalid_certs(true)
@@ -220,6 +230,9 @@ fn start_sse_stream(
         };
 
         while let Some(event) = es.next().await {
+            if stop_flag.load(Ordering::SeqCst) {
+                break;
+            }
             match event {
                 Ok(Event::Message(msg)) => {
                     if tx.send(msg.data).await.is_err() {
@@ -233,6 +246,7 @@ fn start_sse_stream(
                 }
             }
         }
+        // tx is dropped here, causing the rx receiver to finish
     });
 
     // UI updater

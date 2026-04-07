@@ -349,6 +349,9 @@ impl ksni::Tray for KsniTray {
                 activate: Box::new(|tray: &mut KsniTray| tray.send_tray_event(TrayEvent::Servers)),
                 ..Default::default()
             }),
+            // NOTE: Ideally "Users" should only show for admin users, but KSNI
+            // tray menus are static and don't have access to async role checks.
+            // The role check is enforced in main.rs when the event is handled.
             MenuItem::Standard(StandardItem {
                 label: "Users".to_string(),
                 activate: Box::new(|tray: &mut KsniTray| tray.send_tray_event(TrayEvent::Users)),

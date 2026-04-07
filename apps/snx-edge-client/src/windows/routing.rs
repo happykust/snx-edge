@@ -9,7 +9,12 @@ use crate::{api::ApiClient, get_window, main_window, set_window};
 /// Build and show the routing management window.
 /// Two-tab Notebook: "VPN-clients" and "Bypass rules".
 /// Each tab has a list of entries with add/delete, plus bottom action bar.
-pub fn show_routing_window(api: ApiClient) {
+///
+/// `role` controls what actions are visible:
+/// - "viewer": read-only list, no add/delete/setup/teardown buttons
+/// - "operator": add/delete clients/bypass, but no setup/teardown
+/// - "admin": full access
+pub fn show_routing_window(api: ApiClient, role: &str) {
     if let Some(window) = get_window("routing") {
         window.present();
         return;
@@ -29,12 +34,14 @@ pub fn show_routing_window(api: ApiClient) {
     let notebook = gtk4::Notebook::new();
     notebook.set_vexpand(true);
 
+    let can_edit = role != "viewer";
+
     // --- Clients tab ---
-    let clients_page = build_list_tab(api.clone(), ListKind::Clients);
+    let clients_page = build_list_tab(api.clone(), ListKind::Clients, can_edit);
     notebook.append_page(&clients_page, Some(&gtk4::Label::new(Some("VPN Clients"))));
 
     // --- Bypass tab ---
-    let bypass_page = build_list_tab(api.clone(), ListKind::Bypass);
+    let bypass_page = build_list_tab(api.clone(), ListKind::Bypass, can_edit);
     notebook.append_page(&bypass_page, Some(&gtk4::Label::new(Some("Bypass Rules"))));
 
     outer.append(&notebook);
@@ -66,8 +73,11 @@ pub fn show_routing_window(api: ApiClient) {
 
     let close_btn = gtk4::Button::builder().label("Close").build();
 
-    action_bar.append(&setup_btn);
-    action_bar.append(&teardown_btn);
+    // Setup/Teardown only for admin
+    if role == "admin" {
+        action_bar.append(&setup_btn);
+        action_bar.append(&teardown_btn);
+    }
     action_bar.append(&diag_btn);
     action_bar.append(&close_btn);
 
@@ -149,7 +159,7 @@ pub fn show_routing_window(api: ApiClient) {
                     });
                     match rx.recv().await {
                         Ok(Ok(val)) => {
-                            let msg = serde_json::to_string_pretty(&val).unwrap_or_default();
+                            let msg = format_diagnostics(&val);
                             show_info_dialog(&window, "Routing Diagnostics", &msg).await;
                         }
                         Ok(Err(e)) => {
@@ -199,7 +209,7 @@ enum ListKind {
     Bypass,
 }
 
-fn build_list_tab(api: ApiClient, kind: ListKind) -> gtk4::Box {
+fn build_list_tab(api: ApiClient, kind: ListKind, can_edit: bool) -> gtk4::Box {
     let page = gtk4::Box::builder()
         .orientation(Orientation::Vertical)
         .spacing(6)
@@ -228,74 +238,74 @@ fn build_list_tab(api: ApiClient, kind: ListKind) -> gtk4::Box {
         .halign(Align::Start)
         .build();
 
-    let add_btn = gtk4::Button::builder()
-        .label("Add")
-        .css_classes(vec!["suggested-action".to_string()])
-        .build();
-    btn_box.append(&add_btn);
-
-    if kind == ListKind::Clients {
-        let add_my_ip_btn = gtk4::Button::builder()
-            .label("Add My IP")
+    if can_edit {
+        let add_btn = gtk4::Button::builder()
+            .label("Add")
+            .css_classes(vec!["suggested-action".to_string()])
             .build();
-        let api_ip = api.clone();
-        let list_box_ip = list_box.clone();
-        add_my_ip_btn.connect_clicked(move |btn| {
-            btn.set_sensitive(false);
-            let api = api_ip.clone();
-            let list_box = list_box_ip.clone();
-            let btn2 = btn.clone();
-            glib::spawn_future_local(async move {
-                let (tx, rx) = async_channel::bounded(1);
-                let api2 = api.clone();
-                tokio::spawn(async move {
-                    let _ = tx.send(api2.add_routing_client("auto", "Added from client (my IP)").await).await;
+        btn_box.append(&add_btn);
+
+        if kind == ListKind::Clients {
+            let add_my_ip_btn = gtk4::Button::builder()
+                .label("Add My IP")
+                .build();
+            let api_ip = api.clone();
+            let list_box_ip = list_box.clone();
+            add_my_ip_btn.connect_clicked(move |btn| {
+                btn.set_sensitive(false);
+                let api = api_ip.clone();
+                let list_box = list_box_ip.clone();
+                let btn2 = btn.clone();
+                glib::spawn_future_local(async move {
+                    let (tx, rx) = async_channel::bounded(1);
+                    let api2 = api.clone();
+                    tokio::spawn(async move {
+                        let _ = tx.send(api2.add_routing_client("auto", "Added from client (my IP)").await).await;
+                    });
+                    if let Ok(Ok(val)) = rx.recv().await {
+                        let address = val["address"].as_str().unwrap_or("auto").to_string();
+                        let comment = val["comment"].as_str().unwrap_or("").to_string();
+                        let id = val["id"].as_str().unwrap_or("").to_string();
+                        append_list_row(&list_box, &id, &address, &comment, api.clone(), ListKind::Clients, true);
+                    }
+                    btn2.set_sensitive(true);
                 });
-                if let Ok(Ok(val)) = rx.recv().await {
-                    let address = val["address"].as_str().unwrap_or("auto").to_string();
-                    let comment = val["comment"].as_str().unwrap_or("").to_string();
-                    let id = val["id"].as_str().unwrap_or("").to_string();
-                    append_list_row(&list_box, &id, &address, &comment, api.clone(), ListKind::Clients);
+            });
+            btn_box.append(&add_my_ip_btn);
+        }
+
+        // Add button callback
+        let api_add = api.clone();
+        let list_box_add = list_box.clone();
+        add_btn.connect_clicked(move |_| {
+            let api = api_add.clone();
+            let list_box = list_box_add.clone();
+            glib::spawn_future_local(async move {
+                if let Some((address, comment)) = show_add_entry_dialog().await {
+                    let (tx, rx) = async_channel::bounded(1);
+                    let api2 = api.clone();
+                    let address2 = address.clone();
+                    let comment2 = comment.clone();
+                    tokio::spawn(async move {
+                        let result = match kind {
+                            ListKind::Clients => api2.add_routing_client(&address2, &comment2).await,
+                            ListKind::Bypass => api2.add_routing_bypass(&address2, &comment2).await,
+                        };
+                        let _ = tx.send(result).await;
+                    });
+                    if let Ok(Ok(val)) = rx.recv().await {
+                        let id = val["id"].as_str().unwrap_or("").to_string();
+                        let addr = val["address"].as_str().unwrap_or(&address).to_string();
+                        let cmt = val["comment"].as_str().unwrap_or(&comment).to_string();
+                        append_list_row(&list_box, &id, &addr, &cmt, api.clone(), kind, true);
+                    }
                 }
-                btn2.set_sensitive(true);
             });
         });
-        btn_box.append(&add_my_ip_btn);
     }
 
     let refresh_btn = gtk4::Button::builder().label("Refresh").build();
     btn_box.append(&refresh_btn);
-
-    page.append(&btn_box);
-
-    // Add button callback
-    let api_add = api.clone();
-    let list_box_add = list_box.clone();
-    add_btn.connect_clicked(move |_| {
-        let api = api_add.clone();
-        let list_box = list_box_add.clone();
-        glib::spawn_future_local(async move {
-            if let Some((address, comment)) = show_add_entry_dialog().await {
-                let (tx, rx) = async_channel::bounded(1);
-                let api2 = api.clone();
-                let address2 = address.clone();
-                let comment2 = comment.clone();
-                tokio::spawn(async move {
-                    let result = match kind {
-                        ListKind::Clients => api2.add_routing_client(&address2, &comment2).await,
-                        ListKind::Bypass => api2.add_routing_bypass(&address2, &comment2).await,
-                    };
-                    let _ = tx.send(result).await;
-                });
-                if let Ok(Ok(val)) = rx.recv().await {
-                    let id = val["id"].as_str().unwrap_or("").to_string();
-                    let addr = val["address"].as_str().unwrap_or(&address).to_string();
-                    let cmt = val["comment"].as_str().unwrap_or(&comment).to_string();
-                    append_list_row(&list_box, &id, &addr, &cmt, api.clone(), kind);
-                }
-            }
-        });
-    });
 
     // Refresh callback
     let api_refresh = api.clone();
@@ -304,21 +314,23 @@ fn build_list_tab(api: ApiClient, kind: ListKind) -> gtk4::Box {
         let api = api_refresh.clone();
         let list_box = list_box_refresh.clone();
         glib::spawn_future_local(async move {
-            reload_list(&list_box, api, kind).await;
+            reload_list(&list_box, api, kind, can_edit).await;
         });
     });
+
+    page.append(&btn_box);
 
     // Initial load
     let api_init = api.clone();
     let list_box_init = list_box.clone();
     glib::spawn_future_local(async move {
-        reload_list(&list_box_init, api_init, kind).await;
+        reload_list(&list_box_init, api_init, kind, can_edit).await;
     });
 
     page
 }
 
-async fn reload_list(list_box: &gtk4::ListBox, api: ApiClient, kind: ListKind) {
+async fn reload_list(list_box: &gtk4::ListBox, api: ApiClient, kind: ListKind, can_edit: bool) {
     // Clear existing rows
     while let Some(child) = list_box.first_child() {
         list_box.remove(&child);
@@ -339,7 +351,7 @@ async fn reload_list(list_box: &gtk4::ListBox, api: ApiClient, kind: ListKind) {
             let id = item["id"].as_str().unwrap_or("").to_string();
             let address = item["address"].as_str().unwrap_or("").to_string();
             let comment = item["comment"].as_str().unwrap_or("").to_string();
-            append_list_row(list_box, &id, &address, &comment, api.clone(), kind);
+            append_list_row(list_box, &id, &address, &comment, api.clone(), kind, can_edit);
         }
     }
 }
@@ -351,6 +363,7 @@ fn append_list_row(
     comment: &str,
     api: ApiClient,
     kind: ListKind,
+    can_edit: bool,
 ) {
     let row_box = gtk4::Box::builder()
         .orientation(Orientation::Horizontal)
@@ -386,36 +399,38 @@ fn append_list_row(
 
     row_box.append(&labels);
 
-    let delete_btn = gtk4::Button::builder()
-        .icon_name("edit-delete-symbolic")
-        .css_classes(vec!["flat".to_string()])
-        .valign(Align::Center)
-        .build();
+    if can_edit {
+        let delete_btn = gtk4::Button::builder()
+            .icon_name("edit-delete-symbolic")
+            .css_classes(vec!["flat".to_string()])
+            .valign(Align::Center)
+            .build();
 
-    let id_owned = id.to_string();
-    let list_box_ref = list_box.clone();
-    delete_btn.connect_clicked(move |_| {
-        let api = api.clone();
-        let id = id_owned.clone();
-        let list_box = list_box_ref.clone();
-        glib::spawn_future_local(async move {
-            let (tx, rx) = async_channel::bounded(1);
-            let api2 = api.clone();
-            let id2 = id.clone();
-            tokio::spawn(async move {
-                let result = match kind {
-                    ListKind::Clients => api2.remove_routing_client(&id2).await,
-                    ListKind::Bypass => api2.remove_routing_bypass(&id2).await,
-                };
-                let _ = tx.send(result).await;
+        let id_owned = id.to_string();
+        let list_box_ref = list_box.clone();
+        delete_btn.connect_clicked(move |_| {
+            let api = api.clone();
+            let id = id_owned.clone();
+            let list_box = list_box_ref.clone();
+            glib::spawn_future_local(async move {
+                let (tx, rx) = async_channel::bounded(1);
+                let api2 = api.clone();
+                let id2 = id.clone();
+                tokio::spawn(async move {
+                    let result = match kind {
+                        ListKind::Clients => api2.remove_routing_client(&id2).await,
+                        ListKind::Bypass => api2.remove_routing_bypass(&id2).await,
+                    };
+                    let _ = tx.send(result).await;
+                });
+                if let Ok(Ok(())) = rx.recv().await {
+                    reload_list(&list_box, api, kind, can_edit).await;
+                }
             });
-            if let Ok(Ok(())) = rx.recv().await {
-                reload_list(&list_box, api, kind).await;
-            }
         });
-    });
 
-    row_box.append(&delete_btn);
+        row_box.append(&delete_btn);
+    }
 
     let list_row = gtk4::ListBoxRow::builder().child(&row_box).build();
     list_box.append(&list_row);
@@ -505,6 +520,70 @@ async fn show_add_entry_dialog() -> Option<(String, String)> {
 
     window.present();
     rx.recv().await.ok().flatten()
+}
+
+/// Format routing diagnostics JSON as human-readable text.
+fn format_diagnostics(val: &serde_json::Value) -> String {
+    let mut lines = Vec::new();
+
+    // Overall status
+    if let Some(status) = val.get("status").and_then(|v| v.as_str()) {
+        let label = match status {
+            "healthy" | "ok" => "Status: healthy",
+            "degraded" | "warning" => "Status: degraded",
+            "error" | "failed" => "Status: error",
+            other => other,
+        };
+        lines.push(label.to_string());
+        lines.push(String::new());
+    }
+
+    // Check items — handle both array and object formats
+    if let Some(checks) = val.get("checks").and_then(|v| v.as_array()) {
+        for check in checks {
+            let name = check.get("name").and_then(|v| v.as_str()).unwrap_or("check");
+            let ok = check.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+            let detail = check.get("detail").and_then(|v| v.as_str()).unwrap_or("");
+            let icon = if ok { "[ok]" } else { "[FAIL]" };
+            if detail.is_empty() {
+                lines.push(format!("{} {}", icon, name));
+            } else {
+                lines.push(format!("{} {} ({})", icon, name, detail));
+            }
+        }
+    } else if let Some(obj) = val.as_object() {
+        // Flat object: render each key-value pair
+        for (key, value) in obj {
+            if key == "status" {
+                continue; // Already shown above
+            }
+            match value {
+                serde_json::Value::Bool(b) => {
+                    let icon = if *b { "[ok]" } else { "[FAIL]" };
+                    lines.push(format!("{} {}", icon, key));
+                }
+                serde_json::Value::Number(n) => {
+                    lines.push(format!("[ok] {} ({})", key, n));
+                }
+                serde_json::Value::String(s) => {
+                    lines.push(format!("  {}: {}", key, s));
+                }
+                serde_json::Value::Array(arr) => {
+                    lines.push(format!("  {}: {} items", key, arr.len()));
+                }
+                _ => {
+                    lines.push(format!("  {}: {}", key, value));
+                }
+            }
+        }
+    }
+
+    if lines.is_empty() {
+        // Fallback to pretty-printed JSON
+        serde_json::to_string_pretty(val).unwrap_or_default()
+    } else {
+        lines.join("\n")
+    }
 }
 
 async fn show_info_dialog(parent: &gtk4::Window, title: &str, message: &str) {

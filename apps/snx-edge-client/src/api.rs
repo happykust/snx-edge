@@ -138,6 +138,22 @@ impl ApiClient {
         resp.json().await.context("Failed to parse tunnel disconnect response")
     }
 
+    pub async fn tunnel_reconnect(&self) -> anyhow::Result<Value> {
+        let resp = self
+            .request_builder(reqwest::Method::POST, "/api/v1/tunnel/reconnect")
+            .await
+            .send()
+            .await
+            .context("Failed to reconnect tunnel")?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("Tunnel reconnect failed: HTTP {} - {}", status, body);
+        }
+        resp.json().await.context("Failed to parse tunnel reconnect response")
+    }
+
     pub async fn tunnel_status(&self) -> anyhow::Result<Value> {
         let resp = self
             .request_builder(reqwest::Method::GET, "/api/v1/tunnel/status")
@@ -507,14 +523,39 @@ impl ApiClient {
         resp.json().await.context("Failed to parse current user response")
     }
 
+    pub async fn change_my_password(
+        &self,
+        current_password: &str,
+        new_password: &str,
+    ) -> anyhow::Result<()> {
+        let resp = self
+            .request_builder(reqwest::Method::POST, "/api/v1/users/me/password")
+            .await
+            .json(&serde_json::json!({
+                "current_password": current_password,
+                "new_password": new_password,
+            }))
+            .send()
+            .await
+            .context("Failed to change password")?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("Change password failed: HTTP {} - {}", status, body);
+        }
+        Ok(())
+    }
+
     // === Logs ===
 
-    pub async fn logs_history(&self, limit: u32, level: &str) -> anyhow::Result<Vec<Value>> {
+    pub async fn logs_history(&self, limit: u32, level: Option<&str>) -> anyhow::Result<Vec<Value>> {
+        let path = match level {
+            Some(l) => format!("/api/v1/logs/history?limit={}&level={}", limit, l),
+            None => format!("/api/v1/logs/history?limit={}", limit),
+        };
         let resp = self
-            .request_builder(
-                reqwest::Method::GET,
-                &format!("/api/v1/logs/history?limit={}&level={}", limit, level),
-            )
+            .request_builder(reqwest::Method::GET, &path)
             .await
             .send()
             .await
