@@ -1,52 +1,55 @@
-## Stage 1: Build (always x86_64, cross-compiles for target)
-FROM --platform=linux/amd64 rust:alpine AS builder
+ARG ALPINE_VERSION=3.23
 
-ARG TARGETARCH=amd64
-
-# Install build deps + cross-compiler for ARM64 if needed
-RUN apk add --no-cache musl-dev perl make openssl-dev dbus-dev pkgconf git && \
-    if [ "$TARGETARCH" = "arm64" ]; then \
-      apk add --no-cache aarch64-none-elf-gcc || true; \
-      wget -qO- https://musl.cc/aarch64-linux-musl-cross.tgz | tar xz -C /opt; \
-      ln -s /opt/aarch64-linux-musl-cross/bin/aarch64-linux-musl-gcc /usr/local/bin/aarch64-linux-musl-gcc; \
-    fi
-
+# ---- Builder ----
+FROM rust:alpine${ALPINE_VERSION} AS builder
+RUN apk add --no-cache musl-dev perl make linux-headers openssl-dev openssl-libs-static
 WORKDIR /app
-COPY Cargo.toml Cargo.lock ./
-COPY apps/ apps/
-COPY vendor/ vendor/
+COPY . .
+RUN cargo build --release -p snx-edge-server
 
-ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
+# ---- Runtime ----
+FROM alpine:${ALPINE_VERSION}
 
-# Configure linker for cross-compilation
-RUN if [ "$TARGETARCH" = "arm64" ]; then \
-      mkdir -p .cargo && printf '[target.aarch64-unknown-linux-musl]\nlinker = "aarch64-linux-musl-gcc"\n' > .cargo/config.toml; \
-    fi
+RUN apk add --no-cache \
+    ca-certificates \
+    iproute2 \
+    iptables-legacy \
+    ip6tables-legacy \
+    openrc
 
-RUN case "$TARGETARCH" in \
-      arm64) RUST_TARGET="aarch64-unknown-linux-musl" ;; \
-      arm)   RUST_TARGET="armv7-unknown-linux-musleabihf" ;; \
-      *)     RUST_TARGET="x86_64-unknown-linux-musl" ;; \
-    esac && \
-    rustup target add "$RUST_TARGET" && \
-    cargo build --release \
-      --target "$RUST_TARGET" \
-      --features snxcore/vendored-openssl,snxcore/vendored-sqlite \
-      -p snx-edge-server && \
-    cp "target/$RUST_TARGET/release/snx-edge-server" /snx-edge-server && \
-    (strip /snx-edge-server 2>/dev/null || true)
+# iptables-legacy (nftables does not work in MikroTik containers)
+RUN rm -f /usr/sbin/iptables && ln -s /usr/sbin/iptables-legacy /usr/sbin/iptables && \
+    rm -f /usr/sbin/ip6tables && ln -s /usr/sbin/ip6tables-legacy /usr/sbin/ip6tables
 
-## Stage 2: Runtime (target platform)
-FROM alpine:3.21
+# ip_forward
+RUN echo "net.ipv4.ip_forward = 1" >> /etc/sysctl.conf
 
-RUN apk add --no-cache ca-certificates iproute2 iptables
+# OpenRC init (proven pattern from AmneziaWG on MikroTik)
+RUN sed -i 's/^\(tty\d\:\:\)/#\1/' /etc/inittab && \
+    sed -i \
+        -e 's/^#\?rc_env_allow=.*/rc_env_allow="\*"/' \
+        -e 's/^#\?rc_sys=.*/rc_sys="docker"/' \
+        /etc/rc.conf && \
+    sed -i \
+        -e 's/VSERVER/DOCKER/' \
+        -e 's/checkpath -d "$RC_SVCDIR"/mkdir "$RC_SVCDIR"/' \
+        /usr/libexec/rc/sh/init.sh && \
+    rm -f /etc/init.d/hwdrivers /etc/init.d/machine-id && \
+    sed -i 's/^tty/#tty/' /etc/inittab
 
-COPY --from=builder /snx-edge-server /usr/local/bin/snx-edge-server
-COPY docker/config.toml.example /etc/snx-edge/config.toml
+# Install binary
+COPY --from=builder /app/target/release/snx-edge-server /usr/local/bin/
 
-RUN mkdir -p /var/lib/snx-edge /var/log/snx-edge /etc/snx-edge/certs
+# Install OpenRC init script
+COPY docker/snx-edge.initd /etc/init.d/snx-edge
+RUN chmod +x /etc/init.d/snx-edge && rc-update add snx-edge default
+
+# Create required directories
+RUN mkdir -p /etc/snx-edge/profiles /var/lib/snx-edge /var/log/snx-edge
+
+# Example config (copy to config.toml and customize)
+COPY docker/config.toml.example /etc/snx-edge/config.toml.example
 
 EXPOSE 8080
 
-ENTRYPOINT ["snx-edge-server"]
-CMD ["--config", "/etc/snx-edge/config.toml"]
+ENTRYPOINT ["/sbin/init"]

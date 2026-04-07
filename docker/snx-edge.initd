@@ -1,0 +1,28 @@
+#!/sbin/openrc-run
+
+name="snx-edge-server"
+description="SNX Edge VPN Management Server"
+
+command="/usr/local/bin/snx-edge-server"
+command_args="--config /etc/snx-edge/config.toml"
+command_background="yes"
+pidfile="/run/${RC_SVCNAME}.pid"
+output_log="/var/log/snx-edge/stdout.log"
+error_log="/var/log/snx-edge/stderr.log"
+
+depend() {
+    need net
+    after firewall
+}
+
+start_pre() {
+    # Ensure ip_forward is enabled
+    sysctl -w net.ipv4.ip_forward=1 > /dev/null 2>&1
+
+    # Setup iptables masquerade for VPN traffic
+    iptables -t nat -C POSTROUTING -o tun+ -j MASQUERADE 2>/dev/null || \
+        iptables -t nat -A POSTROUTING -o tun+ -j MASQUERADE
+
+    # Ensure required directories exist
+    mkdir -p /var/log/snx-edge /etc/snx-edge/profiles /var/lib/snx-edge
+}
