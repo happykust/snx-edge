@@ -1,585 +1,633 @@
+use std::{cell::RefCell, collections::HashMap, sync::Arc, time::Duration};
+
+use gtk4::{
+    Application, ApplicationWindow, License, Window,
+    glib::{self, clone},
+    prelude::*,
+};
+use tokio::sync::mpsc;
+use tracing::{info, level_filters::LevelFilter, warn};
+
+use crate::{
+    api::ApiClient,
+    auth::AuthManager,
+    client_settings::{ClientSettings, ServerConnection},
+    profiles::ProfileStore,
+    prompt::show_notification,
+    status::show_status_dialog,
+    theme::init_theme_monitoring,
+    tray::{ConnectionState, TrayCommand, TrayEvent},
+};
+
 mod api;
+mod assets;
 mod auth;
+mod client_settings;
+mod dbus;
+mod profiles;
+mod prompt;
 mod settings;
-mod sse;
+mod status;
+mod theme;
 mod tray;
-mod ui;
+mod windows;
 
-use std::sync::Arc;
+pub const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
-use gtk4::prelude::*;
-use libadwaita as adw;
-use libadwaita::prelude::*;
-use tokio::sync::RwLock;
+thread_local! {
+    static WINDOWS: RefCell<HashMap<String, Window>> = RefCell::new(HashMap::new());
+}
 
-use api::ApiClient;
-use auth::AuthManager;
-use settings::ClientSettings;
-use sse::SseManager;
+pub fn main_window() -> ApplicationWindow {
+    get_window("main")
+        .unwrap()
+        .downcast::<ApplicationWindow>()
+        .unwrap()
+}
 
-/// Shared application context available to all UI handlers.
+pub fn get_window(name: &str) -> Option<Window> {
+    WINDOWS.with(|cell| cell.borrow().get(name).cloned())
+}
+
+pub fn set_window<W: Cast + IsA<Window>>(name: &str, window: Option<W>) {
+    WINDOWS.with(|cell| {
+        if let Some(window) = window {
+            cell.borrow_mut()
+                .insert(name.to_string(), window.upcast::<Window>());
+        } else {
+            cell.borrow_mut().remove(name);
+        }
+    });
+}
+
+// === Shared app state ===
+
 #[derive(Clone)]
 pub struct AppContext {
-    pub api: Arc<ApiClient>,
-    pub auth: Arc<AuthManager>,
-    pub settings: Arc<RwLock<ClientSettings>>,
-    pub sse: Arc<SseManager>,
-    pub tray_handle: Arc<RwLock<Option<tray::TrayHandle>>>,
+    pub api: ApiClient,
+    pub auth: AuthManager,
+    pub profile_store: Arc<ProfileStore>,
+    pub settings: Arc<tokio::sync::RwLock<ClientSettings>>,
+    pub tray_cmd: mpsc::Sender<TrayCommand>,
+    pub tray_evt: mpsc::Sender<TrayEvent>,
 }
 
-fn main() {
-    // Initialize tracing
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
-
-    // Create a tokio runtime so that tokio::spawn is available globally.
-    let runtime = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
-    let _guard = runtime.enter();
-
-    let app = adw::Application::builder()
-        .application_id("com.github.happykust.snx-edge-client")
-        .build();
-
-    app.connect_activate(on_activate);
-    app.run();
-}
-
-fn on_activate(app: &adw::Application) {
-    // Guard: if already running, just present the existing window
-    if let Some(window) = app.active_window() {
-        window.present();
-        return;
-    }
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    init_logging();
+    let _ = init_theme_monitoring().await;
 
     let settings = ClientSettings::load();
+    let settings = Arc::new(tokio::sync::RwLock::new(settings));
 
-    // Use the active server URL if available, otherwise start with an empty URL.
-    let initial_url = settings
-        .active()
-        .map(|s| s.url.as_str())
-        .unwrap_or("");
+    let (tray_event_sender, mut tray_event_receiver) = mpsc::channel(16);
 
-    let api = Arc::new(ApiClient::new(initial_url).expect("failed to create API client"));
-    let auth = Arc::new(AuthManager::new(api.clone()));
-    let sse = Arc::new(SseManager::new(
-        api.base_url_handle(),
-        api.token_handle(),
-    ));
+    // Create tray (retries)
+    let mut retry_count = 5;
+    let mut my_tray = loop {
+        match tray::AppTray::new(tray_event_sender.clone(), false).await {
+            Ok(tray) => break tray,
+            Err(e) => {
+                if retry_count == 0 {
+                    anyhow::bail!("Failed to create tray: {}", e);
+                }
+                warn!("Failed to create tray: {}, retrying in 2s", e);
+                retry_count -= 1;
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+    };
+
+    let tray_command_sender = my_tray.sender();
+    tokio::spawn(async move { my_tray.run().await });
+
+    // Dummy API/Auth — will be replaced after login
+    let api = ApiClient::new("http://localhost");
+    let auth = AuthManager::new(api.clone(), "http://localhost");
+    let profile_store = Arc::new(ProfileStore::new());
 
     let ctx = AppContext {
-        api: api.clone(),
-        auth: auth.clone(),
-        settings: Arc::new(RwLock::new(settings.clone())),
-        sse: sse.clone(),
-        tray_handle: Arc::new(RwLock::new(None)),
+        api,
+        auth,
+        profile_store,
+        settings: settings.clone(),
+        tray_cmd: tray_command_sender.clone(),
+        tray_evt: tray_event_sender.clone(),
     };
 
-    // Build the main status window (hidden by default, shown from tray)
-    let window = ui::status::build_status_window(app);
+    // Wrap ctx in Arc<RwLock> so we can update it after login
+    let ctx = Arc::new(tokio::sync::RwLock::new(ctx));
 
-    // Decide startup flow based on number of configured servers.
-    if settings.servers.is_empty() {
-        // No servers: show login dialog so user can add one.
-        show_login(app, ctx.clone(), window.clone());
-    } else if let Some(active) = settings.active() {
-        // We have an active server -- try restoring saved session.
-        let server_url = active.url.clone();
-        let ctx2 = ctx.clone();
-        let window2 = window.clone();
-        let app2 = app.clone();
-        gtk4::glib::spawn_future_local(async move {
-            match ctx2.auth.load_saved_token(&server_url).await {
-                Ok(()) => {
-                    tracing::info!("restored saved session for {server_url}");
-                    post_login(ctx2, window2).await;
-                }
-                Err(_) => {
-                    show_login(&app2, ctx2, window2);
-                }
+    let app = Application::builder()
+        .application_id("com.github.snx-edge-client")
+        .build();
+
+    let ctx_activate = ctx.clone();
+    let settings_activate = settings.clone();
+
+    app.connect_activate(move |app| {
+        let app_window = ApplicationWindow::builder()
+            .application(app)
+            .visible(false)
+            .build();
+
+        let provider = gtk4::CssProvider::new();
+        provider.load_from_data(assets::APP_CSS);
+        gtk4::style_context_add_provider_for_display(
+            &gtk4::prelude::WidgetExt::display(&app_window),
+            &provider,
+            gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+        set_window("main", Some(app_window));
+
+        // Startup flow: check if we have a saved server
+        let ctx = ctx_activate.clone();
+        let settings = settings_activate.clone();
+        glib::spawn_future_local(async move {
+            let s = settings.read().await;
+            if let Some(server) = s.active_server().cloned() {
+                drop(s);
+                // Try restoring saved session
+                try_restore_or_login(ctx, server).await;
+            } else {
+                drop(s);
+                // No server configured → show server setup dialog
+                show_add_server_dialog(ctx);
             }
         });
-    } else {
-        // Servers exist but none active -- show server picker.
-        let ctx2 = ctx.clone();
-        let window2 = window.clone();
-        let app2 = app.clone();
-        show_server_picker(&app2, ctx2, window2);
-    }
-}
-
-/// Show the server picker dialog that lets the user choose or add a server.
-fn show_server_picker(
-    app: &adw::Application,
-    ctx: AppContext,
-    main_window: adw::ApplicationWindow,
-) {
-    let app2 = app.clone();
-    let ctx2 = ctx.clone();
-    let main_window2 = main_window.clone();
-
-    ui::servers::show_server_picker(
-        &main_window,
-        ctx.settings.clone(),
-        move |pick| {
-            let ctx3 = ctx2.clone();
-            let main_window3 = main_window2.clone();
-            let app3 = app2.clone();
-
-            match pick {
-                Some(idx) => {
-                    // User picked an existing server -- switch to it.
-                    gtk4::glib::spawn_future_local(async move {
-                        do_switch_server(idx, &ctx3, &main_window3, &app3).await;
-                    });
-                }
-                None => {
-                    // User wants to add a new server -- show login dialog.
-                    show_login(&app3, ctx3, main_window3);
-                }
-            }
-        },
-    );
-}
-
-fn show_login(app: &adw::Application, ctx: AppContext, main_window: adw::ApplicationWindow) {
-    let _app2 = app.clone();
-    let main_window_ref = main_window.clone();
-
-    // Rc<RefCell> lets the closure reference the dialog that is created inside
-    // show_login_dialog and returned to us.
-    let dialog_holder: std::rc::Rc<std::cell::RefCell<Option<adw::Window>>> =
-        std::rc::Rc::new(std::cell::RefCell::new(None));
-    let dialog_for_cb = dialog_holder.clone();
-    let ctx2 = ctx.clone();
-
-    let dialog = ui::login::show_login_dialog(
-        &main_window_ref,
-        move |server_url, username, password| {
-            let ctx3 = ctx2.clone();
-            let main_window2 = main_window.clone();
-            let dialog_ref = dialog_for_cb.borrow().clone();
-            gtk4::glib::spawn_future_local(async move {
-                // Update API base URL
-                ctx3.api.set_base_url(&server_url);
-
-                match ctx3.auth.login(&server_url, &username, &password).await {
-                    Ok(()) => {
-                        // Ensure the server is in the settings list.
-                        let mut settings = ctx3.settings.write().await;
-
-                        let existing_idx = settings
-                            .servers
-                            .iter()
-                            .position(|s| s.url == server_url);
-
-                        if let Some(idx) = existing_idx {
-                            settings.set_active(idx);
-                        } else {
-                            // Derive a display name from the URL.
-                            let name = display_name_from_url(&server_url);
-                            let idx = settings.add_server(name, server_url);
-                            settings.set_active(idx);
-                        }
-
-                        let _ = settings.save();
-                        drop(settings);
-
-                        // Close the login dialog on success
-                        if let Some(ref dlg) = dialog_ref {
-                            dlg.close();
-                        }
-
-                        post_login(ctx3, main_window2).await;
-                    }
-                    Err(e) => {
-                        tracing::error!("login failed: {e}");
-                        // Show error inside the login dialog
-                        if let Some(ref dlg) = dialog_ref {
-                            ui::login::show_login_error(dlg, &format!("{e}"));
-                        }
-                    }
-                }
-            });
-        },
-    );
-
-    // Store the dialog reference so the callback can access it on future clicks.
-    *dialog_holder.borrow_mut() = Some(dialog);
-}
-
-async fn post_login(ctx: AppContext, window: adw::ApplicationWindow) {
-    // Sync tray server list.
-    sync_tray_servers(&ctx).await;
-
-    // Stop any previous SSE session before starting a new one so tasks
-    // from earlier calls to post_login (e.g. after a server switch) are
-    // cleaned up.
-    ctx.sse.stop();
-
-    // Start SSE subscription
-    let (sse_tx, mut sse_rx) = tokio::sync::mpsc::unbounded_channel::<sse::SseEvent>();
-    ctx.sse.start(sse_tx);
-
-    // Shut down an existing tray before spawning a new one.
-    {
-        let mut guard = ctx.tray_handle.write().await;
-        if let Some(ref old_handle) = *guard {
-            old_handle.shutdown();
-        }
-        *guard = None;
-    }
-
-    // Start tray
-    let (tray_tx, mut tray_rx) =
-        tokio::sync::mpsc::unbounded_channel::<tray::TrayAction>();
-
-    // Spawn tray in background, storing the handle so it is not dropped.
-    let tray_tx2 = tray_tx.clone();
-    let tray_handle = ctx.tray_handle.clone();
-    tokio::spawn(async move {
-        match tray::spawn(tray_tx2).await {
-            Ok(handle) => {
-                *tray_handle.write().await = Some(handle);
-            }
-            Err(e) => {
-                tracing::error!("failed to spawn tray: {e}");
-            }
-        }
     });
 
-    // After tray spawns, push server list to it.
-    {
-        let ctx_for_tray = ctx.clone();
-        gtk4::glib::spawn_future_local(async move {
-            // Give ksni a moment to initialize before sending commands.
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            sync_tray_servers(&ctx_for_tray).await;
-        });
-    }
+    // Main tray event loop
+    let ctx_events = ctx.clone();
 
-    // Handle tray actions on the GTK main loop
-    {
-        let ctx2 = ctx.clone();
-        let window2 = window.clone();
-        gtk4::glib::spawn_future_local(async move {
-            while let Some(action) = tray_rx.recv().await {
-                handle_tray_action(action, &ctx2, &window2).await;
-            }
-        });
-    }
-
-    // Handle SSE events on the GTK main loop
-    {
-        let ctx3 = ctx.clone();
-        let window3 = window.clone();
-        gtk4::glib::spawn_future_local(async move {
-            while let Some(event) = sse_rx.recv().await {
-                match event {
-                    sse::SseEvent::ConnectionStatus(status) => {
-                        tracing::info!("connection status: {status}");
-
-                        // Forward status to tray icon
-                        let tray_handle = ctx3.tray_handle.clone();
-                        let tray_status = status.clone();
+    glib::spawn_future_local(clone!(
+        #[weak]
+        app,
+        async move {
+            while let Some(v) = tray_event_receiver.recv().await {
+                let ctx = ctx_events.read().await.clone();
+                match v {
+                    TrayEvent::Connect(profile_id) => {
+                        let ctx2 = ctx.clone();
                         tokio::spawn(async move {
-                            let guard = tray_handle.read().await;
-                            if let Some(ref handle) = *guard {
-                                handle.send_command(
-                                    tray::TrayCommand::UpdateStatus(tray_status),
-                                ).await;
-                            }
-                        });
-
-                        // Refresh status display
-                        let ctx4 = ctx3.clone();
-                        let window4 = window3.clone();
-                        gtk4::glib::spawn_future_local(async move {
-                            if let Ok(status) = ctx4.api.tunnel_status().await {
-                                let json = serde_json::to_value(&status).unwrap_or_default();
-                                ui::status::update_status(&window4, &json);
-                            }
+                            do_connect(&ctx2, &profile_id).await;
                         });
                     }
-                    sse::SseEvent::RoutingChanged => {
-                        tracing::info!("routing changed");
+                    TrayEvent::Disconnect => {
+                        let ctx2 = ctx.clone();
+                        tokio::spawn(async move {
+                            do_disconnect(&ctx2).await;
+                        });
                     }
-                    sse::SseEvent::ConfigChanged => {
-                        tracing::info!("config changed");
+                    TrayEvent::Settings => {
+                        settings::start_settings_dialog(
+                            main_window(),
+                            ctx.tray_cmd.clone(),
+                            ctx.api.clone(),
+                            ctx.profile_store.clone(),
+                        );
                     }
-                    sse::SseEvent::Disconnected => {
-                        tracing::warn!("SSE disconnected, will reconnect");
+                    TrayEvent::AddServer => {
+                        let ctx_ref = ctx_events.clone();
+                        show_add_server_dialog(ctx_ref);
+                    }
+                    TrayEvent::Exit => {
+                        let _ = ctx.tray_cmd.send(TrayCommand::Exit).await;
+                        app.quit();
+                    }
+                    TrayEvent::About => do_about(),
+                    TrayEvent::Status => {
+                        do_status(ctx.tray_evt.clone(), false, ctx.api.clone());
                     }
                 }
             }
-        });
-    }
+        }
+    ));
 
-    // Initial status fetch
-    let ctx5 = ctx.clone();
-    let window5 = window.clone();
-    gtk4::glib::spawn_future_local(async move {
-        if let Ok(status) = ctx5.api.tunnel_status().await {
-            let json = serde_json::to_value(&status).unwrap_or_default();
-            ui::status::update_status(&window5, &json);
-        }
-        if let Ok(profiles) = ctx5.api.list_profiles().await {
-            let json: Vec<serde_json::Value> = profiles
-                .iter()
-                .map(|p| serde_json::to_value(p).unwrap_or_default())
-                .collect();
-            // Update profile dropdown
-            if let Some(dropdown) = window5
-                .content()
-                .and_then(|c: gtk4::Widget| find_widget_by_name(&c, "profile_dropdown"))
-                .and_then(|w: gtk4::Widget| w.downcast::<gtk4::DropDown>().ok())
-            {
-                ui::status::update_profiles(&dropdown, &json);
-            }
-        }
-    });
-
-    // Auto-connect if configured for the active server.
-    let settings = ctx.settings.read().await;
-    if let Some(active) = settings.active() {
-        if active.auto_connect {
-            if let Some(ref profile_id) = active.last_profile_id {
-                let api = ctx.api.clone();
-                let pid = profile_id.clone();
-                gtk4::glib::spawn_future_local(async move {
-                    let _ = api.tunnel_connect(&pid).await;
-                });
-            }
-        }
-    }
+    app.run_with_args::<&str>(&[]);
+    Ok(())
 }
 
-/// Switch to a different server by index.
-///
-/// This stops SSE, updates the API base URL, attempts to restore the session
-/// from keyring, and if that fails shows the login dialog.
-async fn do_switch_server(
-    index: usize,
-    ctx: &AppContext,
-    window: &adw::ApplicationWindow,
-    app: &adw::Application,
-) {
-    let server_url = {
-        let mut settings = ctx.settings.write().await;
-        if !settings.set_active(index) {
-            tracing::warn!("switch_server: invalid index {index}");
-            return;
-        }
-        let _ = settings.save();
-        settings.active().unwrap().url.clone()
-    };
+// === Startup flow ===
 
-    tracing::info!("switching to server {index}: {server_url}");
+async fn try_restore_or_login(ctx: Arc<tokio::sync::RwLock<AppContext>>, server: ServerConnection) {
+    info!("trying to restore session for {}", server.url);
 
-    // Stop SSE for the old server.
-    ctx.sse.stop();
+    // Setup API for this server
+    {
+        let mut c = ctx.write().await;
+        c.api = ApiClient::new(&server.url);
+        c.auth = AuthManager::new(c.api.clone(), &server.url);
+    }
 
-    // Clear current auth tokens from memory (do NOT delete from keyring --
-    // we only clear the in-memory state for the old server).
-    ctx.api.set_token(None).await;
-
-    // Point API at the new server.
-    ctx.api.set_base_url(&server_url);
-
-    // Sync tray.
-    sync_tray_servers(ctx).await;
-
-    // Try to restore the saved session.
-    match ctx.auth.load_saved_token(&server_url).await {
+    let c = ctx.read().await;
+    match c.auth.refresh().await {
         Ok(()) => {
-            tracing::info!("restored session for {server_url}");
-            post_login(ctx.clone(), window.clone()).await;
+            info!("session restored for {}", server.url);
+            let _ = profiles::load_profiles(&c.api, &c.profile_store).await;
+            start_status_polling(c.api.clone(), c.tray_cmd.clone());
         }
         Err(_) => {
-            tracing::info!("no saved session for {server_url}, showing login");
-            show_login(app, ctx.clone(), window.clone());
+            drop(c);
+            show_login_for_server(ctx, server.url, server.name);
         }
     }
 }
 
-async fn handle_tray_action(
-    action: tray::TrayAction,
-    ctx: &AppContext,
-    window: &adw::ApplicationWindow,
-) {
-    match action {
-        tray::TrayAction::Connect => {
-            let api = ctx.api.clone();
-            let settings = ctx.settings.clone();
-            gtk4::glib::spawn_future_local(async move {
-                let s = settings.read().await;
-                if let Some(active) = s.active() {
-                    if let Some(ref pid) = active.last_profile_id {
-                        let _ = api.tunnel_connect(pid).await;
-                    }
-                }
+fn show_add_server_dialog(ctx: Arc<tokio::sync::RwLock<AppContext>>) {
+    glib::spawn_future_local(show_add_server_dialog_inner(ctx));
+}
+
+async fn show_add_server_dialog_inner(ctx: Arc<tokio::sync::RwLock<AppContext>>) {
+    let (tx, rx) = async_channel::bounded(1);
+
+    glib::idle_add_once(move || {
+        glib::spawn_future_local(async move {
+            let result = show_server_input_dialog().await;
+            let _ = tx.send(result).await;
+        });
+    });
+
+    if let Ok(Some((name, url, username, password))) = rx.recv().await {
+        // Save server to settings
+        {
+            let c = ctx.read().await;
+            let mut settings = c.settings.write().await;
+            settings.servers.push(ServerConnection {
+                name: name.clone(),
+                url: url.clone(),
+                auto_connect: false,
+                last_profile_id: None,
             });
+            settings.active_server = Some(settings.servers.len() - 1);
+            let _ = settings.save();
         }
-        tray::TrayAction::Disconnect => {
-            let api = ctx.api.clone();
-            gtk4::glib::spawn_future_local(async move {
-                let _ = api.tunnel_disconnect().await;
-            });
+
+        // Setup API and login
+        {
+            let mut c = ctx.write().await;
+            c.api = ApiClient::new(&url);
+            c.auth = AuthManager::new(c.api.clone(), &url);
         }
-        tray::TrayAction::ShowProfiles => {
-            let _win = ui::profiles::build_profiles_window(window);
-        }
-        tray::TrayAction::ShowRouting => {
-            let _win = ui::routing::build_routing_window(window);
-        }
-        tray::TrayAction::ShowLogs => {
-            let _win = ui::logs::build_logs_window(window);
-        }
-        tray::TrayAction::ShowUsers => {
-            let _win = ui::users::build_users_window(window);
-        }
-        tray::TrayAction::ShowAbout => {
-            ui::about::show_about_dialog(window);
-        }
-        tray::TrayAction::SwitchServer(index) => {
-            let ctx2 = ctx.clone();
-            let window2 = window.clone();
-            let app = window
-                .application()
-                .and_then(|a| a.downcast::<adw::Application>().ok());
-            if let Some(app) = app {
-                gtk4::glib::spawn_future_local(async move {
-                    do_switch_server(index, &ctx2, &window2, &app).await;
-                });
+
+        let c = ctx.read().await;
+        match c.auth.login(&username, &password).await {
+            Ok(()) => {
+                info!("logged in to {}", url);
+                let _ = profiles::load_profiles(&c.api, &c.profile_store).await;
+                start_status_polling(c.api.clone(), c.tray_cmd.clone());
+            }
+            Err(e) => {
+                let _ = show_notification("Login Failed", &e.to_string()).await;
+                // Retry — non-recursive to avoid boxing
+                drop(c);
+                show_add_server_dialog(ctx);
+                return;
             }
         }
-        tray::TrayAction::ManageServers => {
-            show_manage_servers(ctx, window);
-        }
-        tray::TrayAction::Quit => {
-            window.application().map(|a| a.quit());
+    }
+    // User cancelled → app stays in tray with no active connection
+}
+
+fn show_login_for_server(
+    ctx: Arc<tokio::sync::RwLock<AppContext>>,
+    url: String,
+    name: String,
+) {
+    glib::spawn_future_local(show_login_for_server_inner(ctx, url, name));
+}
+
+async fn show_login_for_server_inner(
+    ctx: Arc<tokio::sync::RwLock<AppContext>>,
+    url: String,
+    name: String,
+) {
+    let (tx, rx) = async_channel::bounded(1);
+
+    let url2 = url.clone();
+    let name2 = name.clone();
+    glib::idle_add_once(move || {
+        glib::spawn_future_local(async move {
+            let result = show_login_only_dialog(&name2, &url2).await;
+            let _ = tx.send(result).await;
+        });
+    });
+
+    if let Ok(Some((username, password))) = rx.recv().await {
+        let c = ctx.read().await;
+        match c.auth.login(&username, &password).await {
+            Ok(()) => {
+                info!("logged in to {}", url);
+                let _ = profiles::load_profiles(&c.api, &c.profile_store).await;
+                start_status_polling(c.api.clone(), c.tray_cmd.clone());
+            }
+            Err(e) => {
+                let _ = show_notification("Login Failed", &e.to_string()).await;
+                drop(c);
+                show_login_for_server(ctx, url, name);
+                return;
+            }
         }
     }
 }
 
-/// Open the "Manage Servers" window.
-fn show_manage_servers(ctx: &AppContext, window: &adw::ApplicationWindow) {
-    let ctx2 = ctx.clone();
-    let ctx3 = ctx.clone();
-    let ctx4 = ctx.clone();
-    let window2 = window.clone();
-    let window4 = window.clone();
-
-    let _dialog = ui::servers::build_servers_window(
-        window,
-        ctx.settings.clone(),
-        // on_add
-        move |name, url| {
-            let ctx = ctx2.clone();
-            let window = window2.clone();
-            gtk4::glib::spawn_future_local(async move {
-                {
-                    let mut settings = ctx.settings.write().await;
-                    let idx = settings.add_server(name.clone(), url);
-                    settings.set_active(idx);
-                    let _ = settings.save();
-                }
-                sync_tray_servers(&ctx).await;
-
-                // Switch to the newly added server.
-                let app = window
-                    .application()
-                    .and_then(|a| a.downcast::<adw::Application>().ok());
-                if let Some(app) = app {
-                    let settings = ctx.settings.read().await;
-                    let idx = settings.active_server.unwrap_or(0);
-                    drop(settings);
-                    do_switch_server(idx, &ctx, &window, &app).await;
-                }
-            });
-        },
-        // on_remove
-        move |index| {
-            let ctx = ctx3.clone();
-            gtk4::glib::spawn_future_local(async move {
-                {
-                    let mut settings = ctx.settings.write().await;
-                    settings.remove_server(index);
-                    let _ = settings.save();
-                }
-                sync_tray_servers(&ctx).await;
-            });
-        },
-        // on_switch
-        move |index| {
-            let ctx = ctx4.clone();
-            let window = window4.clone();
-            gtk4::glib::spawn_future_local(async move {
-                let app = window
-                    .application()
-                    .and_then(|a| a.downcast::<adw::Application>().ok());
-                if let Some(app) = app {
-                    do_switch_server(index, &ctx, &window, &app).await;
-                }
-            });
-        },
-    );
-}
-
-/// Push the current server list to the tray icon.
-async fn sync_tray_servers(ctx: &AppContext) {
-    let (entries, active) = {
-        let settings = ctx.settings.read().await;
-        let entries: Vec<tray::ServerEntry> = settings
-            .servers
-            .iter()
-            .map(|s| tray::ServerEntry {
-                name: s.name.clone(),
-            })
-            .collect();
-        (entries, settings.active_server)
-    };
-
-    let tray_handle = ctx.tray_handle.clone();
+fn start_status_polling(api: ApiClient, cmd_sender: mpsc::Sender<TrayCommand>) {
     tokio::spawn(async move {
-        let guard = tray_handle.read().await;
-        if let Some(ref handle) = *guard {
-            handle
-                .send_command(tray::TrayCommand::UpdateServers {
-                    servers: entries,
-                    active,
-                })
-                .await;
+        let mut old_state = ConnectionState::Disconnected;
+        loop {
+            let new_state = match api.tunnel_status().await {
+                Ok(json) => ConnectionState::from_json(&json),
+                Err(_) => ConnectionState::Disconnected, // silently retry
+            };
+
+            if !status::same_status(&new_state, &old_state) {
+                old_state = new_state.clone();
+                let _ = cmd_sender
+                    .send(TrayCommand::Update(Some(Arc::new(old_state.clone()))))
+                    .await;
+            }
+
+            tokio::time::sleep(POLL_INTERVAL).await;
         }
     });
 }
 
-/// Derive a short display name from a URL, e.g. "172.19.0.2" from
-/// "https://172.19.0.2:8443".
-fn display_name_from_url(url: &str) -> String {
-    url.trim_start_matches("https://")
-        .trim_start_matches("http://")
-        .split(':')
-        .next()
-        .unwrap_or("Server")
-        .to_string()
+// === Dialogs ===
+
+/// Dialog: add new server (URL + name + credentials)
+async fn show_server_input_dialog() -> Option<(String, String, String, String)> {
+    use gtk4::{Align, Orientation};
+
+    let (tx, rx) = async_channel::bounded(1);
+
+    let window = gtk4::Window::builder()
+        .title("SNX Edge — Add Server")
+        .transient_for(&main_window())
+        .modal(true)
+        .default_width(400)
+        .build();
+
+    let inner = gtk4::Box::builder()
+        .orientation(Orientation::Vertical)
+        .margin_top(12)
+        .margin_start(12)
+        .margin_end(12)
+        .margin_bottom(12)
+        .spacing(8)
+        .build();
+
+    inner.append(&gtk4::Label::builder().label("Server name:").halign(Align::Start).build());
+    let name_entry = gtk4::Entry::builder().placeholder_text("Office MikroTik").build();
+    inner.append(&name_entry);
+
+    inner.append(&gtk4::Label::builder().label("Server URL:").halign(Align::Start).build());
+    let url_entry = gtk4::Entry::builder().placeholder_text("http://172.19.0.2:8080").build();
+    inner.append(&url_entry);
+
+    inner.append(&gtk4::Label::builder().label("Username:").halign(Align::Start).build());
+    let user_entry = gtk4::Entry::builder().placeholder_text("admin").build();
+    inner.append(&user_entry);
+
+    inner.append(&gtk4::Label::builder().label("Password:").halign(Align::Start).build());
+    let pass_entry = gtk4::PasswordEntry::new();
+    inner.append(&pass_entry);
+
+    let error_label = gtk4::Label::builder()
+        .label("")
+        .css_classes(vec!["error".to_string()])
+        .wrap(true)
+        .visible(false)
+        .build();
+    inner.append(&error_label);
+
+    let btn_box = gtk4::Box::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(8)
+        .margin_top(8)
+        .halign(Align::End)
+        .build();
+
+    let cancel_btn = gtk4::Button::builder().label("Cancel").build();
+    let connect_btn = gtk4::Button::builder()
+        .label("Connect")
+        .css_classes(vec!["suggested-action".to_string()])
+        .build();
+    btn_box.append(&cancel_btn);
+    btn_box.append(&connect_btn);
+    inner.append(&btn_box);
+
+    window.set_child(Some(&inner));
+
+    let tx_ok = tx.clone();
+    connect_btn.connect_clicked(clone!(
+        #[weak] window,
+        #[weak] name_entry,
+        #[weak] url_entry,
+        #[weak] user_entry,
+        #[weak] pass_entry,
+        #[weak] error_label,
+        move |_| {
+            let name = name_entry.text().trim().to_string();
+            let url = url_entry.text().trim().to_string();
+            let user = user_entry.text().trim().to_string();
+            let pass = pass_entry.text().to_string();
+
+            if url.is_empty() {
+                error_label.set_text("Server URL is required");
+                error_label.set_visible(true);
+                return;
+            }
+            if !url.starts_with("http://") && !url.starts_with("https://") {
+                error_label.set_text("URL must start with http:// or https://");
+                error_label.set_visible(true);
+                return;
+            }
+            if user.is_empty() || pass.is_empty() {
+                error_label.set_text("Username and password are required");
+                error_label.set_visible(true);
+                return;
+            }
+
+            let display_name = if name.is_empty() { url.clone() } else { name };
+            let _ = tx_ok.try_send(Some((display_name, url, user, pass)));
+            window.close();
+        }
+    ));
+
+    cancel_btn.connect_clicked(clone!(
+        #[weak] window,
+        move |_| {
+            let _ = tx.try_send(None::<(String, String, String, String)>);
+            window.close();
+        }
+    ));
+
+    window.present();
+    rx.recv().await.ok().flatten()
 }
 
-/// Recursively find a widget by its CSS name.
-fn find_widget_by_name(root: &impl IsA<gtk4::Widget>, name: &str) -> Option<gtk4::Widget> {
-    let widget = root.as_ref();
-    if widget.widget_name() == name {
-        return Some(widget.clone());
-    }
-    let mut child = widget.first_child();
-    while let Some(c) = child {
-        if let Some(found) = find_widget_by_name(&c, name) {
-            return Some(found);
+/// Dialog: login to existing server (username + password only)
+async fn show_login_only_dialog(server_name: &str, server_url: &str) -> Option<(String, String)> {
+    use gtk4::{Align, Orientation};
+
+    let (tx, rx) = async_channel::bounded(1);
+
+    let window = gtk4::Window::builder()
+        .title(&format!("SNX Edge — Login to {server_name}"))
+        .transient_for(&main_window())
+        .modal(true)
+        .default_width(380)
+        .build();
+
+    let inner = gtk4::Box::builder()
+        .orientation(Orientation::Vertical)
+        .margin_top(12)
+        .margin_start(12)
+        .margin_end(12)
+        .margin_bottom(12)
+        .spacing(8)
+        .build();
+
+    inner.append(
+        &gtk4::Label::builder()
+            .label(&format!("Server: {server_url}"))
+            .halign(Align::Start)
+            .css_classes(vec!["dim-label".to_string()])
+            .build(),
+    );
+
+    inner.append(&gtk4::Label::builder().label("Username:").halign(Align::Start).build());
+    let user_entry = gtk4::Entry::builder().placeholder_text("admin").build();
+    inner.append(&user_entry);
+
+    inner.append(&gtk4::Label::builder().label("Password:").halign(Align::Start).build());
+    let pass_entry = gtk4::PasswordEntry::new();
+    inner.append(&pass_entry);
+
+    let btn_box = gtk4::Box::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(8)
+        .margin_top(8)
+        .halign(Align::End)
+        .build();
+
+    let cancel_btn = gtk4::Button::builder().label("Cancel").build();
+    let login_btn = gtk4::Button::builder()
+        .label("Login")
+        .css_classes(vec!["suggested-action".to_string()])
+        .build();
+    btn_box.append(&cancel_btn);
+    btn_box.append(&login_btn);
+    inner.append(&btn_box);
+
+    window.set_child(Some(&inner));
+
+    let tx_ok = tx.clone();
+    login_btn.connect_clicked(clone!(
+        #[weak] window,
+        #[weak] user_entry,
+        #[weak] pass_entry,
+        move |_| {
+            let user = user_entry.text().trim().to_string();
+            let pass = pass_entry.text().to_string();
+            let _ = tx_ok.try_send(Some((user, pass)));
+            window.close();
         }
-        child = c.next_sibling();
+    ));
+
+    cancel_btn.connect_clicked(clone!(
+        #[weak] window,
+        move |_| {
+            let _ = tx.try_send(None::<(String, String)>);
+            window.close();
+        }
+    ));
+
+    window.present();
+    rx.recv().await.ok().flatten()
+}
+
+// === Actions ===
+
+async fn do_connect(ctx: &AppContext, profile_id: &str) {
+    let _ = ctx
+        .tray_cmd
+        .send(TrayCommand::Update(Some(Arc::new(ConnectionState::Connecting))))
+        .await;
+
+    match ctx.api.tunnel_connect(profile_id).await {
+        Ok(json) => {
+            let state = ConnectionState::from_json(&json);
+            let _ = show_notification("VPN", &format!("{state}")).await;
+            let _ = ctx
+                .tray_cmd
+                .send(TrayCommand::Update(Some(Arc::new(state))))
+                .await;
+        }
+        Err(e) => {
+            let _ = show_notification("Connection Error", &e.to_string()).await;
+            let _ = ctx
+                .tray_cmd
+                .send(TrayCommand::Update(Some(Arc::new(ConnectionState::Error(
+                    e.to_string(),
+                )))))
+                .await;
+        }
     }
-    None
+}
+
+async fn do_disconnect(ctx: &AppContext) {
+    match ctx.api.tunnel_disconnect().await {
+        Ok(json) => {
+            let state = ConnectionState::from_json(&json);
+            let _ = ctx
+                .tray_cmd
+                .send(TrayCommand::Update(Some(Arc::new(state))))
+                .await;
+        }
+        Err(e) => {
+            let _ = show_notification("Disconnect Error", &e.to_string()).await;
+        }
+    }
+}
+
+fn do_about() {
+    glib::idle_add_once(|| {
+        if let Some(dialog) = get_window("about") {
+            dialog.present();
+            return;
+        }
+
+        let dialog = gtk4::AboutDialog::builder()
+            .transient_for(&main_window())
+            .version(env!("CARGO_PKG_VERSION"))
+            .logo_icon_name("network-vpn")
+            .website("https://github.com/happykust/snx-edge-proxy")
+            .license_type(License::Agpl30)
+            .program_name("SNX Edge")
+            .title("SNX Edge")
+            .build();
+
+        set_window("about", Some(dialog.clone()));
+        dialog.connect_close_request(|_| {
+            set_window("about", None::<gtk4::Window>);
+            glib::signal::Propagation::Proceed
+        });
+        dialog.present();
+    });
+}
+
+fn do_status(sender: mpsc::Sender<TrayEvent>, exit_on_close: bool, api: ApiClient) {
+    glib::idle_add_once(move || {
+        glib::spawn_future_local(
+            async move { show_status_dialog(sender, exit_on_close, api).await },
+        );
+    });
+}
+
+fn init_logging() {
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(LevelFilter::INFO)
+        .finish();
+    tracing::subscriber::set_global_default(subscriber).unwrap();
 }
