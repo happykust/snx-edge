@@ -209,6 +209,10 @@ pub fn build_tunnel_params(vpn: &VpnConfig) -> snxcore::model::params::TunnelPar
     params.ca_cert = vpn.ca_cert.iter().map(|s| s.into()).collect();
     params.ignore_server_cert = vpn.no_cert_check;
 
+    if let Some(lease) = vpn.ip_lease_duration {
+        params.ip_lease_time = Some(std::time::Duration::from_secs(lease as u64));
+    }
+
     params.ike_lifetime = std::time::Duration::from_secs(vpn.ike_lifetime as u64);
     params.ike_persist = vpn.ike_persist;
     params.no_keepalive = vpn.no_keepalive;

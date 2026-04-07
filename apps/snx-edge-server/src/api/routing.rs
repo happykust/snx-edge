@@ -1,3 +1,5 @@
+use std::net::IpAddr;
+
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{delete, get, post};
@@ -10,6 +12,52 @@ use crate::routeros::client::RouterOsClient;
 use crate::routeros::models::{AddressListEntry, DiagnosticsResult};
 use crate::routeros::provisioner::Provisioner;
 use crate::state::{AppState, ServerEvent};
+
+/// Validate that `address` is one of the following accepted forms:
+///   - Plain IPv4/IPv6 address (e.g. `192.168.1.1`, `::1`)
+///   - CIDR notation            (e.g. `10.0.0.0/24`, `fd00::/64`)
+///   - IPv4 range               (e.g. `192.168.1.1-192.168.1.254`)
+///
+/// Returns `Ok(())` on success, or `Err(AppError::BadRequest)` describing the
+/// problem.
+fn validate_address(address: &str) -> Result<(), AppError> {
+    // 1. Plain IP address
+    if address.parse::<IpAddr>().is_ok() {
+        return Ok(());
+    }
+
+    // 2. CIDR notation: ip/prefix
+    if let Some((ip_part, prefix_part)) = address.split_once('/') {
+        let ip: IpAddr = ip_part
+            .parse()
+            .map_err(|_| AppError::BadRequest(format!("invalid IP in CIDR notation: {address}")))?;
+        let prefix: u8 = prefix_part
+            .parse()
+            .map_err(|_| AppError::BadRequest(format!("invalid prefix length in CIDR: {address}")))?;
+        let max = if ip.is_ipv4() { 32 } else { 128 };
+        if prefix > max {
+            return Err(AppError::BadRequest(format!(
+                "prefix length {prefix} exceeds maximum {max} for {address}"
+            )));
+        }
+        return Ok(());
+    }
+
+    // 3. IP range: ip-ip  (IPv4 only, as RouterOS uses this form)
+    if let Some((start, end)) = address.split_once('-') {
+        let _start: std::net::Ipv4Addr = start.parse().map_err(|_| {
+            AppError::BadRequest(format!("invalid start address in range: {address}"))
+        })?;
+        let _end: std::net::Ipv4Addr = end.parse().map_err(|_| {
+            AppError::BadRequest(format!("invalid end address in range: {address}"))
+        })?;
+        return Ok(());
+    }
+
+    Err(AppError::BadRequest(format!(
+        "invalid address format: expected IPv4/IPv6 address, CIDR (x.x.x.x/N), or range (x.x.x.x-y.y.y.y), got: {address}"
+    )))
+}
 
 async fn make_client(state: &AppState) -> Result<RouterOsClient, AppError> {
     let config = state.config.read().await;
@@ -54,6 +102,8 @@ async fn add_client(
     if !has_permission(&claims, "routing.clients.create") {
         return Err(AppError::Forbidden("permission required".to_string()));
     }
+
+    validate_address(&req.address)?;
 
     let client = make_client(&state).await?;
     let config = state.config.read().await;
@@ -114,6 +164,8 @@ async fn add_bypass(
     if !has_permission(&claims, "routing.bypass.create") {
         return Err(AppError::Forbidden("permission required".to_string()));
     }
+
+    validate_address(&req.address)?;
 
     let client = make_client(&state).await?;
     let config = state.config.read().await;

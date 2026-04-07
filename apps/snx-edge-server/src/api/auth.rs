@@ -210,6 +210,15 @@ pub fn decode_token(secret: &str, token: &str) -> Result<Claims, AppError> {
 }
 
 /// Axum middleware: extract and validate JWT from Authorization header.
+///
+/// NOTE: Access tokens are stateless JWTs -- they are NOT checked against
+/// the database on every request.  This means an access token remains
+/// valid for up to `access_token_ttl_minutes` (default 15 min) after the
+/// owning user is deleted or has all sessions revoked.  This is an
+/// intentional tradeoff: it avoids a DB round-trip on every authenticated
+/// request while keeping the exposure window short.  Refresh tokens *are*
+/// validated against stored sessions, so revocation takes full effect once
+/// the current access token expires.
 pub async fn require_auth(
     State(state): State<AppState>,
     mut request: axum::extract::Request,

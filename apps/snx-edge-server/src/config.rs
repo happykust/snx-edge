@@ -83,6 +83,13 @@ impl AppConfig {
         Ok(config)
     }
 
+    /// Persist the current configuration to disk.
+    ///
+    /// This **overwrites** the file at `path` with a freshly serialised
+    /// TOML representation.  Any manual edits or comments in the original
+    /// file will be lost.  This is acceptable for the appliance deployment
+    /// model where the configuration is managed exclusively through the
+    /// management API.
     pub fn save(&self, path: &str) -> anyhow::Result<()> {
         let content = toml::to_string_pretty(self)?;
         std::fs::write(path, content)?;

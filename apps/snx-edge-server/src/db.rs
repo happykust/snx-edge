@@ -157,7 +157,7 @@ impl UserDb {
                     failed_login_attempts, locked_until, created_at, updated_at
              FROM users WHERE id = ?1",
             params![id],
-            |row| Ok(row_to_user(row)),
+            |row| row_to_user(row),
         )
         .map_err(|_| AppError::NotFound("user not found".to_string()))
     }
@@ -170,7 +170,7 @@ impl UserDb {
                     failed_login_attempts, locked_until, created_at, updated_at
              FROM users WHERE username = ?1",
             params![username],
-            |row| Ok(row_to_user(row)),
+            |row| row_to_user(row),
         )
         .map_err(|_| AppError::NotFound("user not found".to_string()))
     }
@@ -183,7 +183,7 @@ impl UserDb {
              FROM users ORDER BY created_at",
         )?;
         let users = stmt
-            .query_map([], |row| Ok(row_to_user(row)))?
+            .query_map([], |row| row_to_user(row))?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(users)
     }
@@ -248,7 +248,7 @@ impl UserDb {
                         failed_login_attempts, locked_until, created_at, updated_at
                  FROM users WHERE id = ?1",
                 params![id],
-                |row| Ok(row_to_user(row)),
+                |row| row_to_user(row),
             )
             .map_err(|_| AppError::NotFound("user not found".to_string()))?;
 
@@ -655,19 +655,19 @@ impl UserDb {
     }
 }
 
-fn row_to_user(row: &rusqlite::Row) -> User {
-    User {
-        id: row.get(0).unwrap(),
-        username: row.get(1).unwrap(),
-        password_hash: row.get(2).unwrap(),
-        role: row.get(3).unwrap(),
-        comment: row.get(4).unwrap(),
-        enabled: row.get(5).unwrap(),
-        failed_login_attempts: row.get(6).unwrap(),
-        locked_until: row.get::<_, Option<String>>(7).unwrap().map(parse_dt),
-        created_at: parse_dt(row.get::<_, String>(8).unwrap()),
-        updated_at: parse_dt(row.get::<_, String>(9).unwrap()),
-    }
+fn row_to_user(row: &rusqlite::Row) -> rusqlite::Result<User> {
+    Ok(User {
+        id: row.get(0)?,
+        username: row.get(1)?,
+        password_hash: row.get(2)?,
+        role: row.get(3)?,
+        comment: row.get(4)?,
+        enabled: row.get(5)?,
+        failed_login_attempts: row.get(6)?,
+        locked_until: row.get::<_, Option<String>>(7)?.map(parse_dt),
+        created_at: parse_dt(row.get::<_, String>(8)?),
+        updated_at: parse_dt(row.get::<_, String>(9)?),
+    })
 }
 
 fn parse_dt(s: String) -> DateTime<Utc> {
