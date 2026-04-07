@@ -200,6 +200,29 @@ async fn main() -> anyhow::Result<()> {
                     TrayEvent::Status => {
                         do_status(ctx.tray_evt.clone(), false, ctx.api.clone());
                     }
+                    TrayEvent::Routing => {
+                        let api = ctx.api.clone();
+                        glib::idle_add_once(move || {
+                            windows::routing::show_routing_window(api);
+                        });
+                    }
+                    TrayEvent::Users => {
+                        let api = ctx.api.clone();
+                        glib::idle_add_once(move || {
+                            windows::users::show_users_window(api);
+                        });
+                    }
+                    TrayEvent::Servers => {
+                        glib::idle_add_once(|| {
+                            windows::servers::show_servers_window();
+                        });
+                    }
+                    TrayEvent::Logs => {
+                        let api = ctx.api.clone();
+                        glib::idle_add_once(move || {
+                            windows::logs::show_logs_window(api);
+                        });
+                    }
                 }
             }
         }
@@ -594,27 +617,18 @@ async fn do_disconnect(ctx: &AppContext) {
 
 fn do_about() {
     glib::idle_add_once(|| {
-        if let Some(dialog) = get_window("about") {
-            dialog.present();
-            return;
-        }
-
-        let dialog = gtk4::AboutDialog::builder()
+        let about = libadwaita::AboutWindow::builder()
             .transient_for(&main_window())
+            .application_name("snx-edge")
+            .application_icon("network-vpn")
             .version(env!("CARGO_PKG_VERSION"))
-            .logo_icon_name("network-vpn")
-            .website("https://github.com/happykust/snx-edge-proxy")
+            .developer_name("snx-edge contributors")
             .license_type(License::Agpl30)
-            .program_name("SNX Edge")
-            .title("SNX Edge")
+            .website("https://github.com/happykust/snx-edge")
+            .issue_url("https://github.com/happykust/snx-edge/issues")
             .build();
 
-        set_window("about", Some(dialog.clone()));
-        dialog.connect_close_request(|_| {
-            set_window("about", None::<gtk4::Window>);
-            glib::signal::Propagation::Proceed
-        });
-        dialog.present();
+        about.present();
     });
 }
 

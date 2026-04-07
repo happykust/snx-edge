@@ -1,363 +1,369 @@
-use ksni::menu::{MenuItem, StandardItem, SubMenu};
-use ksni::{Handle, Tray, TrayMethods};
-use tokio::sync::mpsc::UnboundedSender;
-use tracing::{debug, info};
+use std::{str::FromStr, sync::Arc};
 
-// ---------------------------------------------------------------------------
-// Public types
-// ---------------------------------------------------------------------------
+use anyhow::anyhow;
+use ksni::{
+    Handle, Icon, MenuItem, TrayMethods,
+    menu::StandardItem,
+};
+use tokio::sync::mpsc::{Receiver, Sender};
 
-/// Commands sent *to* the tray to update its visual state.
-#[derive(Debug, Clone)]
-pub enum TrayCommand {
-    /// Update VPN connection status.
-    /// Recognized values: "connected", "disconnected", "connecting", "error".
-    UpdateStatus(String),
-    /// Set the current user's role (e.g. `Some("admin")`).
-    /// Controls visibility of admin-only menu entries.
-    SetRole(Option<String>),
-    /// Update the list of configured servers and the active index.
-    UpdateServers {
-        servers: Vec<ServerEntry>,
-        active: Option<usize>,
-    },
-}
+use crate::{
+    assets,
+    theme::{SystemColorTheme, system_color_theme},
+    client_settings::ClientSettings,
+};
 
-/// Lightweight description of a server for the tray submenu.
-#[derive(Debug, Clone)]
-pub struct ServerEntry {
-    pub name: String,
-}
-
-/// Actions emitted *by* the tray when the user clicks a menu item.
-/// These are forwarded to the GTK main loop via `glib::Sender`.
-#[derive(Debug, Clone)]
-pub enum TrayAction {
-    Connect,
+#[derive(Debug, Clone, PartialEq)]
+pub enum TrayEvent {
+    Connect(String), // profile_id
     Disconnect,
-    ShowProfiles,
-    ShowRouting,
-    ShowLogs,
-    ShowUsers,
-    ShowAbout,
-    SwitchServer(usize),
-    ManageServers,
-    Quit,
+    Settings,
+    Status,
+    AddServer,
+    Exit,
+    About,
+    Routing,
+    Users,
+    Servers,
+    Logs,
 }
 
-// ---------------------------------------------------------------------------
-// Tray state
-// ---------------------------------------------------------------------------
+impl TrayEvent {
+    #[allow(dead_code)]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TrayEvent::Connect(_) => "connect",
+            TrayEvent::Disconnect => "disconnect",
+            TrayEvent::Settings => "settings",
+            TrayEvent::Status => "status",
+            TrayEvent::AddServer => "add_server",
+            TrayEvent::Exit => "exit",
+            TrayEvent::About => "about",
+            TrayEvent::Routing => "routing",
+            TrayEvent::Users => "users",
+            TrayEvent::Servers => "servers",
+            TrayEvent::Logs => "logs",
+        }
+    }
+}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TrayState {
+impl FromStr for TrayEvent {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "connect" => Ok(TrayEvent::Connect(String::new())),
+            "disconnect" => Ok(TrayEvent::Disconnect),
+            "settings" => Ok(TrayEvent::Settings),
+            "status" => Ok(TrayEvent::Status),
+            "exit" => Ok(TrayEvent::Exit),
+            "about" => Ok(TrayEvent::About),
+            "routing" => Ok(TrayEvent::Routing),
+            "users" => Ok(TrayEvent::Users),
+            "servers" => Ok(TrayEvent::Servers),
+            "logs" => Ok(TrayEvent::Logs),
+            _ => Err(anyhow!("Unknown event: {}", s)),
+        }
+    }
+}
+
+/// Status representation for the tray, parsed from server JSON.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConnectionState {
+    Connected { info: String },
     Disconnected,
     Connecting,
-    Connected,
-    Error,
+    Error(String),
 }
 
-impl TrayState {
-    fn from_status(s: &str) -> Self {
-        match s {
-            "connected" => Self::Connected,
-            "connecting" => Self::Connecting,
-            "error" => Self::Error,
-            _ => Self::Disconnected,
-        }
-    }
-
-    /// FreeDesktop icon theme name for the current state.
-    fn icon_name(self) -> &'static str {
+impl std::fmt::Display for ConnectionState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Disconnected => "network-vpn-disconnected",
-            Self::Connecting => "network-vpn-acquiring",
-            Self::Connected => "network-vpn",
-            Self::Error => "network-vpn-error",
+            ConnectionState::Connected { info } => write!(f, "Connected: {}", info),
+            ConnectionState::Disconnected => write!(f, "Disconnected"),
+            ConnectionState::Connecting => write!(f, "Connecting..."),
+            ConnectionState::Error(e) => write!(f, "Error: {}", e),
         }
     }
 }
 
-// ---------------------------------------------------------------------------
-// ksni::Tray implementation
-// ---------------------------------------------------------------------------
-
-struct SnxTray {
-    state: TrayState,
-    role: Option<String>,
-    servers: Vec<ServerEntry>,
-    active_server: Option<usize>,
-    /// Channel back to the GTK main loop.
-    action_tx: UnboundedSender<TrayAction>,
+impl ConnectionState {
+    /// Parse from a serde_json::Value returned by the tunnel status API.
+    pub fn from_json(value: &serde_json::Value) -> Self {
+        let state = value
+            .get("state")
+            .and_then(|v| v.as_str())
+            .unwrap_or("disconnected");
+        match state {
+            "connected" => {
+                let server = value.get("server").and_then(|v| v.as_str()).unwrap_or("unknown");
+                ConnectionState::Connected {
+                    info: server.to_string(),
+                }
+            }
+            "connecting" => ConnectionState::Connecting,
+            "disconnected" => ConnectionState::Disconnected,
+            _ => ConnectionState::Error(format!("Unknown state: {}", state)),
+        }
+    }
 }
 
-impl Tray for SnxTray {
-    fn id(&self) -> String {
-        "snx-edge-client".into()
+#[derive(Debug, Clone)]
+pub enum TrayCommand {
+    Update(Option<Arc<ConnectionState>>),
+    Exit,
+}
+
+enum PixmapOrName {
+    Pixmap(Icon),
+    Name(&'static str),
+}
+
+pub struct AppTray {
+    command_sender: Sender<TrayCommand>,
+    command_receiver: Option<Receiver<TrayCommand>>,
+    status: Arc<ConnectionState>,
+    tray_icon: Option<Handle<KsniTray>>,
+}
+
+impl AppTray {
+    pub async fn new(event_sender: Sender<TrayEvent>, no_tray: bool) -> anyhow::Result<Self> {
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+
+        let handle = if !no_tray {
+            let tray_icon = KsniTray::new(event_sender);
+            Some(tray_icon.spawn().await?)
+        } else {
+            None
+        };
+
+        let app_tray = AppTray {
+            command_sender: tx,
+            command_receiver: Some(rx),
+            status: Arc::new(ConnectionState::Disconnected),
+            tray_icon: handle,
+        };
+
+        app_tray.update().await;
+
+        Ok(app_tray)
     }
 
-    fn title(&self) -> String {
-        "SNX Edge VPN".into()
+    pub fn sender(&self) -> Sender<TrayCommand> {
+        self.command_sender.clone()
+    }
+
+    fn status_label(&self) -> String {
+        self.status.to_string()
+    }
+
+    fn icon_theme(&self) -> &'static assets::IconTheme {
+        let settings = ClientSettings::load();
+        let system_theme = match settings.icon_theme.as_str() {
+            "dark" => SystemColorTheme::Light,
+            "light" => SystemColorTheme::Dark,
+            _ => system_color_theme().ok().unwrap_or_default(),
+        };
+
+        if system_theme.is_dark() {
+            &assets::DARK_THEME
+        } else {
+            &assets::LIGHT_THEME
+        }
+    }
+
+    fn icon(&self) -> Icon {
+        let theme = self.icon_theme();
+
+        let data = match &*self.status {
+            ConnectionState::Connected { .. } => theme.connected.clone(),
+            ConnectionState::Disconnected => theme.disconnected.clone(),
+            ConnectionState::Connecting => theme.acquiring.clone(),
+            ConnectionState::Error(_) => theme.error.clone(),
+        };
+
+        Icon {
+            width: 256,
+            height: 256,
+            data,
+        }
+    }
+
+    fn icon_name(&self) -> &'static str {
+        match &*self.status {
+            ConnectionState::Connected { .. } => "network-vpn-symbolic",
+            ConnectionState::Disconnected => "network-vpn-disconnected-symbolic",
+            ConnectionState::Connecting => "network-vpn-acquiring-symbolic",
+            ConnectionState::Error(_) => "network-vpn-disabled-symbolic",
+        }
+    }
+
+    async fn update(&self) {
+        let status_label = self.status_label();
+
+        let icon = if self.pixmap_icons_supported() {
+            PixmapOrName::Pixmap(self.icon())
+        } else {
+            PixmapOrName::Name(self.icon_name())
+        };
+
+        let connect_enabled = matches!(&*self.status, ConnectionState::Disconnected);
+        let disconnect_enabled = !matches!(&*self.status, ConnectionState::Disconnected);
+
+        if let Some(ref tray_icon) = self.tray_icon {
+            tray_icon
+                .update(|tray| {
+                    tray.status_label = status_label;
+                    tray.icon = icon;
+                    tray.connect_enabled = connect_enabled;
+                    tray.disconnect_enabled = disconnect_enabled;
+                })
+                .await;
+        }
+    }
+
+    pub async fn run(&mut self) -> anyhow::Result<()> {
+        let mut rx = self.command_receiver.take().unwrap();
+
+        while let Some(command) = rx.recv().await {
+            match command {
+                TrayCommand::Update(status) => {
+                    if let Some(status) = status {
+                        self.status = status;
+                    }
+                    self.update().await;
+                }
+                TrayCommand::Exit => {
+                    break;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn pixmap_icons_supported(&self) -> bool {
+        std::env::var("XDG_CURRENT_DESKTOP")
+            .map(|s| s.to_lowercase())
+            .is_ok_and(|s| s.contains("gnome") || s.contains("kde"))
+    }
+}
+
+struct KsniTray {
+    status_label: String,
+    connect_enabled: bool,
+    disconnect_enabled: bool,
+    icon: PixmapOrName,
+    event_sender: Sender<TrayEvent>,
+}
+
+impl KsniTray {
+    fn new(event_sender: Sender<TrayEvent>) -> Self {
+        Self {
+            status_label: String::new(),
+            connect_enabled: false,
+            disconnect_enabled: false,
+            icon: PixmapOrName::Name(""),
+            event_sender,
+        }
+    }
+
+    fn send_tray_event(&self, event: TrayEvent) {
+        let sender = self.event_sender.clone();
+        tokio::spawn(async move { sender.send(event).await });
+    }
+}
+
+impl ksni::Tray for KsniTray {
+    const MENU_ON_ACTIVATE: bool = true;
+
+    fn id(&self) -> String {
+        "SNX-Edge".to_string()
     }
 
     fn icon_name(&self) -> String {
-        self.state.icon_name().into()
+        if let PixmapOrName::Name(name) = &self.icon {
+            name.to_string()
+        } else {
+            String::new()
+        }
+    }
+
+    fn icon_pixmap(&self) -> Vec<Icon> {
+        if let PixmapOrName::Pixmap(icon) = &self.icon {
+            vec![icon.clone()]
+        } else {
+            vec![]
+        }
     }
 
     fn menu(&self) -> Vec<MenuItem<Self>> {
-        let is_connected = self.state == TrayState::Connected;
-        let is_admin = self
-            .role
-            .as_deref()
-            .is_some_and(|r| r.eq_ignore_ascii_case("admin"));
+        // TODO: When profiles are loaded from the server, populate Connect submenu.
+        // For now, simple connect with empty profile ID (server picks default).
+        let connect_item = MenuItem::Standard(StandardItem {
+            label: "Connect".to_string(),
+            enabled: self.connect_enabled,
+            activate: Box::new(|tray: &mut KsniTray| {
+                tray.send_tray_event(TrayEvent::Connect(String::new()))
+            }),
+            ..Default::default()
+        });
 
-        let mut items: Vec<MenuItem<Self>> = Vec::new();
-
-        // -- Servers submenu --
-        if !self.servers.is_empty() {
-            let active_idx = self.active_server;
-            let mut server_items: Vec<MenuItem<Self>> = Vec::new();
-
-            for (i, server) in self.servers.iter().enumerate() {
-                let is_active = active_idx == Some(i);
-                let label = if is_active {
-                    format!("\u{2713} {}", server.name)
-                } else {
-                    format!("  {}", server.name)
-                };
-                let idx = i;
-                server_items.push(
-                    StandardItem {
-                        label,
-                        enabled: !is_active,
-                        activate: Box::new(move |this: &mut Self| {
-                            let _ = this.action_tx.send(TrayAction::SwitchServer(idx));
-                        }),
-                        ..Default::default()
-                    }
-                    .into(),
-                );
-            }
-
-            server_items.push(MenuItem::Separator);
-            server_items.push(
-                StandardItem {
-                    label: "Manage Servers...".into(),
-                    activate: Box::new(|this: &mut Self| {
-                        let _ = this.action_tx.send(TrayAction::ManageServers);
-                    }),
-                    ..Default::default()
-                }
-                .into(),
-            );
-
-            items.push(
-                SubMenu {
-                    label: "Servers".into(),
-                    submenu: server_items,
-                    ..Default::default()
-                }
-                .into(),
-            );
-
-            items.push(MenuItem::Separator);
-        }
-
-        // -- Connect / Disconnect --
-        items.push(
-            StandardItem {
-                label: "Connect".into(),
-                enabled: !is_connected && self.state != TrayState::Connecting,
-                activate: Box::new(|this: &mut Self| {
-                    let _ = this.action_tx.send(TrayAction::Connect);
-                }),
+        vec![
+            MenuItem::Standard(StandardItem {
+                label: self.status_label.clone(),
+                enabled: false,
                 ..Default::default()
-            }
-            .into(),
-        );
-
-        items.push(
-            StandardItem {
-                label: "Disconnect".into(),
-                enabled: is_connected,
-                activate: Box::new(|this: &mut Self| {
-                    let _ = this.action_tx.send(TrayAction::Disconnect);
-                }),
+            }),
+            MenuItem::Separator,
+            connect_item,
+            MenuItem::Standard(StandardItem {
+                label: "Disconnect".to_string(),
+                enabled: self.disconnect_enabled,
+                activate: Box::new(|tray: &mut KsniTray| tray.send_tray_event(TrayEvent::Disconnect)),
                 ..Default::default()
-            }
-            .into(),
-        );
-
-        // -- Separator --
-        items.push(MenuItem::Separator);
-
-        // -- Profiles / Routing / Logs --
-        items.push(
-            StandardItem {
-                label: "Profiles...".into(),
-                activate: Box::new(|this: &mut Self| {
-                    let _ = this.action_tx.send(TrayAction::ShowProfiles);
-                }),
+            }),
+            MenuItem::Standard(StandardItem {
+                label: "Status".to_string(),
+                activate: Box::new(|tray: &mut KsniTray| tray.send_tray_event(TrayEvent::Status)),
                 ..Default::default()
-            }
-            .into(),
-        );
-
-        items.push(
-            StandardItem {
-                label: "Routing...".into(),
-                activate: Box::new(|this: &mut Self| {
-                    let _ = this.action_tx.send(TrayAction::ShowRouting);
-                }),
+            }),
+            MenuItem::Standard(StandardItem {
+                label: "Routing".to_string(),
+                activate: Box::new(|tray: &mut KsniTray| tray.send_tray_event(TrayEvent::Routing)),
                 ..Default::default()
-            }
-            .into(),
-        );
-
-        items.push(
-            StandardItem {
-                label: "Logs...".into(),
-                activate: Box::new(|this: &mut Self| {
-                    let _ = this.action_tx.send(TrayAction::ShowLogs);
-                }),
+            }),
+            MenuItem::Standard(StandardItem {
+                label: "Logs".to_string(),
+                activate: Box::new(|tray: &mut KsniTray| tray.send_tray_event(TrayEvent::Logs)),
                 ..Default::default()
-            }
-            .into(),
-        );
-
-        // -- Admin section (only if role == "admin") --
-        if is_admin {
-            items.push(MenuItem::Separator);
-
-            items.push(
-                StandardItem {
-                    label: "Users...".into(),
-                    activate: Box::new(|this: &mut Self| {
-                        let _ = this.action_tx.send(TrayAction::ShowUsers);
-                    }),
-                    ..Default::default()
-                }
-                .into(),
-            );
-        }
-
-        // -- Bottom section --
-        items.push(MenuItem::Separator);
-
-        items.push(
-            StandardItem {
-                label: "About".into(),
-                activate: Box::new(|this: &mut Self| {
-                    let _ = this.action_tx.send(TrayAction::ShowAbout);
-                }),
+            }),
+            MenuItem::Standard(StandardItem {
+                label: "Settings".to_string(),
+                activate: Box::new(|tray: &mut KsniTray| tray.send_tray_event(TrayEvent::Settings)),
                 ..Default::default()
-            }
-            .into(),
-        );
-
-        items.push(
-            StandardItem {
-                label: "Quit".into(),
-                icon_name: "application-exit".into(),
-                activate: Box::new(|this: &mut Self| {
-                    let _ = this.action_tx.send(TrayAction::Quit);
-                }),
+            }),
+            MenuItem::Separator,
+            MenuItem::Standard(StandardItem {
+                label: "Servers".to_string(),
+                activate: Box::new(|tray: &mut KsniTray| tray.send_tray_event(TrayEvent::Servers)),
                 ..Default::default()
-            }
-            .into(),
-        );
-
-        items
+            }),
+            MenuItem::Standard(StandardItem {
+                label: "Users".to_string(),
+                activate: Box::new(|tray: &mut KsniTray| tray.send_tray_event(TrayEvent::Users)),
+                ..Default::default()
+            }),
+            MenuItem::Standard(StandardItem {
+                label: "About".to_string(),
+                activate: Box::new(|tray: &mut KsniTray| tray.send_tray_event(TrayEvent::About)),
+                ..Default::default()
+            }),
+            MenuItem::Standard(StandardItem {
+                label: "Exit".to_string(),
+                activate: Box::new(|tray: &mut KsniTray| tray.send_tray_event(TrayEvent::Exit)),
+                ..Default::default()
+            }),
+        ]
     }
-}
-
-// ---------------------------------------------------------------------------
-// TrayHandle -- public wrapper
-// ---------------------------------------------------------------------------
-
-/// Wrapper around the running ksni tray.
-///
-/// Use [`spawn`] to create it.  Then call [`send_command`] to update the
-/// tray state, and receive [`TrayAction`]s from the `glib::Sender` passed
-/// at creation time.
-pub struct TrayHandle {
-    handle: Handle<SnxTray>,
-}
-
-impl TrayHandle {
-    /// Push a [`TrayCommand`] to the tray, updating its visual state.
-    /// Returns `false` if the tray has already shut down.
-    pub async fn send_command(&self, cmd: TrayCommand) -> bool {
-        match cmd {
-            TrayCommand::UpdateStatus(status) => {
-                let new_state = TrayState::from_status(&status);
-                self.handle
-                    .update(move |tray| {
-                        tray.state = new_state;
-                    })
-                    .await
-                    .is_some()
-            }
-            TrayCommand::SetRole(role) => {
-                self.handle
-                    .update(move |tray| {
-                        tray.role = role;
-                    })
-                    .await
-                    .is_some()
-            }
-            TrayCommand::UpdateServers { servers, active } => {
-                self.handle
-                    .update(move |tray| {
-                        tray.servers = servers;
-                        tray.active_server = active;
-                    })
-                    .await
-                    .is_some()
-            }
-        }
-    }
-
-    /// Shut down the tray icon.
-    pub fn shutdown(&self) {
-        self.handle.shutdown();
-    }
-
-    /// Check if the tray service has already stopped.
-    pub fn is_closed(&self) -> bool {
-        self.handle.is_closed()
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Spawn helper
-// ---------------------------------------------------------------------------
-
-/// Spawn the system tray.
-///
-/// * `action_tx` - an `UnboundedSender<TrayAction>` whose receiver lives on
-///   the GTK main loop side (e.g. via `glib::spawn_future_local` or a channel
-///   bridge).
-///
-/// Returns a [`TrayHandle`] that can be used to push [`TrayCommand`]s to
-/// the tray from any async context.
-///
-/// This function is `async` because ksni 0.3 spawns the tray on the tokio
-/// runtime.
-pub async fn spawn(action_tx: UnboundedSender<TrayAction>) -> Result<TrayHandle, ksni::Error> {
-    let tray = SnxTray {
-        state: TrayState::Disconnected,
-        role: None,
-        servers: Vec::new(),
-        active_server: None,
-        action_tx,
-    };
-
-    info!("Starting system tray");
-
-    let handle = tray.spawn().await?;
-
-    debug!("System tray spawned successfully");
-
-    Ok(TrayHandle { handle })
 }
