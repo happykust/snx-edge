@@ -5,31 +5,26 @@ services:
       dockerfile: docker/Dockerfile
     ports:
       - "8080:8080"
+    environment:
+      - SNX_EDGE_JWT_SECRET=dev-secret-at-least-32-characters-long!!
+      - SNX_EDGE_ADMIN_USER=admin
+      - SNX_EDGE_ADMIN_PASSWORD=admin123456
+      - ROUTEROS_HOST=172.19.0.1
+      - ROUTEROS_USER=snx-edge
+      - ROUTEROS_PASSWORD=routeros-dev
+    volumes:
+      - snx-config:/etc/snx-edge
+      - snx-data:/var/lib/snx-edge
+      - snx-logs:/var/log/snx-edge
     cap_add:
       - NET_ADMIN
     devices:
-      - "/dev/net/tun:/dev/net/tun"
-    environment:
-      # SNX_EDGE_JWT_SECRET must be at least 32 characters
-      - SNX_EDGE_JWT_SECRET=${SNX_EDGE_JWT_SECRET}
-      - SNX_EDGE_ADMIN_USER=admin
-      - SNX_EDGE_ADMIN_PASSWORD=admin12345
-      - ROUTEROS_HOST=${ROUTEROS_HOST:-172.19.0.1}
-      - ROUTEROS_USER=${ROUTEROS_USER:-snx-edge}
-      - ROUTEROS_PASSWORD=${ROUTEROS_PASSWORD:-changeme}
-      - RUST_LOG=info
-    volumes:
-      - snx-data:/var/lib/snx-edge
-      - snx-logs:/var/log/snx-edge
-      - ./config.toml.example:/etc/snx-edge/config.toml:ro
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/api/v1/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 10s
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      - net.ipv4.ip_forward=1
     restart: unless-stopped
 
 volumes:
+  snx-config:
   snx-data:
   snx-logs:
