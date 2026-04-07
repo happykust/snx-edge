@@ -1,5 +1,6 @@
 use axum::extract::{Multipart, Path, State};
-use axum::http::StatusCode;
+use axum::http::{header, StatusCode};
+use axum::response::IntoResponse;
 use axum::routing::{delete, get, post, put};
 use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
@@ -243,43 +244,82 @@ async fn upload_certs(
     Ok(Json(profile_to_response(updated)))
 }
 
-/// GET /api/v1/profiles/{id}/export — export profile as JSON (secrets stripped).
+/// GET /api/v1/profiles/{id}/export — export profile as TOML (secrets stripped).
 async fn export_profile(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
     Path(id): Path<String>,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<impl IntoResponse, AppError> {
     if !has_permission(&claims, "profiles.read") {
         return Err(AppError::Forbidden("permission 'profiles.read' required".to_string()));
     }
 
     let profile = state.db.get_profile(&id).await?;
-    let mut config = profile.config;
+    let config = profile.config;
+
+    // Convert JSON config to toml::Value
+    let mut toml_value: toml::Value = serde_json::from_value(config)
+        .map_err(|e| AppError::Internal(format!("failed to convert config to TOML: {e}")))?;
 
     // Strip secrets for export
-    if let Some(obj) = config.as_object_mut() {
+    if let Some(table) = toml_value.as_table_mut() {
         for key in ["password", "cert_password"] {
-            obj.remove(key);
+            table.remove(key);
         }
     }
 
-    Ok(Json(serde_json::json!({
-        "name": profile.name,
-        "config": config,
-    })))
+    let toml_string = toml::to_string_pretty(&toml_value)
+        .map_err(|e| AppError::Internal(format!("failed to serialize TOML: {e}")))?;
+
+    let filename = format!("{}.conf", profile.name.replace(' ', "_"));
+
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/toml".to_string()),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{filename}\""),
+            ),
+        ],
+        toml_string,
+    ))
 }
 
-/// POST /api/v1/profiles/import — import profile from JSON.
+/// POST /api/v1/profiles/import — import profile from TOML.
 async fn import_profile(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
-    Json(req): Json<CreateProfileRequest>,
+    body: String,
 ) -> Result<(StatusCode, Json<ProfileResponse>), AppError> {
     if !has_permission(&claims, "profiles.write") {
         return Err(AppError::Forbidden("permission 'profiles.write' required".to_string()));
     }
 
-    let profile = state.db.create_profile(&req.name, &req.config).await?;
+    // Parse TOML input
+    let toml_value: toml::Value = body
+        .parse()
+        .map_err(|e| AppError::BadRequest(format!("invalid TOML: {e}")))?;
+
+    // Convert TOML to JSON
+    let config: serde_json::Value = serde_json::to_value(&toml_value)
+        .map_err(|e| AppError::Internal(format!("failed to convert TOML to JSON: {e}")))?;
+
+    // Extract profile name from TOML or use filename-derived default
+    let name = config
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("imported")
+        .to_string();
+
+    // Remove the "name" key from config since it's stored separately
+    let config = if let serde_json::Value::Object(mut map) = config {
+        map.remove("name");
+        serde_json::Value::Object(map)
+    } else {
+        config
+    };
+
+    let profile = state.db.create_profile(&name, &config).await?;
     Ok((StatusCode::CREATED, Json(profile_to_response(profile))))
 }
 
