@@ -8,63 +8,70 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: -Dwarnings
 
 jobs:
   check:
-    name: Check & Clippy
+    name: Check & Lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
-
+          components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install system dependencies
+      - name: Install GTK4 dev dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev libdbus-1-dev
+          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev
 
-      - name: Cargo check
-        run: cargo check --workspace
+      - name: Check formatting
+        run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --workspace -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
   test:
     name: Test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
       - uses: dtolnay/rust-toolchain@stable
-
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install system dependencies
+      - name: Install GTK4 dev dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev libdbus-1-dev
+          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev
 
       - name: Run tests
-        run: cargo test -p snx-edge-server
+        run: cargo test --workspace
 
-  fmt:
-    name: Format
+  build-server:
+    name: Build Server (${{ matrix.arch }})
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            arch: amd64
+          - target: aarch64-unknown-linux-musl
+            arch: arm64
     steps:
       - uses: actions/checkout@v4
-
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
         with:
-          components: rustfmt
+          key: ${{ matrix.target }}
 
-      - name: Check formatting
-        run: cargo fmt --all -- --check
+      - name: Install cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build
+        run: cross build --release --target ${{ matrix.target }} -p snx-edge-server
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: snx-edge-server-${{ matrix.arch }}
+          path: target/${{ matrix.target }}/release/snx-edge-server
