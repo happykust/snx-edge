@@ -11,7 +11,7 @@ pub struct AddressListEntry {
     pub comment: Option<String>,
     #[serde(default)]
     pub disabled: Option<String>,
-    #[serde(rename = "creation-time", default)]
+    #[serde(alias = "creation-time", default)]
     pub creation_time: Option<String>,
 }
 
