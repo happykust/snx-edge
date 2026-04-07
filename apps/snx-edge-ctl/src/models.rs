@@ -15,11 +15,9 @@ pub struct LoginRequest {
 #[allow(dead_code)]
 pub struct TokenResponse {
     pub access_token: String,
-    pub refresh_token: Option<String>,
-    #[serde(default)]
-    pub token_type: Option<String>,
-    #[serde(default)]
-    pub expires_in: Option<i64>,
+    pub refresh_token: String,
+    pub token_type: String,
+    pub expires_in: i64,
 }
 
 #[derive(Debug, Serialize)]

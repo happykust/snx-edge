@@ -13,6 +13,37 @@ use crate::api::ApiClient;
 use crate::output::OutputMode;
 use crate::servers::ClientSettings;
 
+/// Display wrapper for server entries in tabular output.
+#[derive(serde::Serialize)]
+struct ServerDisplay {
+    name: String,
+    url: String,
+    active: bool,
+    auto_connect: bool,
+}
+
+impl tabled::Tabled for ServerDisplay {
+    const LENGTH: usize = 4;
+
+    fn fields(&self) -> Vec<std::borrow::Cow<'_, str>> {
+        vec![
+            std::borrow::Cow::Borrowed(&self.name),
+            std::borrow::Cow::Borrowed(&self.url),
+            std::borrow::Cow::Owned(if self.active { "*".to_string() } else { String::new() }),
+            std::borrow::Cow::Owned(if self.auto_connect { "yes".to_string() } else { String::new() }),
+        ]
+    }
+
+    fn headers() -> Vec<std::borrow::Cow<'static, str>> {
+        vec![
+            std::borrow::Cow::Borrowed("Name"),
+            std::borrow::Cow::Borrowed("URL"),
+            std::borrow::Cow::Borrowed("Active"),
+            std::borrow::Cow::Borrowed("Auto-Connect"),
+        ]
+    }
+}
+
 // ============================================================
 // CLI structure
 // ============================================================
@@ -39,6 +70,10 @@ struct Cli {
     /// Suppress output (exit code only)
     #[arg(long, global = true)]
     quiet: bool,
+
+    /// Accept invalid TLS certificates (insecure)
+    #[arg(long, global = true)]
+    insecure: bool,
 
     #[command(subcommand)]
     command: Commands,
@@ -339,7 +374,7 @@ fn resolve_server(cli: &Cli) -> anyhow::Result<String> {
 /// Build an authenticated ApiClient: --token flag > keyring refresh_token > error.
 async fn ensure_auth(cli: &Cli) -> anyhow::Result<ApiClient> {
     let server_url = resolve_server(cli)?;
-    let mut client = ApiClient::new(&server_url);
+    let mut client = ApiClient::new(&server_url, cli.insecure);
 
     if let Some(token) = &cli.token {
         client.set_token(token.clone());
@@ -352,10 +387,8 @@ async fn ensure_auth(cli: &Cli) -> anyhow::Result<ApiClient> {
 
     let token_resp = client.refresh(&refresh_token).await?;
 
-    // Save the new refresh token if provided
-    if let Some(new_refresh) = &token_resp.refresh_token {
-        auth::save_refresh_token(&server_url, new_refresh);
-    }
+    // Save the new refresh token
+    auth::save_refresh_token(&server_url, &token_resp.refresh_token);
 
     Ok(client)
 }
@@ -388,7 +421,7 @@ async fn resolve_profile_id(client: &ApiClient, profile: &str) -> anyhow::Result
 
 async fn cmd_health(cli: &Cli, mode: OutputMode) -> anyhow::Result<()> {
     let server_url = resolve_server(cli)?;
-    let client = ApiClient::new(&server_url);
+    let client = ApiClient::new(&server_url, cli.insecure);
     let health = client.health().await?;
     output::print_item(mode, &health);
     Ok(())
@@ -399,36 +432,19 @@ async fn cmd_server(action: &ServerAction, mode: OutputMode) -> anyhow::Result<(
 
     match action {
         ServerAction::List => {
-            if settings.servers.is_empty() {
-                output::print_ok(mode, "No servers configured.");
-                return Ok(());
-            }
             let active_idx = settings.active_server;
-            for (i, s) in settings.servers.iter().enumerate() {
-                let marker = if Some(i) == active_idx { " *" } else { "" };
-                if mode == OutputMode::Table {
-                    println!(
-                        "  {}{} -> {}{}",
-                        s.name,
-                        marker,
-                        s.url,
-                        if s.auto_connect {
-                            " [auto-connect]"
-                        } else {
-                            ""
-                        }
-                    );
-                }
-            }
-            if mode == OutputMode::Json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "servers": settings.servers,
-                        "active": active_idx,
-                    }))?
-                );
-            }
+            let display: Vec<ServerDisplay> = settings
+                .servers
+                .iter()
+                .enumerate()
+                .map(|(i, s)| ServerDisplay {
+                    name: s.name.clone(),
+                    url: s.url.clone(),
+                    active: Some(i) == active_idx,
+                    auto_connect: s.auto_connect,
+                })
+                .collect();
+            output::print_list(mode, &display);
         }
         ServerAction::Add { name, url } => {
             settings.add(name, url)?;
@@ -453,7 +469,7 @@ async fn cmd_server(action: &ServerAction, mode: OutputMode) -> anyhow::Result<(
 
 async fn cmd_login(cli: &Cli, mode: OutputMode) -> anyhow::Result<()> {
     let server_url = resolve_server(cli)?;
-    let mut client = ApiClient::new(&server_url);
+    let mut client = ApiClient::new(&server_url, cli.insecure);
 
     let username = {
         eprint!("Username: ");
@@ -469,9 +485,7 @@ async fn cmd_login(cli: &Cli, mode: OutputMode) -> anyhow::Result<()> {
 
     let token_resp = client.login(&username, &password).await?;
 
-    if let Some(refresh) = &token_resp.refresh_token {
-        auth::save_refresh_token(&server_url, refresh);
-    }
+    auth::save_refresh_token(&server_url, &token_resp.refresh_token);
 
     output::print_ok(mode, "Login successful.");
     Ok(())
@@ -502,9 +516,17 @@ async fn cmd_connect(
                 .and_then(|(_, s)| s.last_profile_id.clone());
             match last_id {
                 Some(id) => id,
-                None => bail!(
-                    "No profile specified. Use --profile <id|name> or set last_profile_id in servers.toml"
-                ),
+                None => {
+                    // Fallback: use the first available profile
+                    let profiles = client.list_profiles().await?;
+                    match profiles.into_iter().next() {
+                        Some(p) => p.id,
+                        None => bail!(
+                            "No profile specified and no profiles found on server. \
+                             Use --profile <id|name> or create a profile first."
+                        ),
+                    }
+                }
             }
         }
     };
@@ -582,7 +604,8 @@ async fn cmd_profiles(
             output::print_list(mode, &profiles);
         }
         ProfileAction::Show { id } => {
-            let profile = client.get_profile(id).await?;
+            let resolved_id = resolve_profile_id(&client, id).await?;
+            let profile = client.get_profile(&resolved_id).await?;
             output::print_item(mode, &profile);
         }
         ProfileAction::Create { name, file } => {
@@ -610,8 +633,9 @@ async fn cmd_profiles(
             output::print_item(mode, &profile);
         }
         ProfileAction::Delete { id } => {
-            client.delete_profile(id).await?;
-            output::print_ok(mode, &format!("Profile {} deleted.", id));
+            let resolved_id = resolve_profile_id(&client, id).await?;
+            client.delete_profile(&resolved_id).await?;
+            output::print_ok(mode, &format!("Profile {} deleted.", resolved_id));
         }
         ProfileAction::Import { file } => {
             let content = std::fs::read_to_string(file)
@@ -819,29 +843,24 @@ async fn cmd_logs(
             match event {
                 Ok(Event::Open) => {}
                 Ok(Event::Message(msg)) => {
-                    if msg.event == "log" {
-                        if mode == OutputMode::Json {
-                            println!("{}", msg.data);
-                        } else if mode == OutputMode::Table {
-                            if let Ok(entry) =
-                                serde_json::from_str::<models::LogEntry>(
-                                    &msg.data,
-                                )
-                            {
-                                let show = match level {
-                                    Some(l) => {
-                                        entry.level.eq_ignore_ascii_case(l)
-                                    }
-                                    None => true,
-                                };
-                                if show {
-                                    println!(
-                                        "[{}] {} {}",
-                                        entry.level,
-                                        entry.timestamp,
-                                        entry.message
-                                    );
-                                }
+                    if msg.event == "log"
+                        && let Ok(entry) =
+                            serde_json::from_str::<models::LogEntry>(&msg.data)
+                    {
+                        let show = match level {
+                            Some(l) => entry.level.eq_ignore_ascii_case(l),
+                            None => true,
+                        };
+                        if show {
+                            if mode == OutputMode::Json {
+                                println!("{}", msg.data);
+                            } else if mode == OutputMode::Table {
+                                println!(
+                                    "[{}] {} {}",
+                                    entry.level,
+                                    entry.timestamp,
+                                    entry.message
+                                );
                             }
                         }
                     }
@@ -854,4 +873,102 @@ async fn cmd_logs(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn test_parse_status() {
+        let cli = Cli::try_parse_from(["snx-edge-ctl", "--server", "https://vpn.example.com", "status"]).unwrap();
+        assert!(matches!(cli.command, Commands::Status));
+        assert_eq!(cli.server.as_deref(), Some("https://vpn.example.com"));
+    }
+
+    #[test]
+    fn test_parse_connect_with_profile() {
+        let cli = Cli::try_parse_from(["snx-edge-ctl", "connect", "--profile", "my-vpn"]).unwrap();
+        match cli.command {
+            Commands::Connect { profile } => assert_eq!(profile.as_deref(), Some("my-vpn")),
+            _ => panic!("expected Connect command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_server_global_flag() {
+        let cli = Cli::try_parse_from(["snx-edge-ctl", "--server", "prod", "health"]).unwrap();
+        assert_eq!(cli.server.as_deref(), Some("prod"));
+        assert!(matches!(cli.command, Commands::Health));
+    }
+
+    #[test]
+    fn test_parse_json_flag() {
+        let cli = Cli::try_parse_from(["snx-edge-ctl", "--json", "status"]).unwrap();
+        assert!(cli.json);
+        assert!(!cli.quiet);
+    }
+
+    #[test]
+    fn test_parse_insecure_flag() {
+        let cli = Cli::try_parse_from(["snx-edge-ctl", "--insecure", "health"]).unwrap();
+        assert!(cli.insecure);
+    }
+
+    #[test]
+    fn test_parse_routing_subcommands() {
+        let cli = Cli::try_parse_from(["snx-edge-ctl", "routing", "clients"]).unwrap();
+        match cli.command {
+            Commands::Routing { action: RoutingAction::Clients { action } } => {
+                assert!(action.is_none());
+            }
+            _ => panic!("expected Routing Clients command"),
+        }
+
+        let cli = Cli::try_parse_from(["snx-edge-ctl", "routing", "clients", "add", "10.0.0.1", "--comment", "test"]).unwrap();
+        match cli.command {
+            Commands::Routing {
+                action: RoutingAction::Clients {
+                    action: Some(ClientAction::Add { address, comment }),
+                },
+            } => {
+                assert_eq!(address, "10.0.0.1");
+                assert_eq!(comment.as_deref(), Some("test"));
+            }
+            _ => panic!("expected Routing Clients Add command"),
+        }
+
+        let cli = Cli::try_parse_from(["snx-edge-ctl", "routing", "setup"]).unwrap();
+        assert!(matches!(cli.command, Commands::Routing { action: RoutingAction::Setup }));
+
+        let cli = Cli::try_parse_from(["snx-edge-ctl", "routing", "diagnostics"]).unwrap();
+        assert!(matches!(cli.command, Commands::Routing { action: RoutingAction::Diagnostics }));
+    }
+
+    #[test]
+    fn test_parse_users_subcommands() {
+        let cli = Cli::try_parse_from(["snx-edge-ctl", "users", "list"]).unwrap();
+        assert!(matches!(cli.command, Commands::Users { action: UserAction::List }));
+
+        let cli = Cli::try_parse_from([
+            "snx-edge-ctl", "users", "create", "admin", "--role", "admin", "--password", "secret",
+        ]).unwrap();
+        match cli.command {
+            Commands::Users {
+                action: UserAction::Create { username, role, password, .. },
+            } => {
+                assert_eq!(username, "admin");
+                assert_eq!(role, "admin");
+                assert_eq!(password.as_deref(), Some("secret"));
+            }
+            _ => panic!("expected Users Create command"),
+        }
+
+        let cli = Cli::try_parse_from(["snx-edge-ctl", "users", "me"]).unwrap();
+        assert!(matches!(cli.command, Commands::Users { action: UserAction::Me }));
+
+        let cli = Cli::try_parse_from(["snx-edge-ctl", "users", "sessions"]).unwrap();
+        assert!(matches!(cli.command, Commands::Users { action: UserAction::Sessions }));
+    }
 }

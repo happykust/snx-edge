@@ -1,7 +1,7 @@
-/// Keyring-based token storage, compatible with snx-edge-client (GUI).
-///
-/// Service name: "snx-edge"
-/// Key: server URL
+//! Keyring-based token storage, compatible with snx-edge-client (GUI).
+//!
+//! Service name: "snx-edge"
+//! Key: server URL
 
 /// Save a refresh token to the system keyring.
 pub fn save_refresh_token(server_url: &str, token: &str) {

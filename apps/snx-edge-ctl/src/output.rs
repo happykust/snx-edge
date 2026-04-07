@@ -44,11 +44,42 @@ pub fn print_list<T: Tabled + Serialize>(mode: OutputMode, items: &[T]) {
     }
 }
 
-/// Print a single item as formatted debug output or JSON.
-pub fn print_item<T: Serialize + std::fmt::Debug>(mode: OutputMode, item: &T) {
+/// Print a single item as key-value pairs or JSON.
+pub fn print_item<T: Serialize>(mode: OutputMode, item: &T) {
     match mode {
         OutputMode::Table => {
-            println!("{:#?}", item);
+            if let Ok(serde_json::Value::Object(map)) = serde_json::to_value(item) {
+                // Find the longest key for alignment
+                let max_key_len = map.keys().map(|k| k.len()).max().unwrap_or(0);
+                for (key, value) in &map {
+                    let display_value = match value {
+                        serde_json::Value::String(s) => s.clone(),
+                        serde_json::Value::Null => "-".to_string(),
+                        serde_json::Value::Array(arr) => {
+                            let items: Vec<String> = arr
+                                .iter()
+                                .map(|v| match v {
+                                    serde_json::Value::String(s) => s.clone(),
+                                    other => other.to_string(),
+                                })
+                                .collect();
+                            if items.is_empty() {
+                                "-".to_string()
+                            } else {
+                                items.join(", ")
+                            }
+                        }
+                        other => other.to_string(),
+                    };
+                    println!("{:<width$}  {}", format!("{}:", key), display_value, width = max_key_len + 1);
+                }
+            } else {
+                // Fallback for non-object types
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(item).unwrap_or_else(|_| "null".to_string())
+                );
+            }
         }
         OutputMode::Json => {
             println!(

@@ -11,12 +11,12 @@ pub struct ApiClient {
 }
 
 impl ApiClient {
-    pub fn new(base_url: &str) -> Self {
+    pub fn new(base_url: &str, insecure: bool) -> Self {
         Self {
             client: Client::builder()
-                .danger_accept_invalid_certs(true)
+                .danger_accept_invalid_certs(insecure)
                 .build()
-                .unwrap_or_default(),
+                .expect("Failed to build HTTP client"),
             base_url: base_url.trim_end_matches('/').to_string(),
             token: None,
         }
