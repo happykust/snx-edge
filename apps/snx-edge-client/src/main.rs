@@ -184,6 +184,7 @@ async fn main() -> anyhow::Result<()> {
                             main_window(),
                             ctx.tray_cmd.clone(),
                             ctx.api.clone(),
+                            ctx.auth.clone(),
                             ctx.profile_store.clone(),
                         );
                     }
