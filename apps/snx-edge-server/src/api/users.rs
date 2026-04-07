@@ -28,10 +28,9 @@ pub struct UpdateUserRequest {
 
 #[derive(Deserialize)]
 pub struct ChangePasswordRequest {
+    #[serde(default)]
     pub current_password: Option<String>,
     pub new_password: String,
-    /// Required when an admin changes another user's password (admin must prove identity).
-    pub caller_password: Option<String>,
 }
 
 // === Helpers ===
@@ -160,26 +159,32 @@ async fn change_user_password(
     Path(id): Path<String>,
     Json(req): Json<ChangePasswordRequest>,
 ) -> Result<axum::http::StatusCode, AppError> {
-    require_permission(&claims, "users.update")?;
+    if claims.sub == id {
+        // User is changing their own password — require current_password
+        let current = req
+            .current_password
+            .as_deref()
+            .ok_or_else(|| AppError::BadRequest("current_password is required".to_string()))?;
 
-    // The caller (admin) must verify their own identity before changing another user's password
-    let caller_pw = req
-        .caller_password
-        .as_deref()
-        .ok_or_else(|| AppError::BadRequest("caller_password is required".to_string()))?;
-
-    let caller = state.db.get_user_by_id(&claims.sub).await?;
-    let caller_pw_owned = caller_pw.to_string();
-    let caller_hash = caller.password_hash.clone();
-    let valid = tokio::task::spawn_blocking(move || bcrypt::verify(caller_pw_owned, &caller_hash))
-        .await
-        .map_err(|e| AppError::Internal(format!("blocking task error: {e}")))?
-        .map_err(|e| AppError::Internal(format!("bcrypt error: {e}")))?;
-    if !valid {
-        return Err(AppError::Unauthorized(
-            "caller password is incorrect".to_string(),
+        let user = state.db.get_user_by_id(&claims.sub).await?;
+        let current_owned = current.to_string();
+        let hash = user.password_hash.clone();
+        let valid = tokio::task::spawn_blocking(move || bcrypt::verify(current_owned, &hash))
+            .await
+            .map_err(|e| AppError::Internal(format!("blocking task error: {e}")))?
+            .map_err(|e| AppError::Internal(format!("bcrypt error: {e}")))?;
+        if !valid {
+            return Err(AppError::Unauthorized(
+                "current password is incorrect".to_string(),
+            ));
+        }
+    } else if claims.role != "admin" {
+        // Non-admin trying to change another user's password
+        return Err(AppError::Forbidden(
+            "only admins can change other users' passwords".to_string(),
         ));
     }
+    // else: admin changing another user's password — no current_password needed
 
     state.db.change_password(&id, &req.new_password).await?;
     // Invalidate all sessions for this user
