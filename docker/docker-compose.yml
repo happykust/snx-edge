@@ -1,3 +1,5 @@
+# WARNING: This file contains development secrets.
+# Do NOT use these values in production. Override via .env or environment variables.
 services:
   snx-edge-server:
     build:

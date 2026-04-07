@@ -1,0 +1,7 @@
+target/
+.git/
+.idea/
+.github/
+docs/
+*.tar
+*.gz

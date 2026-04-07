@@ -32,7 +32,7 @@
 # --- 2. RouterOS REST API User ---
 # Create a dedicated user group with minimal permissions
 /user/group/add name=snx-edge-api \
-    policy=read,write,api,!ftp,!local,!ssh,!reboot,!policy,!test,!winbox,!password,!web,!sniff,!sensitive,!romon,!rest-api
+    policy=read,write,api,rest-api,!ftp,!local,!ssh,!reboot,!policy,!test,!winbox,!password,!web,!sniff,!sensitive,!romon
 
 # Create the API user (CHANGE_ME: set a strong password)
 /user/add name=snx-edge group=snx-edge-api password="CHANGE_ME"
