@@ -1,5 +1,5 @@
 [workspace]
-members = ["apps/snx-edge-server", "apps/snx-edge-client"]
+members = ["apps/snx-edge-server", "apps/snx-edge-client", "apps/snx-edge-ctl"]
 resolver = "3"
 
 [workspace.package]
@@ -63,6 +63,9 @@ thiserror = "2"
 anyhow = "1"
 base64 = "0.22"
 dirs-next = "2"
+clap = { version = "4", features = ["derive"] }
+tabled = "0.20"
+rpassword = "7"
 
 # VPN core
 snxcore = { git = "https://github.com/ancwrd1/snx-rs.git" }

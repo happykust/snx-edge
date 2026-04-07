@@ -1,0 +1,35 @@
+[package]
+name = "snx-edge-ctl"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "CLI client for remote management of snx-edge-server"
+
+[dependencies]
+# CLI
+clap.workspace = true
+tabled.workspace = true
+rpassword.workspace = true
+
+# Async runtime
+tokio.workspace = true
+
+# HTTP + SSE
+reqwest.workspace = true
+reqwest-eventsource.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+
+# Auth
+keyring.workspace = true
+
+# Logging / utils
+chrono.workspace = true
+uuid.workspace = true
+anyhow.workspace = true
+futures-util.workspace = true
+dirs-next.workspace = true
