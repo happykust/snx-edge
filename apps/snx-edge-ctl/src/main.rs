@@ -55,7 +55,7 @@ impl tabled::Tabled for ServerDisplay {
     version
 )]
 struct Cli {
-    /// Server URL or name from servers.toml
+    /// Server URL or name from client.toml
     #[arg(long, short = 's', global = true)]
     server: Option<String>,
 
@@ -503,14 +503,14 @@ async fn cmd_connect(
     mode: OutputMode,
     profile: Option<&str>,
 ) -> anyhow::Result<()> {
+    let server_url = resolve_server(cli)?;
     let client = ensure_auth(cli).await?;
 
     let profile_id = match profile {
         Some(p) => resolve_profile_id(&client, p).await?,
         None => {
-            // Try to use last_profile_id from servers.toml
+            // Try to use last_profile_id from client.toml
             let settings = ClientSettings::load();
-            let server_url = resolve_server(cli)?;
             let last_id = settings
                 .find_by_name_or_url(&server_url)
                 .and_then(|(_, s)| s.last_profile_id.clone());
@@ -534,7 +534,6 @@ async fn cmd_connect(
     // Remember the profile for next time
     {
         let mut settings = ClientSettings::load();
-        let server_url = resolve_server(cli)?;
         if let Some((idx, _)) = settings.find_by_name_or_url(&server_url) {
             settings.servers[idx].last_profile_id = Some(profile_id.clone());
             let _ = settings.save();
@@ -558,13 +557,13 @@ async fn cmd_reconnect(
     mode: OutputMode,
     profile: Option<&str>,
 ) -> anyhow::Result<()> {
+    let server_url = resolve_server(cli)?;
     let client = ensure_auth(cli).await?;
 
     let profile_id = match profile {
         Some(p) => resolve_profile_id(&client, p).await?,
         None => {
             let settings = ClientSettings::load();
-            let server_url = resolve_server(cli)?;
             settings
                 .find_by_name_or_url(&server_url)
                 .and_then(|(_, s)| s.last_profile_id.clone())
@@ -623,13 +622,14 @@ async fn cmd_profiles(
             output::print_item(mode, &profile);
         }
         ProfileAction::Update { id, file } => {
+            let resolved_id = resolve_profile_id(&client, id).await?;
             let content = std::fs::read_to_string(file)
                 .context(format!("Failed to read file: {}", file))?;
             let toml_val: toml::Value = content.parse().context("Invalid TOML")?;
             let config = serde_json::to_value(&toml_val)?;
 
             let body = serde_json::json!({ "config": config });
-            let profile = client.update_profile(id, &body).await?;
+            let profile = client.update_profile(&resolved_id, &body).await?;
             output::print_item(mode, &profile);
         }
         ProfileAction::Delete { id } => {
@@ -647,7 +647,8 @@ async fn cmd_profiles(
             id,
             output: out_file,
         } => {
-            let toml_str = client.export_profile(id).await?;
+            let resolved_id = resolve_profile_id(&client, id).await?;
+            let toml_str = client.export_profile(&resolved_id).await?;
             if let Some(path) = out_file {
                 std::fs::write(path, &toml_str)
                     .context(format!("Failed to write file: {}", path))?;
@@ -767,6 +768,17 @@ async fn cmd_users(
             output::print_ok(mode, &format!("User {} deleted.", id));
         }
         UserAction::Passwd { id } => {
+            let me = client.get_me().await?;
+            let is_self = me.id == *id;
+
+            let current_pw = if is_self {
+                let pw = rpassword::prompt_password("Current password: ")
+                    .context("Failed to read password")?;
+                Some(pw)
+            } else {
+                None
+            };
+
             let new_pw = rpassword::prompt_password("New password: ")
                 .context("Failed to read password")?;
             let confirm = rpassword::prompt_password("Confirm password: ")
@@ -774,7 +786,14 @@ async fn cmd_users(
             if new_pw != confirm {
                 bail!("Passwords do not match.");
             }
-            client.change_password(id, &new_pw, None).await?;
+
+            if is_self {
+                client
+                    .change_my_password(current_pw.as_deref().unwrap(), &new_pw)
+                    .await?;
+            } else {
+                client.change_password(id, &new_pw, None).await?;
+            }
             output::print_ok(mode, "Password changed.");
         }
         UserAction::Sessions => {
