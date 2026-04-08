@@ -618,14 +618,14 @@ fn format_diagnostics(val: &serde_json::Value) -> String {
     }
 
     // Warnings
-    if let Some(warnings) = val.get("warnings").and_then(|v| v.as_array()) {
-        if !warnings.is_empty() {
-            lines.push(String::new());
-            lines.push("Warnings:".to_string());
-            for w in warnings {
-                if let Some(s) = w.as_str() {
-                    lines.push(format!("  - {}", s));
-                }
+    if let Some(warnings) = val.get("warnings").and_then(|v| v.as_array())
+        && !warnings.is_empty()
+    {
+        lines.push(String::new());
+        lines.push("Warnings:".to_string());
+        for w in warnings {
+            if let Some(s) = w.as_str() {
+                lines.push(format!("  - {}", s));
             }
         }
     }

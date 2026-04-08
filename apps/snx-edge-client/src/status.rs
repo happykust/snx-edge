@@ -321,7 +321,7 @@ pub async fn show_status_dialog(sender: Sender<TrayEvent>, exit_on_close: bool, 
         let mut last_routing_health = RoutingHealth::Unknown;
         loop {
             // Check routing diagnostics every 5th poll (~10 seconds) or on first load
-            let routing_health = if poll_count % 5 == 0 {
+            let routing_health = if poll_count.is_multiple_of(5) {
                 match api.routing_diagnostics().await {
                     Ok(json) => {
                         let health = RoutingHealth::from_diagnostics(&json);

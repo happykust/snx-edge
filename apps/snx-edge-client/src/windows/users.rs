@@ -243,7 +243,7 @@ fn append_user_row(
     };
     title_box.append(
         &gtk4::Label::builder()
-            .label(&format!("[{}]", role))
+            .label(format!("[{}]", role))
             .halign(Align::Start)
             .css_classes(vec![role_class.to_string()])
             .build(),

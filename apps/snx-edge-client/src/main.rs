@@ -132,7 +132,7 @@ async fn main() -> anyhow::Result<()> {
             .build();
 
         let provider = gtk4::CssProvider::new();
-        provider.load_from_data(assets::APP_CSS);
+        provider.load_from_string(assets::APP_CSS);
         gtk4::style_context_add_provider_for_display(
             &gtk4::prelude::WidgetExt::display(&app_window),
             &provider,
@@ -316,7 +316,6 @@ async fn show_add_server_dialog_inner(ctx: Arc<tokio::sync::RwLock<AppContext>>)
                 // Retry — non-recursive to avoid boxing
                 drop(c);
                 show_add_server_dialog(ctx);
-                return;
             }
         }
     }
@@ -355,7 +354,6 @@ async fn show_login_for_server_inner(
                 let _ = show_notification("Login Failed", &e.to_string()).await;
                 drop(c);
                 show_login_for_server(ctx, url, name);
-                return;
             }
         }
     }
@@ -534,7 +532,7 @@ async fn show_login_only_dialog(server_name: &str, server_url: &str) -> Option<(
     let (tx, rx) = async_channel::bounded(1);
 
     let window = gtk4::Window::builder()
-        .title(&format!("SNX Edge — Login to {server_name}"))
+        .title(format!("SNX Edge — Login to {server_name}"))
         .transient_for(&main_window())
         .modal(true)
         .default_width(380)
@@ -551,7 +549,7 @@ async fn show_login_only_dialog(server_name: &str, server_url: &str) -> Option<(
 
     inner.append(
         &gtk4::Label::builder()
-            .label(&format!("Server: {server_url}"))
+            .label(format!("Server: {server_url}"))
             .halign(Align::Start)
             .css_classes(vec!["dim-label".to_string()])
             .build(),

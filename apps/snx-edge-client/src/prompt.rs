@@ -142,6 +142,7 @@ pub async fn show_prompt_dialog(title: &str, prompt: &str, secure: bool) -> Opti
 }
 
 /// Show a login dialog with username and password fields.
+#[allow(dead_code)]
 pub async fn show_login_dialog() -> Option<(String, String)> {
     let (tx, rx) = async_channel::bounded(1);
 

@@ -1215,13 +1215,13 @@ impl SettingsDialog {
                             .title("Select Certificate File")
                             .modal(true)
                             .build();
-                        if let Ok(file) = dialog.open_future(Some(&window)).await {
-                            if let Some(path) = file.path() {
-                                widgets
-                                    .profile_config
-                                    .cert_path
-                                    .set_text(&path.to_string_lossy());
-                            }
+                        if let Ok(file) = dialog.open_future(Some(&window)).await
+                            && let Some(path) = file.path()
+                        {
+                            widgets
+                                .profile_config
+                                .cert_path
+                                .set_text(&path.to_string_lossy());
                         }
                     }
                 ));
