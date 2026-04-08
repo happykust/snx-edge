@@ -12,6 +12,23 @@ use crate::api::auth::Claims;
 use crate::state::{AppState, ServerEvent};
 
 /// GET /api/v1/events — SSE stream of state change events.
+///
+/// # Permission model
+///
+/// No explicit permission check is performed here because the auth middleware
+/// already guarantees that `_claims` belongs to a valid, authenticated user.
+/// Every role (admin, operator, viewer) has `tunnel.status` which makes an
+/// additional gate redundant.
+///
+/// LogEntry events are broadcast to all subscribers regardless of the
+/// `logs.read` permission. This is a deliberate trade-off: the log entries
+/// sent over SSE are the same ephemeral in-memory lines visible in the
+/// `/api/v1/logs` endpoint, and filtering per-connection would require
+/// wrapping the broadcast stream in a per-role filter that references the
+/// claims — adding complexity for marginal security benefit. If fine-grained
+/// log-event filtering becomes necessary, add a `.filter()` stage here that
+/// checks `has_permission(&claims, "logs.read")` before emitting `LogEntry`
+/// variants.
 async fn events_stream(
     State(state): State<AppState>,
     Extension(_claims): Extension<Claims>,

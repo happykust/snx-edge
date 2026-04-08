@@ -139,6 +139,7 @@ impl RouterOsClient {
         list_name: &str,
         address: &str,
         comment: Option<&str>,
+        disabled: Option<bool>,
     ) -> Result<super::models::AddressListEntry, AppError> {
         // Check for duplicates
         let existing = self.list_address_list(list_name).await?;
@@ -148,11 +149,16 @@ impl RouterOsClient {
             )));
         }
 
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "list": list_name,
             "address": address,
             "comment": comment.unwrap_or(&self.comment_tag),
         });
+
+        // RouterOS expects "disabled" as a string "true"/"false"
+        if let Some(dis) = disabled {
+            body["disabled"] = serde_json::Value::String(dis.to_string());
+        }
 
         self.create("/ip/firewall/address-list", &body).await
     }

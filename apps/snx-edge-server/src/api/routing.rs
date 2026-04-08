@@ -59,6 +59,11 @@ fn validate_address(address: &str) -> Result<(), AppError> {
     )))
 }
 
+// NOTE: RouterOsClient is re-created per request. This is intentional — the env var
+// reads (ROUTEROS_HOST, ROUTEROS_USER, ROUTEROS_PASSWORD) are microsecond-cheap
+// compared to the HTTP calls that follow, and re-creating allows picking up rotated
+// credentials without a server restart. Caching the client in AppState would save
+// negligible time while complicating credential rotation and config reload.
 async fn make_client(state: &AppState) -> Result<RouterOsClient, AppError> {
     let config = state.config.read().await;
     RouterOsClient::new(&config.routeros)
@@ -86,10 +91,11 @@ async fn list_clients(
     }
 
     let client = make_client(&state).await?;
-    let config = state.config.read().await;
-    let entries = client
-        .list_address_list(&config.routeros.address_list_vpn)
-        .await?;
+    let address_list_vpn = {
+        let config = state.config.read().await;
+        config.routeros.address_list_vpn.clone()
+    };
+    let entries = client.list_address_list(&address_list_vpn).await?;
     Ok(Json(entries))
 }
 
@@ -106,12 +112,16 @@ async fn add_client(
     validate_address(&req.address)?;
 
     let client = make_client(&state).await?;
-    let config = state.config.read().await;
+    let address_list_vpn = {
+        let config = state.config.read().await;
+        config.routeros.address_list_vpn.clone()
+    };
     let entry = client
         .add_address(
-            &config.routeros.address_list_vpn,
+            &address_list_vpn,
             &req.address,
             req.comment.as_deref(),
+            req.disabled,
         )
         .await?;
 
@@ -148,10 +158,11 @@ async fn list_bypass(
     }
 
     let client = make_client(&state).await?;
-    let config = state.config.read().await;
-    let entries = client
-        .list_address_list(&config.routeros.address_list_bypass)
-        .await?;
+    let address_list_bypass = {
+        let config = state.config.read().await;
+        config.routeros.address_list_bypass.clone()
+    };
+    let entries = client.list_address_list(&address_list_bypass).await?;
     Ok(Json(entries))
 }
 
@@ -168,12 +179,16 @@ async fn add_bypass(
     validate_address(&req.address)?;
 
     let client = make_client(&state).await?;
-    let config = state.config.read().await;
+    let address_list_bypass = {
+        let config = state.config.read().await;
+        config.routeros.address_list_bypass.clone()
+    };
     let entry = client
         .add_address(
-            &config.routeros.address_list_bypass,
+            &address_list_bypass,
             &req.address,
             req.comment.as_deref(),
+            req.disabled,
         )
         .await?;
 
@@ -210,7 +225,10 @@ async fn routing_status(
     }
 
     let client = make_client(&state).await?;
-    let config = state.config.read().await;
+    let routing_table = {
+        let config = state.config.read().await;
+        config.routeros.routing_table.clone()
+    };
 
     let mangles: Vec<crate::routeros::models::MangleRule> =
         client.list_managed("/ip/firewall/mangle").await?;
@@ -223,7 +241,7 @@ async fn routing_status(
         "mangle_rules": mangles,
         "routes": routes,
         "nat_rules": nats,
-        "routing_table": config.routeros.routing_table,
+        "routing_table": routing_table,
     })))
 }
 
@@ -239,12 +257,15 @@ async fn setup_pbr(
     }
 
     let client = make_client(&state).await?;
-    let config = state.config.read().await;
+    let routeros_config = {
+        let config = state.config.read().await;
+        config.routeros.clone()
+    };
 
     // Determine container IP (our gateway in the veth network)
     let container_ip = detect_container_ip();
 
-    let provisioner = Provisioner::new(&client, &config.routeros);
+    let provisioner = Provisioner::new(&client, &routeros_config);
     provisioner.setup(&container_ip).await?;
 
     let _ = state.event_tx.send(ServerEvent::RoutingChanged);
@@ -267,9 +288,12 @@ async fn teardown_pbr(
     }
 
     let client = make_client(&state).await?;
-    let config = state.config.read().await;
+    let routeros_config = {
+        let config = state.config.read().await;
+        config.routeros.clone()
+    };
 
-    let provisioner = Provisioner::new(&client, &config.routeros);
+    let provisioner = Provisioner::new(&client, &routeros_config);
     let removed = provisioner.teardown().await?;
 
     let _ = state.event_tx.send(ServerEvent::RoutingChanged);
@@ -290,9 +314,12 @@ async fn diagnostics(
     }
 
     let client = make_client(&state).await?;
-    let config = state.config.read().await;
+    let routeros_config = {
+        let config = state.config.read().await;
+        config.routeros.clone()
+    };
 
-    let provisioner = Provisioner::new(&client, &config.routeros);
+    let provisioner = Provisioner::new(&client, &routeros_config);
     let result = provisioner.diagnostics().await?;
 
     Ok(Json(result))

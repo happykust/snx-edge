@@ -623,8 +623,31 @@ impl UserDb {
         config: Option<&serde_json::Value>,
         enabled: Option<bool>,
     ) -> Result<Profile, AppError> {
-        let existing = self.get_profile(id).await?;
         let now = Utc::now();
+
+        // Read existing profile and apply update under a single lock
+        // acquisition to avoid TOCTOU races, matching the pattern used
+        // by update_user.
+        let conn = self.conn.lock().await;
+
+        let existing = conn
+            .query_row(
+                "SELECT id, name, config, enabled, created_at, updated_at
+                 FROM profiles WHERE id = ?1",
+                params![id],
+                |row| {
+                    let config_str: String = row.get(2)?;
+                    Ok(Profile {
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                        config: serde_json::from_str(&config_str).unwrap_or_default(),
+                        enabled: row.get(3)?,
+                        created_at: parse_dt(row.get::<_, String>(4)?),
+                        updated_at: parse_dt(row.get::<_, String>(5)?),
+                    })
+                },
+            )
+            .map_err(|_| AppError::NotFound("profile not found".to_string()))?;
 
         let new_name = name.unwrap_or(&existing.name);
         let new_enabled = enabled.unwrap_or(existing.enabled);
@@ -635,7 +658,6 @@ impl UserDb {
             serde_json::to_string(&existing.config).unwrap_or_default()
         };
 
-        let conn = self.conn.lock().await;
         conn.execute(
             "UPDATE profiles SET name = ?1, config = ?2, enabled = ?3, updated_at = ?4 WHERE id = ?5",
             params![new_name, new_config_str, new_enabled, now.to_rfc3339(), id],
