@@ -6,10 +6,10 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use tokio::sync::broadcast;
-use tracing::field::{Field, Visit};
 use tracing::Subscriber;
-use tracing_subscriber::layer::Context;
+use tracing::field::{Field, Visit};
 use tracing_subscriber::Layer;
+use tracing_subscriber::layer::Context;
 
 use crate::api::logs::{LogEntry, SharedLogBuffer};
 use crate::state::ServerEvent;

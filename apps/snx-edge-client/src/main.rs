@@ -214,7 +214,8 @@ async fn main() -> anyhow::Result<()> {
                         glib::spawn_future_local(async move {
                             let role = auth.role().await.unwrap_or_else(|| "viewer".to_string());
                             if role != "admin" {
-                                let _ = show_notification("Access Denied", "Admin access required").await;
+                                let _ = show_notification("Access Denied", "Admin access required")
+                                    .await;
                                 return;
                             }
                             windows::users::show_users_window(api, &role);
@@ -322,11 +323,7 @@ async fn show_add_server_dialog_inner(ctx: Arc<tokio::sync::RwLock<AppContext>>)
     // User cancelled → app stays in tray with no active connection
 }
 
-fn show_login_for_server(
-    ctx: Arc<tokio::sync::RwLock<AppContext>>,
-    url: String,
-    name: String,
-) {
+fn show_login_for_server(ctx: Arc<tokio::sync::RwLock<AppContext>>, url: String, name: String) {
     glib::spawn_future_local(show_login_for_server_inner(ctx, url, name));
 }
 
@@ -409,19 +406,43 @@ async fn show_server_input_dialog() -> Option<(String, String, String, String)> 
         .spacing(8)
         .build();
 
-    inner.append(&gtk4::Label::builder().label("Server name:").halign(Align::Start).build());
-    let name_entry = gtk4::Entry::builder().placeholder_text("Office MikroTik").build();
+    inner.append(
+        &gtk4::Label::builder()
+            .label("Server name:")
+            .halign(Align::Start)
+            .build(),
+    );
+    let name_entry = gtk4::Entry::builder()
+        .placeholder_text("Office MikroTik")
+        .build();
     inner.append(&name_entry);
 
-    inner.append(&gtk4::Label::builder().label("Server URL:").halign(Align::Start).build());
-    let url_entry = gtk4::Entry::builder().placeholder_text("http://172.19.0.2:8080").build();
+    inner.append(
+        &gtk4::Label::builder()
+            .label("Server URL:")
+            .halign(Align::Start)
+            .build(),
+    );
+    let url_entry = gtk4::Entry::builder()
+        .placeholder_text("http://172.19.0.2:8080")
+        .build();
     inner.append(&url_entry);
 
-    inner.append(&gtk4::Label::builder().label("Username:").halign(Align::Start).build());
+    inner.append(
+        &gtk4::Label::builder()
+            .label("Username:")
+            .halign(Align::Start)
+            .build(),
+    );
     let user_entry = gtk4::Entry::builder().placeholder_text("admin").build();
     inner.append(&user_entry);
 
-    inner.append(&gtk4::Label::builder().label("Password:").halign(Align::Start).build());
+    inner.append(
+        &gtk4::Label::builder()
+            .label("Password:")
+            .halign(Align::Start)
+            .build(),
+    );
     let pass_entry = gtk4::PasswordEntry::new();
     inner.append(&pass_entry);
 
@@ -453,12 +474,18 @@ async fn show_server_input_dialog() -> Option<(String, String, String, String)> 
 
     let tx_ok = tx.clone();
     connect_btn.connect_clicked(clone!(
-        #[weak] window,
-        #[weak] name_entry,
-        #[weak] url_entry,
-        #[weak] user_entry,
-        #[weak] pass_entry,
-        #[weak] error_label,
+        #[weak]
+        window,
+        #[weak]
+        name_entry,
+        #[weak]
+        url_entry,
+        #[weak]
+        user_entry,
+        #[weak]
+        pass_entry,
+        #[weak]
+        error_label,
         move |_| {
             let name = name_entry.text().trim().to_string();
             let url = url_entry.text().trim().to_string();
@@ -488,7 +515,8 @@ async fn show_server_input_dialog() -> Option<(String, String, String, String)> 
     ));
 
     cancel_btn.connect_clicked(clone!(
-        #[weak] window,
+        #[weak]
+        window,
         move |_| {
             let _ = tx.try_send(None::<(String, String, String, String)>);
             window.close();
@@ -529,11 +557,21 @@ async fn show_login_only_dialog(server_name: &str, server_url: &str) -> Option<(
             .build(),
     );
 
-    inner.append(&gtk4::Label::builder().label("Username:").halign(Align::Start).build());
+    inner.append(
+        &gtk4::Label::builder()
+            .label("Username:")
+            .halign(Align::Start)
+            .build(),
+    );
     let user_entry = gtk4::Entry::builder().placeholder_text("admin").build();
     inner.append(&user_entry);
 
-    inner.append(&gtk4::Label::builder().label("Password:").halign(Align::Start).build());
+    inner.append(
+        &gtk4::Label::builder()
+            .label("Password:")
+            .halign(Align::Start)
+            .build(),
+    );
     let pass_entry = gtk4::PasswordEntry::new();
     inner.append(&pass_entry);
 
@@ -557,9 +595,12 @@ async fn show_login_only_dialog(server_name: &str, server_url: &str) -> Option<(
 
     let tx_ok = tx.clone();
     login_btn.connect_clicked(clone!(
-        #[weak] window,
-        #[weak] user_entry,
-        #[weak] pass_entry,
+        #[weak]
+        window,
+        #[weak]
+        user_entry,
+        #[weak]
+        pass_entry,
         move |_| {
             let user = user_entry.text().trim().to_string();
             let pass = pass_entry.text().to_string();
@@ -569,7 +610,8 @@ async fn show_login_only_dialog(server_name: &str, server_url: &str) -> Option<(
     ));
 
     cancel_btn.connect_clicked(clone!(
-        #[weak] window,
+        #[weak]
+        window,
         move |_| {
             let _ = tx.try_send(None::<(String, String)>);
             window.close();
@@ -585,7 +627,11 @@ async fn show_login_only_dialog(server_name: &str, server_url: &str) -> Option<(
 async fn do_connect(ctx: &AppContext, profile_id: &str) {
     // Resolve profile_id: if empty, use connected_profile_id or first available profile
     let resolved_id = if profile_id.is_empty() {
-        if let Some(id) = ctx.profile_store.connected_profile_id().filter(|s| !s.is_empty()) {
+        if let Some(id) = ctx
+            .profile_store
+            .connected_profile_id()
+            .filter(|s| !s.is_empty())
+        {
             id
         } else {
             let profiles = ctx.profile_store.all();
@@ -602,7 +648,9 @@ async fn do_connect(ctx: &AppContext, profile_id: &str) {
 
     let _ = ctx
         .tray_cmd
-        .send(TrayCommand::Update(Some(Arc::new(ConnectionState::Connecting))))
+        .send(TrayCommand::Update(Some(Arc::new(
+            ConnectionState::Connecting,
+        ))))
         .await;
 
     match ctx.api.tunnel_connect(&resolved_id).await {

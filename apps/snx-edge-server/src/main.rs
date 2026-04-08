@@ -13,9 +13,9 @@ use std::sync::Arc;
 use anyhow::Context;
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
+use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::EnvFilter;
 
 use crate::api::logs::new_log_buffer;
 
@@ -56,16 +56,11 @@ async fn main() -> anyhow::Result<()> {
     let tls_key = config.api.tls_key.clone();
     let tls_client_ca = config.api.tls_client_ca.clone();
 
-    let app_state =
-        state::AppState::with_shared(config, config_path, log_buffer, event_tx).await?;
+    let app_state = state::AppState::with_shared(config, config_path, log_buffer, event_tx).await?;
     let router = api::router(app_state);
 
     if let (Some(cert_path), Some(key_path)) = (&tls_cert, &tls_key) {
-        let tls_config = build_tls_config(
-            cert_path,
-            key_path,
-            tls_client_ca.as_deref(),
-        )?;
+        let tls_config = build_tls_config(cert_path, key_path, tls_client_ca.as_deref())?;
 
         let rustls_config =
             axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(tls_config));
@@ -102,15 +97,15 @@ fn build_tls_config(
     use std::io::BufReader;
 
     // --- server cert chain ---
-    let cert_file = std::fs::File::open(cert_path)
-        .with_context(|| format!("open TLS cert {cert_path}"))?;
+    let cert_file =
+        std::fs::File::open(cert_path).with_context(|| format!("open TLS cert {cert_path}"))?;
     let server_certs: Vec<_> = certs(&mut BufReader::new(cert_file))
         .collect::<Result<_, _>>()
         .with_context(|| format!("parse TLS certs from {cert_path}"))?;
 
     // --- server private key ---
-    let key_file = std::fs::File::open(key_path)
-        .with_context(|| format!("open TLS key {key_path}"))?;
+    let key_file =
+        std::fs::File::open(key_path).with_context(|| format!("open TLS key {key_path}"))?;
     let server_key = pkcs8_private_keys(&mut BufReader::new(key_file))
         .next()
         .ok_or_else(|| anyhow::anyhow!("no PKCS8 private key found in {key_path}"))?
@@ -135,20 +130,25 @@ fn build_tls_config(
 
         // allow_unauthenticated: client certs are verified if provided but not required.
         // This lets health checks work without a cert while still validating real clients.
-        let client_verifier =
-            rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store))
-                .allow_unauthenticated()
-                .build()
-                .with_context(|| "build WebPkiClientVerifier")?;
+        let client_verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store))
+            .allow_unauthenticated()
+            .build()
+            .with_context(|| "build WebPkiClientVerifier")?;
 
         builder
             .with_client_cert_verifier(client_verifier)
-            .with_single_cert(server_certs, rustls::pki_types::PrivateKeyDer::Pkcs8(server_key))
+            .with_single_cert(
+                server_certs,
+                rustls::pki_types::PrivateKeyDer::Pkcs8(server_key),
+            )
             .with_context(|| "build TLS ServerConfig with mTLS")?
     } else {
         builder
             .with_no_client_auth()
-            .with_single_cert(server_certs, rustls::pki_types::PrivateKeyDer::Pkcs8(server_key))
+            .with_single_cert(
+                server_certs,
+                rustls::pki_types::PrivateKeyDer::Pkcs8(server_key),
+            )
             .with_context(|| "build TLS ServerConfig")?
     };
 

@@ -1,11 +1,11 @@
 use axum::extract::{Multipart, Path, State};
-use axum::http::{header, StatusCode};
+use axum::http::{StatusCode, header};
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post, put};
 use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
 
-use crate::api::auth::{has_permission, Claims};
+use crate::api::auth::{Claims, has_permission};
 use crate::db::Profile;
 use crate::error::AppError;
 use crate::state::{AppState, ServerEvent};
@@ -66,11 +66,15 @@ async fn list_profiles(
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<Vec<ProfileResponse>>, AppError> {
     if !has_permission(&claims, "profiles.read") {
-        return Err(AppError::Forbidden("permission 'profiles.read' required".to_string()));
+        return Err(AppError::Forbidden(
+            "permission 'profiles.read' required".to_string(),
+        ));
     }
 
     let profiles = state.db.list_profiles().await?;
-    Ok(Json(profiles.into_iter().map(profile_to_response).collect()))
+    Ok(Json(
+        profiles.into_iter().map(profile_to_response).collect(),
+    ))
 }
 
 /// POST /api/v1/profiles
@@ -80,13 +84,22 @@ async fn create_profile(
     Json(req): Json<CreateProfileRequest>,
 ) -> Result<(StatusCode, Json<ProfileResponse>), AppError> {
     if !has_permission(&claims, "profiles.write") {
-        return Err(AppError::Forbidden("permission 'profiles.write' required".to_string()));
+        return Err(AppError::Forbidden(
+            "permission 'profiles.write' required".to_string(),
+        ));
     }
 
     // Validate required fields
     if let Some(obj) = req.config.as_object() {
-        if obj.get("server").and_then(|v| v.as_str()).unwrap_or("").is_empty() {
-            return Err(AppError::BadRequest("config.server is required".to_string()));
+        if obj
+            .get("server")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .is_empty()
+        {
+            return Err(AppError::BadRequest(
+                "config.server is required".to_string(),
+            ));
         }
     } else {
         return Err(AppError::BadRequest("config must be an object".to_string()));
@@ -104,7 +117,9 @@ async fn get_profile(
     Path(id): Path<String>,
 ) -> Result<Json<ProfileResponse>, AppError> {
     if !has_permission(&claims, "profiles.read") {
-        return Err(AppError::Forbidden("permission 'profiles.read' required".to_string()));
+        return Err(AppError::Forbidden(
+            "permission 'profiles.read' required".to_string(),
+        ));
     }
 
     let profile = state.db.get_profile(&id).await?;
@@ -119,7 +134,9 @@ async fn update_profile(
     Json(req): Json<UpdateProfileRequest>,
 ) -> Result<Json<ProfileResponse>, AppError> {
     if !has_permission(&claims, "profiles.write") {
-        return Err(AppError::Forbidden("permission 'profiles.write' required".to_string()));
+        return Err(AppError::Forbidden(
+            "permission 'profiles.write' required".to_string(),
+        ));
     }
 
     // Handle secret fields: if "***" keep current value
@@ -165,7 +182,9 @@ async fn upload_certs(
     mut multipart: Multipart,
 ) -> Result<Json<ProfileResponse>, AppError> {
     if !has_permission(&claims, "profiles.write") {
-        return Err(AppError::Forbidden("permission 'profiles.write' required".to_string()));
+        return Err(AppError::Forbidden(
+            "permission 'profiles.write' required".to_string(),
+        ));
     }
 
     // Verify profile exists
@@ -251,7 +270,9 @@ async fn export_profile(
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
     if !has_permission(&claims, "profiles.read") {
-        return Err(AppError::Forbidden("permission 'profiles.read' required".to_string()));
+        return Err(AppError::Forbidden(
+            "permission 'profiles.read' required".to_string(),
+        ));
     }
 
     let profile = state.db.get_profile(&id).await?;
@@ -292,7 +313,9 @@ async fn import_profile(
     body: String,
 ) -> Result<(StatusCode, Json<ProfileResponse>), AppError> {
     if !has_permission(&claims, "profiles.write") {
-        return Err(AppError::Forbidden("permission 'profiles.write' required".to_string()));
+        return Err(AppError::Forbidden(
+            "permission 'profiles.write' required".to_string(),
+        ));
     }
 
     // Parse TOML input
@@ -330,7 +353,9 @@ async fn delete_profile(
     Path(id): Path<String>,
 ) -> Result<StatusCode, AppError> {
     if !has_permission(&claims, "profiles.write") {
-        return Err(AppError::Forbidden("permission 'profiles.write' required".to_string()));
+        return Err(AppError::Forbidden(
+            "permission 'profiles.write' required".to_string(),
+        ));
     }
 
     state.db.delete_profile(&id).await?;

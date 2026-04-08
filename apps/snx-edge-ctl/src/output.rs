@@ -71,7 +71,12 @@ pub fn print_item<T: Serialize>(mode: OutputMode, item: &T) {
                         }
                         other => other.to_string(),
                     };
-                    println!("{:<width$}  {}", format!("{}:", key), display_value, width = max_key_len + 1);
+                    println!(
+                        "{:<width$}  {}",
+                        format!("{}:", key),
+                        display_value,
+                        width = max_key_len + 1
+                    );
                 }
             } else {
                 // Fallback for non-object types
@@ -95,7 +100,10 @@ pub fn print_item<T: Serialize>(mode: OutputMode, item: &T) {
 pub fn print_ok(mode: OutputMode, message: &str) {
     match mode {
         OutputMode::Table => println!("{}", message),
-        OutputMode::Json => println!("{}", serde_json::json!({"status": "ok", "message": message})),
+        OutputMode::Json => println!(
+            "{}",
+            serde_json::json!({"status": "ok", "message": message})
+        ),
         OutputMode::Quiet => {}
     }
 }
@@ -104,7 +112,10 @@ pub fn print_ok(mode: OutputMode, message: &str) {
 pub fn print_error(mode: OutputMode, err: &anyhow::Error) {
     match mode {
         OutputMode::Json => {
-            eprintln!("{}", serde_json::json!({"status": "error", "message": err.to_string()}));
+            eprintln!(
+                "{}",
+                serde_json::json!({"status": "error", "message": err.to_string()})
+            );
         }
         _ => {
             eprintln!("Error: {err:#}");

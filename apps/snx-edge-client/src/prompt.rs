@@ -64,7 +64,9 @@ pub async fn show_prompt_dialog(title: &str, prompt: &str, secure: bool) -> Opti
 
             inner.append(&entry);
 
-            let outer_box = gtk4::Box::builder().orientation(Orientation::Vertical).build();
+            let outer_box = gtk4::Box::builder()
+                .orientation(Orientation::Vertical)
+                .build();
             outer_box.append(&inner);
             outer_box.append(&button_box);
 
@@ -198,12 +200,12 @@ pub async fn show_login_dialog() -> Option<(String, String)> {
                     .build(),
             );
 
-            let password_entry = gtk4::PasswordEntry::builder()
-                .show_peek_icon(true)
-                .build();
+            let password_entry = gtk4::PasswordEntry::builder().show_peek_icon(true).build();
             inner.append(&password_entry);
 
-            let outer_box = gtk4::Box::builder().orientation(Orientation::Vertical).build();
+            let outer_box = gtk4::Box::builder()
+                .orientation(Orientation::Vertical)
+                .build();
             outer_box.append(&inner);
             outer_box.append(&button_box);
 

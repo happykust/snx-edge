@@ -64,15 +64,20 @@ impl ClientSettings {
 
     /// Find a server by name or URL (case-insensitive name match).
     pub fn find_by_name_or_url(&self, query: &str) -> Option<(usize, &ServerEntry)> {
-        self.servers.iter().enumerate().find(|(_, s)| {
-            s.name.eq_ignore_ascii_case(query) || s.url == query
-        })
+        self.servers
+            .iter()
+            .enumerate()
+            .find(|(_, s)| s.name.eq_ignore_ascii_case(query) || s.url == query)
     }
 
     /// Add a new server and return its index.
     pub fn add(&mut self, name: &str, url: &str) -> anyhow::Result<usize> {
         // Check for duplicate name
-        if self.servers.iter().any(|s| s.name.eq_ignore_ascii_case(name)) {
+        if self
+            .servers
+            .iter()
+            .any(|s| s.name.eq_ignore_ascii_case(name))
+        {
             bail!("Server with name '{}' already exists", name);
         }
 

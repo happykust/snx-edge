@@ -1,6 +1,6 @@
 use reqwest::Client;
-use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 
 use crate::config::RouterOsConfig;
 use crate::error::AppError;
@@ -19,15 +19,12 @@ pub struct RouterOsClient {
 
 impl RouterOsClient {
     pub fn new(config: &RouterOsConfig) -> Result<Self, AppError> {
-        let host = std::env::var(&config.host_env).map_err(|_| {
-            AppError::Internal(format!("env {} not set", config.host_env))
-        })?;
-        let username = std::env::var(&config.user_env).map_err(|_| {
-            AppError::Internal(format!("env {} not set", config.user_env))
-        })?;
-        let password = std::env::var(&config.password_env).map_err(|_| {
-            AppError::Internal(format!("env {} not set", config.password_env))
-        })?;
+        let host = std::env::var(&config.host_env)
+            .map_err(|_| AppError::Internal(format!("env {} not set", config.host_env)))?;
+        let username = std::env::var(&config.user_env)
+            .map_err(|_| AppError::Internal(format!("env {} not set", config.user_env)))?;
+        let password = std::env::var(&config.password_env)
+            .map_err(|_| AppError::Internal(format!("env {} not set", config.password_env)))?;
 
         let client = Client::builder()
             .danger_accept_invalid_certs(config.tls_skip_verify)

@@ -9,10 +9,10 @@ use chrono::{DateTime, Utc};
 use futures_util::stream::Stream;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
-use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
+use tokio_stream::wrappers::BroadcastStream;
 
-use crate::api::auth::{has_permission, Claims};
+use crate::api::auth::{Claims, has_permission};
 use crate::error::AppError;
 use crate::state::{AppState, ServerEvent};
 
@@ -86,7 +86,9 @@ async fn logs_stream(
     Extension(claims): Extension<Claims>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AppError> {
     if !has_permission(&claims, "logs.read") {
-        return Err(AppError::Forbidden("permission 'logs.read' required".to_string()));
+        return Err(AppError::Forbidden(
+            "permission 'logs.read' required".to_string(),
+        ));
     }
 
     let rx = state.event_tx.subscribe();
@@ -97,9 +99,7 @@ async fn logs_stream(
                 "level": level,
                 "message": message,
             });
-            Some(Ok(Event::default()
-                .event("log")
-                .data(entry.to_string())))
+            Some(Ok(Event::default().event("log").data(entry.to_string())))
         }
         _ => None,
     });
@@ -126,7 +126,9 @@ async fn logs_history(
     Query(query): Query<HistoryQuery>,
 ) -> Result<Json<Vec<LogEntry>>, AppError> {
     if !has_permission(&claims, "logs.read") {
-        return Err(AppError::Forbidden("permission 'logs.read' required".to_string()));
+        return Err(AppError::Forbidden(
+            "permission 'logs.read' required".to_string(),
+        ));
     }
 
     let buffer = state.log_buffer.read().await;

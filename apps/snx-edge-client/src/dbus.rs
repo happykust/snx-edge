@@ -11,7 +11,12 @@ use zbus::{Connection, zvariant};
 )]
 pub trait DesktopSettings {
     #[zbus(signal)]
-    fn setting_changed(&self, namespace: &str, key: &str, value: zvariant::Value<'_>) -> zbus::Result<()>;
+    fn setting_changed(
+        &self,
+        namespace: &str,
+        key: &str,
+        value: zvariant::Value<'_>,
+    ) -> zbus::Result<()>;
 
     fn read_one(&self, namespace: &str, key: &str) -> zbus::Result<zvariant::OwnedValue>;
 }

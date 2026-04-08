@@ -155,9 +155,7 @@ impl Tabled for Session {
         vec![
             std::borrow::Cow::Borrowed(&self.id),
             std::borrow::Cow::Borrowed(&self.user_id),
-            std::borrow::Cow::Owned(
-                self.ip_address.as_deref().unwrap_or("-").to_string(),
-            ),
+            std::borrow::Cow::Owned(self.ip_address.as_deref().unwrap_or("-").to_string()),
             std::borrow::Cow::Owned(self.created_at.format("%Y-%m-%d %H:%M").to_string()),
             std::borrow::Cow::Owned(self.expires_at.format("%Y-%m-%d %H:%M").to_string()),
         ]
@@ -198,12 +196,8 @@ impl Tabled for AddressListEntry {
         vec![
             std::borrow::Cow::Borrowed(&self.id),
             std::borrow::Cow::Borrowed(&self.address),
-            std::borrow::Cow::Owned(
-                self.comment.as_deref().unwrap_or("-").to_string(),
-            ),
-            std::borrow::Cow::Owned(
-                self.disabled.as_deref().unwrap_or("false").to_string(),
-            ),
+            std::borrow::Cow::Owned(self.comment.as_deref().unwrap_or("-").to_string()),
+            std::borrow::Cow::Owned(self.disabled.as_deref().unwrap_or("false").to_string()),
         ]
     }
 

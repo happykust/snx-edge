@@ -88,7 +88,12 @@ pub fn show_users_window(api: ApiClient, role: &str) {
                 let (tx, rx) = async_channel::bounded(1);
                 let api2 = api.clone();
                 tokio::spawn(async move {
-                    let _ = tx.send(api2.create_user(&username, &password, &role, &comment).await).await;
+                    let _ = tx
+                        .send(
+                            api2.create_user(&username, &password, &role, &comment)
+                                .await,
+                        )
+                        .await;
                 });
                 if let Ok(Ok(_)) = rx.recv().await {
                     reload_users(&list_box, api).await;
@@ -109,15 +114,18 @@ pub fn show_users_window(api: ApiClient, role: &str) {
     });
 
     close_btn.connect_clicked(clone!(
-        #[weak] window,
+        #[weak]
+        window,
         move |_| window.close()
     ));
 
     // Escape to close
     let key_controller = gtk4::EventControllerKey::new();
     key_controller.connect_key_pressed(clone!(
-        #[weak] window,
-        #[upgrade_or] glib::Propagation::Proceed,
+        #[weak]
+        window,
+        #[upgrade_or]
+        glib::Propagation::Proceed,
         move |_, key, _, _| {
             if key == gtk4::gdk::Key::Escape {
                 window.close();
@@ -286,7 +294,9 @@ fn append_user_row(
                 let api2 = api.clone();
                 let id2 = id.clone();
                 tokio::spawn(async move {
-                    let _ = tx.send(api2.change_user_password(&id2, &new_password).await).await;
+                    let _ = tx
+                        .send(api2.change_user_password(&id2, &new_password).await)
+                        .await;
                 });
                 if let Ok(Ok(())) = rx.recv().await {
                     reload_users(&list_box, api).await;
@@ -361,9 +371,7 @@ async fn show_add_user_dialog() -> Option<(String, String, String, String)> {
             .halign(Align::Start)
             .build(),
     );
-    let username_entry = gtk4::Entry::builder()
-        .placeholder_text("johndoe")
-        .build();
+    let username_entry = gtk4::Entry::builder().placeholder_text("johndoe").build();
     inner.append(&username_entry);
 
     inner.append(
@@ -372,9 +380,7 @@ async fn show_add_user_dialog() -> Option<(String, String, String, String)> {
             .halign(Align::Start)
             .build(),
     );
-    let password_entry = gtk4::PasswordEntry::builder()
-        .show_peek_icon(true)
-        .build();
+    let password_entry = gtk4::PasswordEntry::builder().show_peek_icon(true).build();
     inner.append(&password_entry);
 
     inner.append(
@@ -429,12 +435,18 @@ async fn show_add_user_dialog() -> Option<(String, String, String, String)> {
 
     let tx_ok = tx.clone();
     ok_btn.connect_clicked(clone!(
-        #[weak] window,
-        #[weak] username_entry,
-        #[weak] password_entry,
-        #[weak] role_dropdown,
-        #[weak] comment_entry,
-        #[weak] error_label,
+        #[weak]
+        window,
+        #[weak]
+        username_entry,
+        #[weak]
+        password_entry,
+        #[weak]
+        role_dropdown,
+        #[weak]
+        comment_entry,
+        #[weak]
+        error_label,
         move |_| {
             let username = username_entry.text().trim().to_string();
             let password = password_entry.text().to_string();
@@ -451,7 +463,8 @@ async fn show_add_user_dialog() -> Option<(String, String, String, String)> {
                 0 => "admin",
                 1 => "operator",
                 _ => "viewer",
-            }.to_string();
+            }
+            .to_string();
 
             let _ = tx_ok.try_send(Some((username, password, role, comment)));
             window.close();
@@ -459,7 +472,8 @@ async fn show_add_user_dialog() -> Option<(String, String, String, String)> {
     ));
 
     cancel_btn.connect_clicked(clone!(
-        #[weak] window,
+        #[weak]
+        window,
         move |_| {
             let _ = tx.try_send(None::<(String, String, String, String)>);
             window.close();
@@ -495,9 +509,7 @@ async fn show_password_dialog() -> Option<String> {
             .halign(Align::Start)
             .build(),
     );
-    let password_entry = gtk4::PasswordEntry::builder()
-        .show_peek_icon(true)
-        .build();
+    let password_entry = gtk4::PasswordEntry::builder().show_peek_icon(true).build();
     inner.append(&password_entry);
 
     let btn_box = gtk4::Box::builder()
@@ -520,8 +532,10 @@ async fn show_password_dialog() -> Option<String> {
 
     let tx_ok = tx.clone();
     ok_btn.connect_clicked(clone!(
-        #[weak] window,
-        #[weak] password_entry,
+        #[weak]
+        window,
+        #[weak]
+        password_entry,
         move |_| {
             let password = password_entry.text().to_string();
             if !password.is_empty() {
@@ -532,7 +546,8 @@ async fn show_password_dialog() -> Option<String> {
     ));
 
     cancel_btn.connect_clicked(clone!(
-        #[weak] window,
+        #[weak]
+        window,
         move |_| {
             let _ = tx.try_send(None::<String>);
             window.close();

@@ -29,8 +29,16 @@ impl tabled::Tabled for ServerDisplay {
         vec![
             std::borrow::Cow::Borrowed(&self.name),
             std::borrow::Cow::Borrowed(&self.url),
-            std::borrow::Cow::Owned(if self.active { "*".to_string() } else { String::new() }),
-            std::borrow::Cow::Owned(if self.auto_connect { "yes".to_string() } else { String::new() }),
+            std::borrow::Cow::Owned(if self.active {
+                "*".to_string()
+            } else {
+                String::new()
+            }),
+            std::borrow::Cow::Owned(if self.auto_connect {
+                "yes".to_string()
+            } else {
+                String::new()
+            }),
         ]
     }
 
@@ -480,8 +488,7 @@ async fn cmd_login(cli: &Cli, mode: OutputMode) -> anyhow::Result<()> {
         input.trim().to_string()
     };
 
-    let password =
-        rpassword::prompt_password("Password: ").context("Failed to read password")?;
+    let password = rpassword::prompt_password("Password: ").context("Failed to read password")?;
 
     let token_resp = client.login(&username, &password).await?;
 
@@ -498,11 +505,7 @@ async fn cmd_logout(cli: &Cli, mode: OutputMode) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn cmd_connect(
-    cli: &Cli,
-    mode: OutputMode,
-    profile: Option<&str>,
-) -> anyhow::Result<()> {
+async fn cmd_connect(cli: &Cli, mode: OutputMode, profile: Option<&str>) -> anyhow::Result<()> {
     let server_url = resolve_server(cli)?;
     let client = ensure_auth(cli).await?;
 
@@ -552,11 +555,7 @@ async fn cmd_disconnect(cli: &Cli, mode: OutputMode) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn cmd_reconnect(
-    cli: &Cli,
-    mode: OutputMode,
-    profile: Option<&str>,
-) -> anyhow::Result<()> {
+async fn cmd_reconnect(cli: &Cli, mode: OutputMode, profile: Option<&str>) -> anyhow::Result<()> {
     let server_url = resolve_server(cli)?;
     let client = ensure_auth(cli).await?;
 
@@ -590,11 +589,7 @@ async fn cmd_info(cli: &Cli, mode: OutputMode) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn cmd_profiles(
-    cli: &Cli,
-    mode: OutputMode,
-    action: &ProfileAction,
-) -> anyhow::Result<()> {
+async fn cmd_profiles(cli: &Cli, mode: OutputMode, action: &ProfileAction) -> anyhow::Result<()> {
     let client = ensure_auth(cli).await?;
 
     match action {
@@ -611,8 +606,7 @@ async fn cmd_profiles(
             let config = if let Some(path) = file {
                 let content = std::fs::read_to_string(path)
                     .context(format!("Failed to read file: {}", path))?;
-                let toml_val: toml::Value =
-                    content.parse().context("Invalid TOML")?;
+                let toml_val: toml::Value = content.parse().context("Invalid TOML")?;
                 serde_json::to_value(&toml_val)?
             } else {
                 serde_json::json!({})
@@ -623,8 +617,8 @@ async fn cmd_profiles(
         }
         ProfileAction::Update { id, file } => {
             let resolved_id = resolve_profile_id(&client, id).await?;
-            let content = std::fs::read_to_string(file)
-                .context(format!("Failed to read file: {}", file))?;
+            let content =
+                std::fs::read_to_string(file).context(format!("Failed to read file: {}", file))?;
             let toml_val: toml::Value = content.parse().context("Invalid TOML")?;
             let config = serde_json::to_value(&toml_val)?;
 
@@ -638,8 +632,8 @@ async fn cmd_profiles(
             output::print_ok(mode, &format!("Profile {} deleted.", resolved_id));
         }
         ProfileAction::Import { file } => {
-            let content = std::fs::read_to_string(file)
-                .context(format!("Failed to read file: {}", file))?;
+            let content =
+                std::fs::read_to_string(file).context(format!("Failed to read file: {}", file))?;
             let profile = client.import_profile(&content).await?;
             output::print_item(mode, &profile);
         }
@@ -652,10 +646,7 @@ async fn cmd_profiles(
             if let Some(path) = out_file {
                 std::fs::write(path, &toml_str)
                     .context(format!("Failed to write file: {}", path))?;
-                output::print_ok(
-                    mode,
-                    &format!("Profile exported to {}", path),
-                );
+                output::print_ok(mode, &format!("Profile exported to {}", path));
             } else {
                 // Write to stdout regardless of mode
                 println!("{}", toml_str);
@@ -665,11 +656,7 @@ async fn cmd_profiles(
     Ok(())
 }
 
-async fn cmd_routing(
-    cli: &Cli,
-    mode: OutputMode,
-    action: &RoutingAction,
-) -> anyhow::Result<()> {
+async fn cmd_routing(cli: &Cli, mode: OutputMode, action: &RoutingAction) -> anyhow::Result<()> {
     let client = ensure_auth(cli).await?;
 
     match action {
@@ -679,8 +666,7 @@ async fn cmd_routing(
                 output::print_list(mode, &clients);
             }
             Some(ClientAction::Add { address, comment }) => {
-                let entry =
-                    client.add_client(address, comment.as_deref()).await?;
+                let entry = client.add_client(address, comment.as_deref()).await?;
                 output::print_item(mode, &entry);
             }
             Some(ClientAction::Remove { id }) => {
@@ -694,8 +680,7 @@ async fn cmd_routing(
                 output::print_list(mode, &entries);
             }
             Some(BypassAction::Add { address, comment }) => {
-                let entry =
-                    client.add_bypass(address, comment.as_deref()).await?;
+                let entry = client.add_bypass(address, comment.as_deref()).await?;
                 output::print_item(mode, &entry);
             }
             Some(BypassAction::Remove { id }) => {
@@ -719,11 +704,7 @@ async fn cmd_routing(
     Ok(())
 }
 
-async fn cmd_users(
-    cli: &Cli,
-    mode: OutputMode,
-    action: &UserAction,
-) -> anyhow::Result<()> {
+async fn cmd_users(cli: &Cli, mode: OutputMode, action: &UserAction) -> anyhow::Result<()> {
     let client = ensure_auth(cli).await?;
 
     match action {
@@ -739,12 +720,12 @@ async fn cmd_users(
         } => {
             let pw = match password {
                 Some(p) => p.clone(),
-                None => rpassword::prompt_password("Password: ")
-                    .context("Failed to read password")?,
+                None => {
+                    rpassword::prompt_password("Password: ").context("Failed to read password")?
+                }
             };
 
-            let user =
-                client.create_user(username, &pw, role, comment).await?;
+            let user = client.create_user(username, &pw, role, comment).await?;
             output::print_item(mode, &user);
         }
         UserAction::Update {
@@ -754,12 +735,7 @@ async fn cmd_users(
             enabled,
         } => {
             let user = client
-                .update_user(
-                    id,
-                    role.as_deref(),
-                    comment.as_deref(),
-                    *enabled,
-                )
+                .update_user(id, role.as_deref(), comment.as_deref(), *enabled)
                 .await?;
             output::print_item(mode, &user);
         }
@@ -779,8 +755,8 @@ async fn cmd_users(
                 None
             };
 
-            let new_pw = rpassword::prompt_password("New password: ")
-                .context("Failed to read password")?;
+            let new_pw =
+                rpassword::prompt_password("New password: ").context("Failed to read password")?;
             let confirm = rpassword::prompt_password("Confirm password: ")
                 .context("Failed to read password")?;
             if new_pw != confirm {
@@ -802,10 +778,7 @@ async fn cmd_users(
         }
         UserAction::Kick { session_id } => {
             client.kick_session(session_id).await?;
-            output::print_ok(
-                mode,
-                &format!("Session {} revoked.", session_id),
-            );
+            output::print_ok(mode, &format!("Session {} revoked.", session_id));
         }
         UserAction::Me => {
             let me = client.get_me().await?;
@@ -829,15 +802,11 @@ async fn cmd_logs(
         if mode == OutputMode::Json {
             println!(
                 "{}",
-                serde_json::to_string_pretty(&entries)
-                    .unwrap_or_else(|_| "[]".to_string())
+                serde_json::to_string_pretty(&entries).unwrap_or_else(|_| "[]".to_string())
             );
         } else if mode == OutputMode::Table {
             for entry in &entries {
-                println!(
-                    "[{}] {} {}",
-                    entry.level, entry.timestamp, entry.message
-                );
+                println!("[{}] {} {}", entry.level, entry.timestamp, entry.message);
             }
         }
     } else {
@@ -849,10 +818,8 @@ async fn cmd_logs(
             .to_string();
 
         let url = format!("{}/api/v1/logs", base_url);
-        let mut es = EventSource::new(
-            client.raw_client().get(&url).bearer_auth(&token),
-        )
-        .context("Failed to create SSE connection")?;
+        let mut es = EventSource::new(client.raw_client().get(&url).bearer_auth(&token))
+            .context("Failed to create SSE connection")?;
 
         if mode != OutputMode::Quiet {
             eprintln!("Streaming logs (Ctrl+C to stop)...");
@@ -863,8 +830,7 @@ async fn cmd_logs(
                 Ok(Event::Open) => {}
                 Ok(Event::Message(msg)) => {
                     if msg.event == "log"
-                        && let Ok(entry) =
-                            serde_json::from_str::<models::LogEntry>(&msg.data)
+                        && let Ok(entry) = serde_json::from_str::<models::LogEntry>(&msg.data)
                     {
                         let show = match level {
                             Some(l) => entry.level.eq_ignore_ascii_case(l),
@@ -874,12 +840,7 @@ async fn cmd_logs(
                             if mode == OutputMode::Json {
                                 println!("{}", msg.data);
                             } else if mode == OutputMode::Table {
-                                println!(
-                                    "[{}] {} {}",
-                                    entry.level,
-                                    entry.timestamp,
-                                    entry.message
-                                );
+                                println!("[{}] {} {}", entry.level, entry.timestamp, entry.message);
                             }
                         }
                     }
@@ -901,7 +862,13 @@ mod tests {
 
     #[test]
     fn test_parse_status() {
-        let cli = Cli::try_parse_from(["snx-edge-ctl", "--server", "https://vpn.example.com", "status"]).unwrap();
+        let cli = Cli::try_parse_from([
+            "snx-edge-ctl",
+            "--server",
+            "https://vpn.example.com",
+            "status",
+        ])
+        .unwrap();
         assert!(matches!(cli.command, Commands::Status));
         assert_eq!(cli.server.as_deref(), Some("https://vpn.example.com"));
     }
@@ -939,18 +906,30 @@ mod tests {
     fn test_parse_routing_subcommands() {
         let cli = Cli::try_parse_from(["snx-edge-ctl", "routing", "clients"]).unwrap();
         match cli.command {
-            Commands::Routing { action: RoutingAction::Clients { action } } => {
+            Commands::Routing {
+                action: RoutingAction::Clients { action },
+            } => {
                 assert!(action.is_none());
             }
             _ => panic!("expected Routing Clients command"),
         }
 
-        let cli = Cli::try_parse_from(["snx-edge-ctl", "routing", "clients", "add", "10.0.0.1", "--comment", "test"]).unwrap();
+        let cli = Cli::try_parse_from([
+            "snx-edge-ctl",
+            "routing",
+            "clients",
+            "add",
+            "10.0.0.1",
+            "--comment",
+            "test",
+        ])
+        .unwrap();
         match cli.command {
             Commands::Routing {
-                action: RoutingAction::Clients {
-                    action: Some(ClientAction::Add { address, comment }),
-                },
+                action:
+                    RoutingAction::Clients {
+                        action: Some(ClientAction::Add { address, comment }),
+                    },
             } => {
                 assert_eq!(address, "10.0.0.1");
                 assert_eq!(comment.as_deref(), Some("test"));
@@ -959,23 +938,52 @@ mod tests {
         }
 
         let cli = Cli::try_parse_from(["snx-edge-ctl", "routing", "setup"]).unwrap();
-        assert!(matches!(cli.command, Commands::Routing { action: RoutingAction::Setup }));
+        assert!(matches!(
+            cli.command,
+            Commands::Routing {
+                action: RoutingAction::Setup
+            }
+        ));
 
         let cli = Cli::try_parse_from(["snx-edge-ctl", "routing", "diagnostics"]).unwrap();
-        assert!(matches!(cli.command, Commands::Routing { action: RoutingAction::Diagnostics }));
+        assert!(matches!(
+            cli.command,
+            Commands::Routing {
+                action: RoutingAction::Diagnostics
+            }
+        ));
     }
 
     #[test]
     fn test_parse_users_subcommands() {
         let cli = Cli::try_parse_from(["snx-edge-ctl", "users", "list"]).unwrap();
-        assert!(matches!(cli.command, Commands::Users { action: UserAction::List }));
+        assert!(matches!(
+            cli.command,
+            Commands::Users {
+                action: UserAction::List
+            }
+        ));
 
         let cli = Cli::try_parse_from([
-            "snx-edge-ctl", "users", "create", "admin", "--role", "admin", "--password", "secret",
-        ]).unwrap();
+            "snx-edge-ctl",
+            "users",
+            "create",
+            "admin",
+            "--role",
+            "admin",
+            "--password",
+            "secret",
+        ])
+        .unwrap();
         match cli.command {
             Commands::Users {
-                action: UserAction::Create { username, role, password, .. },
+                action:
+                    UserAction::Create {
+                        username,
+                        role,
+                        password,
+                        ..
+                    },
             } => {
                 assert_eq!(username, "admin");
                 assert_eq!(role, "admin");
@@ -985,9 +993,19 @@ mod tests {
         }
 
         let cli = Cli::try_parse_from(["snx-edge-ctl", "users", "me"]).unwrap();
-        assert!(matches!(cli.command, Commands::Users { action: UserAction::Me }));
+        assert!(matches!(
+            cli.command,
+            Commands::Users {
+                action: UserAction::Me
+            }
+        ));
 
         let cli = Cli::try_parse_from(["snx-edge-ctl", "users", "sessions"]).unwrap();
-        assert!(matches!(cli.command, Commands::Users { action: UserAction::Sessions }));
+        assert!(matches!(
+            cli.command,
+            Commands::Users {
+                action: UserAction::Sessions
+            }
+        ));
     }
 }

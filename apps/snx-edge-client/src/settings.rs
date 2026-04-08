@@ -265,10 +265,13 @@ impl ProfileConfigWidgets {
         // DNS
         self.no_dns.set_active(get_bool("no_dns"));
         self.dns_servers.set_text(&get_str_vec("dns_servers"));
-        self.ignored_dns_servers.set_text(&get_str_vec("ignored_dns_servers"));
+        self.ignored_dns_servers
+            .set_text(&get_str_vec("ignored_dns_servers"));
         self.search_domains.set_text(&get_str_vec("search_domains"));
-        self.ignored_search_domains.set_text(&get_str_vec("ignored_search_domains"));
-        self.search_domains_as_routes.set_active(get_bool("search_domains_as_routes"));
+        self.ignored_search_domains
+            .set_text(&get_str_vec("ignored_search_domains"));
+        self.search_domains_as_routes
+            .set_active(get_bool("search_domains_as_routes"));
 
         // Routing
         self.no_routing.set_active(get_bool("no_routing"));
@@ -282,8 +285,10 @@ impl ProfileConfigWidgets {
         self.no_cert_check.set_active(get_bool("no_cert_check"));
 
         // Other
-        self.password_factor.set_value(get_u32("password_factor", 1) as f64);
-        self.ike_lifetime.set_value(get_u32("ike_lifetime", 28800) as f64);
+        self.password_factor
+            .set_value(get_u32("password_factor", 1) as f64);
+        self.ike_lifetime
+            .set_value(get_u32("ike_lifetime", 28800) as f64);
         self.ike_persist.set_active(get_bool("ike_persist"));
         self.no_keepalive.set_active(get_bool("no_keepalive"));
         self.port_knock.set_active(get_bool("port_knock"));
@@ -365,7 +370,10 @@ impl ProfileConfigWidgets {
         }
         let ignored_search = parse_comma_list(&self.ignored_search_domains.text());
         if !ignored_search.is_empty() {
-            map.insert("ignored_search_domains".into(), str_vec_to_json(&ignored_search));
+            map.insert(
+                "ignored_search_domains".into(),
+                str_vec_to_json(&ignored_search),
+            );
         }
         map.insert(
             "search_domains_as_routes".into(),
@@ -373,8 +381,14 @@ impl ProfileConfigWidgets {
         );
 
         // Routing
-        map.insert("no_routing".into(), Value::Bool(self.no_routing.is_active()));
-        map.insert("default_route".into(), Value::Bool(self.default_route.is_active()));
+        map.insert(
+            "no_routing".into(),
+            Value::Bool(self.no_routing.is_active()),
+        );
+        map.insert(
+            "default_route".into(),
+            Value::Bool(self.default_route.is_active()),
+        );
 
         let add_routes = parse_comma_list(&self.add_routes.text());
         if !add_routes.is_empty() {
@@ -391,7 +405,10 @@ impl ProfileConfigWidgets {
         if !ca_cert.is_empty() {
             map.insert("ca_cert".into(), str_vec_to_json(&ca_cert));
         }
-        map.insert("no_cert_check".into(), Value::Bool(self.no_cert_check.is_active()));
+        map.insert(
+            "no_cert_check".into(),
+            Value::Bool(self.no_cert_check.is_active()),
+        );
 
         // Other
         map.insert(
@@ -402,9 +419,18 @@ impl ProfileConfigWidgets {
             "ike_lifetime".into(),
             Value::Number(serde_json::Number::from(self.ike_lifetime.value() as u32)),
         );
-        map.insert("ike_persist".into(), Value::Bool(self.ike_persist.is_active()));
-        map.insert("no_keepalive".into(), Value::Bool(self.no_keepalive.is_active()));
-        map.insert("port_knock".into(), Value::Bool(self.port_knock.is_active()));
+        map.insert(
+            "ike_persist".into(),
+            Value::Bool(self.ike_persist.is_active()),
+        );
+        map.insert(
+            "no_keepalive".into(),
+            Value::Bool(self.no_keepalive.is_active()),
+        );
+        map.insert(
+            "port_knock".into(),
+            Value::Bool(self.port_knock.is_active()),
+        );
 
         let lease = self.ip_lease_duration.value() as u32;
         if lease > 0 {
@@ -831,7 +857,9 @@ impl SettingsDialog {
             )
             .build();
 
-        let profile_select = gtk4::DropDown::builder().model(&gtk4::StringList::new(&[])).build();
+        let profile_select = gtk4::DropDown::builder()
+            .model(&gtk4::StringList::new(&[]))
+            .build();
         let profile_new = gtk4::Button::with_label("New");
         let profile_rename = gtk4::Button::with_label("Rename");
         let profile_delete = gtk4::Button::with_label("Delete");
@@ -1037,14 +1065,17 @@ impl SettingsDialog {
         // ── Profile config change tracking (dirty state) ─────────────────
 
         // Connect login_type change to update cert visibility + dirty
-        widgets.profile_config.login_type.connect_selected_notify(clone!(
-            #[weak]
-            widgets,
-            move |_| {
-                widgets.profile_config.update_cert_visibility();
-                widgets.mark_dirty();
-            }
-        ));
+        widgets
+            .profile_config
+            .login_type
+            .connect_selected_notify(clone!(
+                #[weak]
+                widgets,
+                move |_| {
+                    widgets.profile_config.update_cert_visibility();
+                    widgets.mark_dirty();
+                }
+            ));
 
         // Connect all Entry widgets to mark dirty on change
         {
@@ -1082,16 +1113,22 @@ impl SettingsDialog {
         ));
 
         // DropDown changes
-        widgets.profile_config.cert_type.connect_selected_notify(clone!(
-            #[weak]
-            widgets,
-            move |_| widgets.mark_dirty()
-        ));
-        widgets.profile_config.transport_type.connect_selected_notify(clone!(
-            #[weak]
-            widgets,
-            move |_| widgets.mark_dirty()
-        ));
+        widgets
+            .profile_config
+            .cert_type
+            .connect_selected_notify(clone!(
+                #[weak]
+                widgets,
+                move |_| widgets.mark_dirty()
+            ));
+        widgets
+            .profile_config
+            .transport_type
+            .connect_selected_notify(clone!(
+                #[weak]
+                widgets,
+                move |_| widgets.mark_dirty()
+            ));
 
         // Switch changes
         {
@@ -1133,27 +1170,33 @@ impl SettingsDialog {
         }
 
         // Save profile button
-        widgets.profile_config.save_profile_btn.connect_clicked(clone!(
-            #[weak]
-            widgets,
-            move |_| {
-                glib::spawn_future_local(clone!(
-                    #[weak]
-                    widgets,
-                    async move { widgets.save_profile_config().await }
-                ));
-            }
-        ));
+        widgets
+            .profile_config
+            .save_profile_btn
+            .connect_clicked(clone!(
+                #[weak]
+                widgets,
+                move |_| {
+                    glib::spawn_future_local(clone!(
+                        #[weak]
+                        widgets,
+                        async move { widgets.save_profile_config().await }
+                    ));
+                }
+            ));
 
         // Reset to defaults button
-        widgets.profile_config.reset_defaults_btn.connect_clicked(clone!(
-            #[weak]
-            widgets,
-            move |_| {
-                widgets.profile_config.reset_defaults();
-                widgets.mark_dirty();
-            }
-        ));
+        widgets
+            .profile_config
+            .reset_defaults_btn
+            .connect_clicked(clone!(
+                #[weak]
+                widgets,
+                move |_| {
+                    widgets.profile_config.reset_defaults();
+                    widgets.mark_dirty();
+                }
+            ));
 
         // Browse for certificate file
         widgets.profile_config.cert_browse.connect_clicked(clone!(
@@ -1202,7 +1245,11 @@ impl SettingsDialog {
     pub async fn run(&self) -> ResponseType {
         set_window("settings", Some(self.window.clone()));
         self.window.present();
-        let result = self.response_rx.recv().await.unwrap_or(ResponseType::Cancel);
+        let result = self
+            .response_rx
+            .recv()
+            .await
+            .unwrap_or(ResponseType::Cancel);
         set_window("settings", None::<Window>);
         result
     }
@@ -1620,7 +1667,9 @@ impl SettingsDialog {
         let basic_tab = self.profile_basic_tab();
         notebook.append_page(
             &basic_tab,
-            Some(&gtk4::Label::new(Some("\u{041e}\u{0441}\u{043d}\u{043e}\u{0432}\u{043d}\u{044b}\u{0435}"))), // "Основные"
+            Some(&gtk4::Label::new(Some(
+                "\u{041e}\u{0441}\u{043d}\u{043e}\u{0432}\u{043d}\u{044b}\u{0435}",
+            ))), // "Основные"
         );
 
         let advanced_tab = self.profile_advanced_tab();
@@ -1641,10 +1690,7 @@ impl SettingsDialog {
             .build();
         actions_box.append(&self.widgets.profile_config.reset_defaults_btn);
         actions_box.append(&self.widgets.profile_config.save_profile_btn);
-        notebook.append_page(
-            &actions_box,
-            None::<&gtk4::Label>,
-        );
+        notebook.append_page(&actions_box, None::<&gtk4::Label>);
 
         // Actually we don't want the actions as a tab. Let's remove and place
         // them outside. We'll handle this in create_layout instead.
@@ -1705,7 +1751,10 @@ impl SettingsDialog {
         actions_box.append(&self.widgets.profile_config.save_profile_btn);
         profile_page.append(&actions_box);
 
-        notebook.append_page(&profile_page, Some(&gtk4::Label::new(Some("Profile Config"))));
+        notebook.append_page(
+            &profile_page,
+            Some(&gtk4::Label::new(Some("Profile Config"))),
+        );
 
         self.window.set_default_size(600, 550);
     }
@@ -1752,8 +1801,17 @@ pub fn start_settings_dialog<W: IsA<Window>>(
     });
 }
 
-async fn show_entry_dialog(parent: &Window, title: &str, label: &str, value: &str) -> Option<String> {
-    let window = Window::builder().title(title).transient_for(parent).modal(true).build();
+async fn show_entry_dialog(
+    parent: &Window,
+    title: &str,
+    label: &str,
+    value: &str,
+) -> Option<String> {
+    let window = Window::builder()
+        .title(title)
+        .transient_for(parent)
+        .modal(true)
+        .build();
 
     let ok = gtk4::Button::builder().label("OK").build();
     ok.set_sensitive(!value.trim().is_empty());
@@ -1775,7 +1833,9 @@ async fn show_entry_dialog(parent: &Window, title: &str, label: &str, value: &st
     button_box.append(&ok);
     button_box.append(&cancel);
 
-    let content = gtk4::Box::builder().orientation(Orientation::Vertical).build();
+    let content = gtk4::Box::builder()
+        .orientation(Orientation::Vertical)
+        .build();
     window.set_child(Some(&content));
     window.set_default_widget(Some(&ok));
 
@@ -1788,7 +1848,12 @@ async fn show_entry_dialog(parent: &Window, title: &str, label: &str, value: &st
         .spacing(6)
         .build();
 
-    inner.append(&gtk4::Label::builder().label(label).halign(Align::Start).build());
+    inner.append(
+        &gtk4::Label::builder()
+            .label(label)
+            .halign(Align::Start)
+            .build(),
+    );
 
     let entry = gtk4::Entry::builder()
         .name("entry")
@@ -1878,7 +1943,11 @@ async fn show_entry_dialog(parent: &Window, title: &str, label: &str, value: &st
     window.set_default_size(new_width, current_size.1);
 
     let ok_clicked = rx.recv().await.unwrap_or(false);
-    if ok_clicked { Some(entry.text().into()) } else { None }
+    if ok_clicked {
+        Some(entry.text().into())
+    } else {
+        None
+    }
 }
 
 /// Show a dialog asking for both profile name and server address when creating a new profile.
@@ -1909,7 +1978,9 @@ async fn show_new_profile_dialog(parent: &Window) -> Option<(String, String)> {
     button_box.append(&ok);
     button_box.append(&cancel);
 
-    let content = gtk4::Box::builder().orientation(Orientation::Vertical).build();
+    let content = gtk4::Box::builder()
+        .orientation(Orientation::Vertical)
+        .build();
     window.set_child(Some(&content));
     window.set_default_widget(Some(&ok));
 
@@ -1922,14 +1993,24 @@ async fn show_new_profile_dialog(parent: &Window) -> Option<(String, String)> {
         .spacing(6)
         .build();
 
-    inner.append(&gtk4::Label::builder().label("Profile name:").halign(Align::Start).build());
+    inner.append(
+        &gtk4::Label::builder()
+            .label("Profile name:")
+            .halign(Align::Start)
+            .build(),
+    );
     let name_entry = gtk4::Entry::builder()
         .name("name")
         .placeholder_text("My VPN Profile")
         .build();
     inner.append(&name_entry);
 
-    inner.append(&gtk4::Label::builder().label("Server address:").halign(Align::Start).build());
+    inner.append(
+        &gtk4::Label::builder()
+            .label("Server address:")
+            .halign(Align::Start)
+            .build(),
+    );
     let server_entry = gtk4::Entry::builder()
         .name("server")
         .placeholder_text("vpn.example.com")
@@ -1964,7 +2045,8 @@ async fn show_new_profile_dialog(parent: &Window) -> Option<(String, String)> {
 
     let tx_ok = tx.clone();
     ok.connect_clicked(clone!(
-        #[weak] window,
+        #[weak]
+        window,
         move |_| {
             let _ = tx_ok.try_send(true);
             window.close();
@@ -1973,7 +2055,8 @@ async fn show_new_profile_dialog(parent: &Window) -> Option<(String, String)> {
 
     let tx_cancel = tx.clone();
     cancel.connect_clicked(clone!(
-        #[weak] window,
+        #[weak]
+        window,
         move |_| {
             let _ = tx_cancel.try_send(false);
             window.close();
@@ -1988,8 +2071,10 @@ async fn show_new_profile_dialog(parent: &Window) -> Option<(String, String)> {
     {
         let key_controller = gtk4::EventControllerKey::new();
         key_controller.connect_key_pressed(clone!(
-            #[weak] window,
-            #[upgrade_or] glib::Propagation::Proceed,
+            #[weak]
+            window,
+            #[upgrade_or]
+            glib::Propagation::Proceed,
             move |_, key, _, _| {
                 if key == gtk4::gdk::Key::Escape {
                     window.close();

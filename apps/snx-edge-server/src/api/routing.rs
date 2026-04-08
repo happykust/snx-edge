@@ -6,7 +6,7 @@ use axum::routing::{delete, get, post};
 use axum::{Extension, Json, Router};
 use serde::Deserialize;
 
-use crate::api::auth::{has_permission, Claims};
+use crate::api::auth::{Claims, has_permission};
 use crate::error::AppError;
 use crate::routeros::client::RouterOsClient;
 use crate::routeros::models::{AddressListEntry, DiagnosticsResult};
@@ -31,9 +31,9 @@ fn validate_address(address: &str) -> Result<(), AppError> {
         let ip: IpAddr = ip_part
             .parse()
             .map_err(|_| AppError::BadRequest(format!("invalid IP in CIDR notation: {address}")))?;
-        let prefix: u8 = prefix_part
-            .parse()
-            .map_err(|_| AppError::BadRequest(format!("invalid prefix length in CIDR: {address}")))?;
+        let prefix: u8 = prefix_part.parse().map_err(|_| {
+            AppError::BadRequest(format!("invalid prefix length in CIDR: {address}"))
+        })?;
         let max = if ip.is_ipv4() { 32 } else { 128 };
         if prefix > max {
             return Err(AppError::BadRequest(format!(
@@ -232,8 +232,7 @@ async fn routing_status(
 
     let mangles: Vec<crate::routeros::models::MangleRule> =
         client.list_managed("/ip/firewall/mangle").await?;
-    let routes: Vec<crate::routeros::models::RouteEntry> =
-        client.list_managed("/ip/route").await?;
+    let routes: Vec<crate::routeros::models::RouteEntry> = client.list_managed("/ip/route").await?;
     let nats: Vec<crate::routeros::models::NatRule> =
         client.list_managed("/ip/firewall/nat").await?;
 
@@ -349,9 +348,6 @@ pub fn routes() -> Router<AppState> {
         .route("/routing/bypass/{id}", delete(remove_bypass))
         // PBR management
         .route("/routing/status", get(routing_status))
-        .route(
-            "/routing/setup",
-            post(setup_pbr).delete(teardown_pbr),
-        )
+        .route("/routing/setup", post(setup_pbr).delete(teardown_pbr))
         .route("/routing/diagnostics", get(diagnostics))
 }

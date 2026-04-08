@@ -85,6 +85,8 @@ impl AuthManager {
         }
         let payload = URL_SAFE_NO_PAD.decode(parts[1]).ok()?;
         let json: serde_json::Value = serde_json::from_slice(&payload).ok()?;
-        json.get("role").and_then(|v| v.as_str()).map(|s| s.to_string())
+        json.get("role")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
     }
 }

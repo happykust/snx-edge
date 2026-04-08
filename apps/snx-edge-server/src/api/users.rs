@@ -3,7 +3,7 @@ use axum::routing::{delete, get, post};
 use axum::{Extension, Json, Router};
 use serde::Deserialize;
 
-use crate::api::auth::{has_permission, Claims};
+use crate::api::auth::{Claims, has_permission};
 use crate::db::{UserDb, UserResponse};
 use crate::error::AppError;
 use crate::state::AppState;
@@ -133,7 +133,12 @@ async fn update_user(
 
     let user = state
         .db
-        .update_user(&id, req.role.as_deref(), req.comment.as_deref(), req.enabled)
+        .update_user(
+            &id,
+            req.role.as_deref(),
+            req.comment.as_deref(),
+            req.enabled,
+        )
         .await?;
     Ok(Json(user_to_response(&state.db, &user).await))
 }

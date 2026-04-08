@@ -3,7 +3,7 @@ use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use serde::Deserialize;
 
-use crate::api::auth::{has_permission, Claims};
+use crate::api::auth::{Claims, has_permission};
 use crate::error::AppError;
 use crate::state::AppState;
 use crate::tunnel::{TunnelStatus, VpnConfig, VpnRoute};
@@ -126,11 +126,11 @@ async fn server_info_current(
         ));
     }
 
-    let server = state
-        .tunnel
-        .current_server()
-        .await
-        .ok_or_else(|| AppError::NotFound("no server available; connect first or use POST with a server address".to_string()))?;
+    let server = state.tunnel.current_server().await.ok_or_else(|| {
+        AppError::NotFound(
+            "no server available; connect first or use POST with a server address".to_string(),
+        )
+    })?;
 
     let vpn_config = VpnConfig {
         server,

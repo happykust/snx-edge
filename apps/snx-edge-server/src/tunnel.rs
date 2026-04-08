@@ -3,12 +3,12 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
-use snxcore::model::params::{CertType, TransportType, TunnelType};
 use snxcore::model::SessionState;
+use snxcore::model::params::{CertType, TransportType, TunnelType};
 use snxcore::tunnel::{
     CheckPointTunnelConnectorFactory, TunnelConnector, TunnelConnectorFactory, TunnelEvent,
 };
-use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
 
 use crate::state::ServerEvent;
 
@@ -75,13 +75,27 @@ pub struct VpnConfig {
     pub no_keychain: bool,
 }
 
-fn default_login_type() -> String { "password".to_string() }
-fn default_cert_type() -> String { "pkcs12".to_string() }
-fn default_password_factor() -> u32 { 1 }
-fn default_ike_lifetime() -> u32 { 28800 }
-fn default_mtu() -> u16 { 1350 }
-fn default_transport_type() -> String { "auto".to_string() }
-fn default_no_keychain() -> bool { true }
+fn default_login_type() -> String {
+    "password".to_string()
+}
+fn default_cert_type() -> String {
+    "pkcs12".to_string()
+}
+fn default_password_factor() -> u32 {
+    1
+}
+fn default_ike_lifetime() -> u32 {
+    28800
+}
+fn default_mtu() -> u16 {
+    1350
+}
+fn default_transport_type() -> String {
+    "auto".to_string()
+}
+fn default_no_keychain() -> bool {
+    true
+}
 
 // === API response types (our own, serializable) ===
 
@@ -94,7 +108,9 @@ pub enum ConnectionStatus {
     Connecting,
     Connected(ConnectionInfo),
     Mfa(MfaChallenge),
-    Error { message: String },
+    Error {
+        message: String,
+    },
 }
 
 /// Information about an active VPN connection.
@@ -149,11 +165,7 @@ fn map_connection_info(info: &snxcore::model::ConnectionInfo, mtu: u16) -> Conne
         transport_type: format!("{:?}", info.transport_type).to_lowercase(),
         ip_address: info.ip_address.to_string(),
         dns_servers: info.dns_servers.iter().map(|d| d.to_string()).collect(),
-        search_domains: info
-            .search_domains
-            .iter()
-            .map(|d| d.to_string())
-            .collect(),
+        search_domains: info.search_domains.iter().map(|d| d.to_string()).collect(),
         interface_name: info.interface_name.clone(),
         mtu,
     }
@@ -194,16 +206,32 @@ pub fn build_tunnel_params(vpn: &VpnConfig) -> snxcore::model::params::TunnelPar
     }
 
     params.no_dns = vpn.no_dns;
-    params.dns_servers = vpn.dns_servers.iter().filter_map(|s| s.parse().ok()).collect();
-    params.ignore_dns_servers = vpn.ignored_dns_servers.iter().filter_map(|s| s.parse().ok()).collect();
+    params.dns_servers = vpn
+        .dns_servers
+        .iter()
+        .filter_map(|s| s.parse().ok())
+        .collect();
+    params.ignore_dns_servers = vpn
+        .ignored_dns_servers
+        .iter()
+        .filter_map(|s| s.parse().ok())
+        .collect();
     params.search_domains = vpn.search_domains.clone();
     params.ignore_search_domains = vpn.ignored_search_domains.clone();
     params.set_routing_domains = vpn.search_domains_as_routes;
 
     params.no_routing = vpn.no_routing;
     params.default_route = vpn.default_route;
-    params.add_routes = vpn.add_routes.iter().filter_map(|s| s.parse().ok()).collect();
-    params.ignore_routes = vpn.ignored_routes.iter().filter_map(|s| s.parse().ok()).collect();
+    params.add_routes = vpn
+        .add_routes
+        .iter()
+        .filter_map(|s| s.parse().ok())
+        .collect();
+    params.ignore_routes = vpn
+        .ignored_routes
+        .iter()
+        .filter_map(|s| s.parse().ok())
+        .collect();
     params.disable_ipv6 = vpn.no_ipv6;
 
     params.ca_cert = vpn.ca_cert.iter().map(|s| s.into()).collect();
@@ -344,7 +372,9 @@ impl TunnelManager {
 
         let tunnel = {
             let mut guard = self.connector.lock().await;
-            let connector = guard.as_mut().ok_or_else(|| anyhow::anyhow!("no connector"))?;
+            let connector = guard
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("no connector"))?;
             connector.create_tunnel(session, cmd_tx).await?
         };
 
@@ -471,10 +501,7 @@ impl TunnelManager {
     }
 
     /// Query server info via snxcore CCC protocol.
-    pub async fn server_info(
-        &self,
-        vpn_config: &VpnConfig,
-    ) -> anyhow::Result<serde_json::Value> {
+    pub async fn server_info(&self, vpn_config: &VpnConfig) -> anyhow::Result<serde_json::Value> {
         let params = build_tunnel_params(vpn_config);
         let info = snxcore::server_info::get(&params).await?;
         Ok(serde_json::to_value(&info)?)

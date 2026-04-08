@@ -55,7 +55,11 @@ impl ApiClient {
         format!("{}{}", self.base_url.read().await, path)
     }
 
-    async fn request_builder(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
+    async fn request_builder(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+    ) -> reqwest::RequestBuilder {
         let url = self.url(path).await;
         let mut builder = self.client.request(method, &url);
         if let Some(ref token) = *self.token.read().await {
@@ -84,7 +88,10 @@ impl ApiClient {
             bail!("Login failed: HTTP {}", resp.status());
         }
 
-        let token_resp: TokenResponse = resp.json().await.context("Failed to parse login response")?;
+        let token_resp: TokenResponse = resp
+            .json()
+            .await
+            .context("Failed to parse login response")?;
         *self.token.write().await = Some(token_resp.access_token.clone());
         Ok(token_resp)
     }
@@ -105,7 +112,10 @@ impl ApiClient {
             bail!("Token refresh failed: HTTP {}", resp.status());
         }
 
-        let token_resp: TokenResponse = resp.json().await.context("Failed to parse refresh response")?;
+        let token_resp: TokenResponse = resp
+            .json()
+            .await
+            .context("Failed to parse refresh response")?;
         *self.token.write().await = Some(token_resp.access_token.clone());
         Ok(token_resp)
     }
@@ -124,7 +134,9 @@ impl ApiClient {
             let body = resp.text().await.unwrap_or_default();
             bail!("Tunnel connect failed: HTTP {} - {}", status, body);
         }
-        resp.json().await.context("Failed to parse tunnel connect response")
+        resp.json()
+            .await
+            .context("Failed to parse tunnel connect response")
     }
 
     pub async fn tunnel_disconnect(&self) -> anyhow::Result<Value> {
@@ -140,7 +152,9 @@ impl ApiClient {
             let body = resp.text().await.unwrap_or_default();
             bail!("Tunnel disconnect failed: HTTP {} - {}", status, body);
         }
-        resp.json().await.context("Failed to parse tunnel disconnect response")
+        resp.json()
+            .await
+            .context("Failed to parse tunnel disconnect response")
     }
 
     pub async fn tunnel_reconnect(&self, profile_id: &str) -> anyhow::Result<Value> {
@@ -157,7 +171,9 @@ impl ApiClient {
             let body = resp.text().await.unwrap_or_default();
             bail!("Tunnel reconnect failed: HTTP {} - {}", status, body);
         }
-        resp.json().await.context("Failed to parse tunnel reconnect response")
+        resp.json()
+            .await
+            .context("Failed to parse tunnel reconnect response")
     }
 
     pub async fn tunnel_status(&self) -> anyhow::Result<Value> {
@@ -171,7 +187,9 @@ impl ApiClient {
         if !resp.status().is_success() {
             bail!("Tunnel status failed: HTTP {}", resp.status());
         }
-        resp.json().await.context("Failed to parse tunnel status response")
+        resp.json()
+            .await
+            .context("Failed to parse tunnel status response")
     }
 
     pub async fn list_profiles(&self) -> anyhow::Result<Vec<Value>> {
@@ -185,7 +203,9 @@ impl ApiClient {
         if !resp.status().is_success() {
             bail!("List profiles failed: HTTP {}", resp.status());
         }
-        resp.json().await.context("Failed to parse profiles response")
+        resp.json()
+            .await
+            .context("Failed to parse profiles response")
     }
 
     pub async fn create_profile(&self, name: &str, config: &Value) -> anyhow::Result<Value> {
@@ -205,7 +225,9 @@ impl ApiClient {
             let body = resp.text().await.unwrap_or_default();
             bail!("Create profile failed: HTTP {} - {}", status, body);
         }
-        resp.json().await.context("Failed to parse create profile response")
+        resp.json()
+            .await
+            .context("Failed to parse create profile response")
     }
 
     pub async fn update_profile(&self, id: &str, body: &Value) -> anyhow::Result<Value> {
@@ -222,7 +244,9 @@ impl ApiClient {
             let body = resp.text().await.unwrap_or_default();
             bail!("Update profile failed: HTTP {} - {}", status, body);
         }
-        resp.json().await.context("Failed to parse update profile response")
+        resp.json()
+            .await
+            .context("Failed to parse update profile response")
     }
 
     pub async fn delete_profile(&self, id: &str) -> anyhow::Result<()> {
@@ -254,7 +278,9 @@ impl ApiClient {
         if !resp.status().is_success() {
             bail!("List routing clients failed: HTTP {}", resp.status());
         }
-        resp.json().await.context("Failed to parse routing clients response")
+        resp.json()
+            .await
+            .context("Failed to parse routing clients response")
     }
 
     pub async fn add_routing_client(&self, address: &str, comment: &str) -> anyhow::Result<Value> {
@@ -274,12 +300,17 @@ impl ApiClient {
             let body = resp.text().await.unwrap_or_default();
             bail!("Add routing client failed: HTTP {} - {}", status, body);
         }
-        resp.json().await.context("Failed to parse add routing client response")
+        resp.json()
+            .await
+            .context("Failed to parse add routing client response")
     }
 
     pub async fn remove_routing_client(&self, id: &str) -> anyhow::Result<()> {
         let resp = self
-            .request_builder(reqwest::Method::DELETE, &format!("/api/v1/routing/clients/{}", id))
+            .request_builder(
+                reqwest::Method::DELETE,
+                &format!("/api/v1/routing/clients/{}", id),
+            )
             .await
             .send()
             .await
@@ -304,7 +335,9 @@ impl ApiClient {
         if !resp.status().is_success() {
             bail!("List routing bypass failed: HTTP {}", resp.status());
         }
-        resp.json().await.context("Failed to parse routing bypass response")
+        resp.json()
+            .await
+            .context("Failed to parse routing bypass response")
     }
 
     pub async fn add_routing_bypass(&self, address: &str, comment: &str) -> anyhow::Result<Value> {
@@ -324,12 +357,17 @@ impl ApiClient {
             let body = resp.text().await.unwrap_or_default();
             bail!("Add routing bypass failed: HTTP {} - {}", status, body);
         }
-        resp.json().await.context("Failed to parse add routing bypass response")
+        resp.json()
+            .await
+            .context("Failed to parse add routing bypass response")
     }
 
     pub async fn remove_routing_bypass(&self, id: &str) -> anyhow::Result<()> {
         let resp = self
-            .request_builder(reqwest::Method::DELETE, &format!("/api/v1/routing/bypass/{}", id))
+            .request_builder(
+                reqwest::Method::DELETE,
+                &format!("/api/v1/routing/bypass/{}", id),
+            )
             .await
             .send()
             .await
@@ -356,7 +394,9 @@ impl ApiClient {
             let body = resp.text().await.unwrap_or_default();
             bail!("Routing setup failed: HTTP {} - {}", status, body);
         }
-        resp.json().await.context("Failed to parse routing setup response")
+        resp.json()
+            .await
+            .context("Failed to parse routing setup response")
     }
 
     pub async fn routing_teardown(&self) -> anyhow::Result<()> {
@@ -386,7 +426,9 @@ impl ApiClient {
         if !resp.status().is_success() {
             bail!("Routing diagnostics failed: HTTP {}", resp.status());
         }
-        resp.json().await.context("Failed to parse routing diagnostics response")
+        resp.json()
+            .await
+            .context("Failed to parse routing diagnostics response")
     }
 
     // === Users ===
@@ -430,7 +472,9 @@ impl ApiClient {
             let body = resp.text().await.unwrap_or_default();
             bail!("Create user failed: HTTP {} - {}", status, body);
         }
-        resp.json().await.context("Failed to parse create user response")
+        resp.json()
+            .await
+            .context("Failed to parse create user response")
     }
 
     pub async fn update_user(&self, id: &str, updates: &Value) -> anyhow::Result<Value> {
@@ -447,7 +491,9 @@ impl ApiClient {
             let body = resp.text().await.unwrap_or_default();
             bail!("Update user failed: HTTP {} - {}", status, body);
         }
-        resp.json().await.context("Failed to parse update user response")
+        resp.json()
+            .await
+            .context("Failed to parse update user response")
     }
 
     pub async fn delete_user(&self, id: &str) -> anyhow::Result<()> {
@@ -468,7 +514,10 @@ impl ApiClient {
 
     pub async fn change_user_password(&self, id: &str, new_password: &str) -> anyhow::Result<()> {
         let resp = self
-            .request_builder(reqwest::Method::POST, &format!("/api/v1/users/{}/password", id))
+            .request_builder(
+                reqwest::Method::POST,
+                &format!("/api/v1/users/{}/password", id),
+            )
             .await
             .json(&serde_json::json!({
                 "new_password": new_password,
@@ -496,12 +545,17 @@ impl ApiClient {
         if !resp.status().is_success() {
             bail!("List sessions failed: HTTP {}", resp.status());
         }
-        resp.json().await.context("Failed to parse sessions response")
+        resp.json()
+            .await
+            .context("Failed to parse sessions response")
     }
 
     pub async fn kick_session(&self, id: &str) -> anyhow::Result<()> {
         let resp = self
-            .request_builder(reqwest::Method::DELETE, &format!("/api/v1/users/sessions/{}", id))
+            .request_builder(
+                reqwest::Method::DELETE,
+                &format!("/api/v1/users/sessions/{}", id),
+            )
             .await
             .send()
             .await
@@ -526,7 +580,9 @@ impl ApiClient {
         if !resp.status().is_success() {
             bail!("Get me failed: HTTP {}", resp.status());
         }
-        resp.json().await.context("Failed to parse current user response")
+        resp.json()
+            .await
+            .context("Failed to parse current user response")
     }
 
     pub async fn change_my_password(
@@ -555,7 +611,11 @@ impl ApiClient {
 
     // === Logs ===
 
-    pub async fn logs_history(&self, limit: u32, level: Option<&str>) -> anyhow::Result<Vec<Value>> {
+    pub async fn logs_history(
+        &self,
+        limit: u32,
+        level: Option<&str>,
+    ) -> anyhow::Result<Vec<Value>> {
         let path = match level {
             Some(l) => format!("/api/v1/logs/history?limit={}&level={}", limit, l),
             None => format!("/api/v1/logs/history?limit={}", limit),
@@ -570,6 +630,8 @@ impl ApiClient {
         if !resp.status().is_success() {
             bail!("Logs history failed: HTTP {}", resp.status());
         }
-        resp.json().await.context("Failed to parse logs history response")
+        resp.json()
+            .await
+            .context("Failed to parse logs history response")
     }
 }

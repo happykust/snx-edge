@@ -75,9 +75,7 @@ pub fn show_routing_window(api: ApiClient, role: &str) {
         .css_classes(vec!["destructive-action".to_string()])
         .build();
 
-    let diag_btn = gtk4::Button::builder()
-        .label("Diagnostics")
-        .build();
+    let diag_btn = gtk4::Button::builder().label("Diagnostics").build();
 
     let close_btn = gtk4::Button::builder().label("Close").build();
 
@@ -94,13 +92,15 @@ pub fn show_routing_window(api: ApiClient, role: &str) {
     // --- Callbacks ---
     let api_setup = api.clone();
     setup_btn.connect_clicked(clone!(
-        #[weak] window,
+        #[weak]
+        window,
         move |btn| {
             btn.set_sensitive(false);
             let api = api_setup.clone();
             let btn2 = btn.clone();
             glib::spawn_future_local(clone!(
-                #[weak] window,
+                #[weak]
+                window,
                 async move {
                     let (tx, rx) = async_channel::bounded(1);
                     tokio::spawn(async move {
@@ -124,13 +124,15 @@ pub fn show_routing_window(api: ApiClient, role: &str) {
 
     let api_teardown = api.clone();
     teardown_btn.connect_clicked(clone!(
-        #[weak] window,
+        #[weak]
+        window,
         move |btn| {
             btn.set_sensitive(false);
             let api = api_teardown.clone();
             let btn2 = btn.clone();
             glib::spawn_future_local(clone!(
-                #[weak] window,
+                #[weak]
+                window,
                 async move {
                     let (tx, rx) = async_channel::bounded(1);
                     tokio::spawn(async move {
@@ -138,10 +140,16 @@ pub fn show_routing_window(api: ApiClient, role: &str) {
                     });
                     match rx.recv().await {
                         Ok(Ok(())) => {
-                            show_info_dialog(&window, "Routing Teardown", "Routing torn down successfully.").await;
+                            show_info_dialog(
+                                &window,
+                                "Routing Teardown",
+                                "Routing torn down successfully.",
+                            )
+                            .await;
                         }
                         Ok(Err(e)) => {
-                            show_info_dialog(&window, "Routing Teardown Error", &e.to_string()).await;
+                            show_info_dialog(&window, "Routing Teardown Error", &e.to_string())
+                                .await;
                         }
                         _ => {}
                     }
@@ -153,13 +161,15 @@ pub fn show_routing_window(api: ApiClient, role: &str) {
 
     let api_diag = api.clone();
     diag_btn.connect_clicked(clone!(
-        #[weak] window,
+        #[weak]
+        window,
         move |btn| {
             btn.set_sensitive(false);
             let api = api_diag.clone();
             let btn2 = btn.clone();
             glib::spawn_future_local(clone!(
-                #[weak] window,
+                #[weak]
+                window,
                 async move {
                     let (tx, rx) = async_channel::bounded(1);
                     tokio::spawn(async move {
@@ -182,15 +192,18 @@ pub fn show_routing_window(api: ApiClient, role: &str) {
     ));
 
     close_btn.connect_clicked(clone!(
-        #[weak] window,
+        #[weak]
+        window,
         move |_| window.close()
     ));
 
     // Escape to close
     let key_controller = gtk4::EventControllerKey::new();
     key_controller.connect_key_pressed(clone!(
-        #[weak] window,
-        #[upgrade_or] glib::Propagation::Proceed,
+        #[weak]
+        window,
+        #[upgrade_or]
+        glib::Propagation::Proceed,
         move |_, key, _, _| {
             if key == gtk4::gdk::Key::Escape {
                 window.close();
@@ -254,9 +267,7 @@ fn build_list_tab(api: ApiClient, kind: ListKind, can_edit: bool) -> gtk4::Box {
         btn_box.append(&add_btn);
 
         if kind == ListKind::Clients {
-            let add_my_ip_btn = gtk4::Button::builder()
-                .label("Add My IP")
-                .build();
+            let add_my_ip_btn = gtk4::Button::builder().label("Add My IP").build();
             let api_ip = api.clone();
             let list_box_ip = list_box.clone();
             add_my_ip_btn.connect_clicked(move |btn| {
@@ -269,7 +280,12 @@ fn build_list_tab(api: ApiClient, kind: ListKind, can_edit: bool) -> gtk4::Box {
                         Some(ip) => ip,
                         None => {
                             let parent: gtk4::Window = main_window().upcast();
-                            show_info_dialog(&parent, "Error", "Could not detect local IP address.").await;
+                            show_info_dialog(
+                                &parent,
+                                "Error",
+                                "Could not detect local IP address.",
+                            )
+                            .await;
                             btn2.set_sensitive(true);
                             return;
                         }
@@ -278,13 +294,26 @@ fn build_list_tab(api: ApiClient, kind: ListKind, can_edit: bool) -> gtk4::Box {
                     let api2 = api.clone();
                     let ip = local_ip.clone();
                     tokio::spawn(async move {
-                        let _ = tx.send(api2.add_routing_client(&ip, "Added from client (my IP)").await).await;
+                        let _ = tx
+                            .send(
+                                api2.add_routing_client(&ip, "Added from client (my IP)")
+                                    .await,
+                            )
+                            .await;
                     });
                     if let Ok(Ok(val)) = rx.recv().await {
                         let address = val["address"].as_str().unwrap_or("auto").to_string();
                         let comment = val["comment"].as_str().unwrap_or("").to_string();
                         let id = val[".id"].as_str().unwrap_or("").to_string();
-                        append_list_row(&list_box, &id, &address, &comment, api.clone(), ListKind::Clients, true);
+                        append_list_row(
+                            &list_box,
+                            &id,
+                            &address,
+                            &comment,
+                            api.clone(),
+                            ListKind::Clients,
+                            true,
+                        );
                     }
                     btn2.set_sensitive(true);
                 });
@@ -306,7 +335,9 @@ fn build_list_tab(api: ApiClient, kind: ListKind, can_edit: bool) -> gtk4::Box {
                     let comment2 = comment.clone();
                     tokio::spawn(async move {
                         let result = match kind {
-                            ListKind::Clients => api2.add_routing_client(&address2, &comment2).await,
+                            ListKind::Clients => {
+                                api2.add_routing_client(&address2, &comment2).await
+                            }
                             ListKind::Bypass => api2.add_routing_bypass(&address2, &comment2).await,
                         };
                         let _ = tx.send(result).await;
@@ -369,7 +400,15 @@ async fn reload_list(list_box: &gtk4::ListBox, api: ApiClient, kind: ListKind, c
             let id = item[".id"].as_str().unwrap_or("").to_string();
             let address = item["address"].as_str().unwrap_or("").to_string();
             let comment = item["comment"].as_str().unwrap_or("").to_string();
-            append_list_row(list_box, &id, &address, &comment, api.clone(), kind, can_edit);
+            append_list_row(
+                list_box,
+                &id,
+                &address,
+                &comment,
+                api.clone(),
+                kind,
+                can_edit,
+            );
         }
     }
 }
@@ -515,9 +554,12 @@ async fn show_add_entry_dialog() -> Option<(String, String)> {
 
     let tx_ok = tx.clone();
     ok_btn.connect_clicked(clone!(
-        #[weak] window,
-        #[weak] address_entry,
-        #[weak] comment_entry,
+        #[weak]
+        window,
+        #[weak]
+        address_entry,
+        #[weak]
+        comment_entry,
         move |_| {
             let address = address_entry.text().trim().to_string();
             let comment = comment_entry.text().trim().to_string();
@@ -529,7 +571,8 @@ async fn show_add_entry_dialog() -> Option<(String, String)> {
     ));
 
     cancel_btn.connect_clicked(clone!(
-        #[weak] window,
+        #[weak]
+        window,
         move |_| {
             let _ = tx.try_send(None::<(String, String)>);
             window.close();

@@ -1,6 +1,6 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tower::ServiceExt;
 
 /// Helper to build the test app and get an admin JWT token.
@@ -38,15 +38,17 @@ buffer_size = 100
     std::fs::write(&config_path, &config_content).unwrap();
     // SAFETY: test env vars set before any multithreaded work
     unsafe {
-        std::env::set_var("TEST_JWT_SECRET", "test-secret-for-testing-only-must-be-32-bytes-long!");
+        std::env::set_var(
+            "TEST_JWT_SECRET",
+            "test-secret-for-testing-only-must-be-32-bytes-long!",
+        );
         std::env::set_var("SNX_EDGE_ADMIN_PASSWORD", "adminpass123");
         std::env::set_var("ROUTEROS_HOST", "127.0.0.1");
         std::env::set_var("ROUTEROS_USER", "admin");
         std::env::set_var("ROUTEROS_PASSWORD", "test");
     }
 
-    let config =
-        snx_edge_server::config::AppConfig::load(&config_path.to_string_lossy()).unwrap();
+    let config = snx_edge_server::config::AppConfig::load(&config_path.to_string_lossy()).unwrap();
     let log_buffer = snx_edge_server::api::logs::new_log_buffer(100);
     let (event_tx, _) = tokio::sync::broadcast::channel(64);
     let state = snx_edge_server::state::AppState::with_shared(
@@ -134,7 +136,12 @@ async fn resp_json(resp: axum::http::Response<Body>) -> Value {
 async fn test_health() {
     let (app, _, _dir) = setup().await;
     let resp = app
-        .oneshot(Request::builder().uri("/api/v1/health").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -171,7 +178,12 @@ async fn test_auth_login_wrong_password() {
 async fn test_protected_endpoint_without_token() {
     let (app, _, _dir) = setup().await;
     let resp = app
-        .oneshot(Request::builder().uri("/api/v1/users").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/users")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
@@ -403,7 +415,10 @@ async fn test_profiles_crud() {
 
     // Delete profile
     let resp = app
-        .oneshot(auth_delete(&format!("/api/v1/profiles/{profile_id}"), &token))
+        .oneshot(auth_delete(
+            &format!("/api/v1/profiles/{profile_id}"),
+            &token,
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);

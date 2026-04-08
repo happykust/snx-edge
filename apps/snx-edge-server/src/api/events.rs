@@ -5,8 +5,8 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::get;
 use axum::{Extension, Router};
 use futures_util::stream::Stream;
-use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
+use tokio_stream::wrappers::BroadcastStream;
 
 use crate::api::auth::Claims;
 use crate::state::{AppState, ServerEvent};

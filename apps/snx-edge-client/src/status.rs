@@ -1,4 +1,3 @@
-
 use gtk4::{
     Align, Orientation,
     glib::{self, clone},
@@ -8,7 +7,9 @@ use libadwaita::prelude::ActionRowExt;
 use tokio::sync::mpsc::Sender;
 
 use crate::{
-    POLL_INTERVAL, api::ApiClient, get_window, main_window, set_window,
+    POLL_INTERVAL,
+    api::ApiClient,
+    get_window, main_window, set_window,
     tray::{ConnectionState, TrayEvent},
 };
 
@@ -94,7 +95,10 @@ fn status_entries_from_json(value: &serde_json::Value) -> Vec<(String, String)> 
 
     // Server returns TunnelStatus: { connection: { state, server_name, ip_address, dns_servers, ... }, uptime_seconds, tx_bytes, rx_bytes }
     let connection = value.get("connection").unwrap_or(value);
-    let state = connection.get("state").and_then(|v| v.as_str()).unwrap_or("Unknown");
+    let state = connection
+        .get("state")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Unknown");
     entries.push(("State:".to_string(), state.to_string()));
 
     if let Some(server) = connection.get("server_name").and_then(|v| v.as_str()) {
@@ -108,7 +112,10 @@ fn status_entries_from_json(value: &serde_json::Value) -> Vec<(String, String)> 
         let hours = uptime / 3600;
         let minutes = (uptime % 3600) / 60;
         let secs = uptime % 60;
-        entries.push(("Uptime:".to_string(), format!("{hours}h {minutes}m {secs}s")));
+        entries.push((
+            "Uptime:".to_string(),
+            format!("{hours}h {minutes}m {secs}s"),
+        ));
     }
     // tx_bytes/rx_bytes are at the top level
     if let Some(tx) = value.get("tx_bytes").and_then(|v| v.as_u64()) {
@@ -171,7 +178,10 @@ pub async fn show_status_dialog(sender: Sender<TrayEvent>, exit_on_close: bool, 
                     acc
                 });
                 glib::idle_add_once(move || {
-                    gtk4::gdk::Display::default().unwrap().clipboard().set_text(&text);
+                    gtk4::gdk::Display::default()
+                        .unwrap()
+                        .clipboard()
+                        .set_text(&text);
                 });
             }
         });
@@ -288,7 +298,11 @@ pub async fn show_status_dialog(sender: Sender<TrayEvent>, exit_on_close: bool, 
         }
     );
 
-    let (tx, rx) = async_channel::bounded::<(ConnectionState, Vec<(String, String)>, Option<RoutingHealth>)>(1);
+    let (tx, rx) = async_channel::bounded::<(
+        ConnectionState,
+        Vec<(String, String)>,
+        Option<RoutingHealth>,
+    )>(1);
 
     glib::spawn_future_local(async move {
         while let Ok((state, entries, routing_health)) = rx.recv().await {

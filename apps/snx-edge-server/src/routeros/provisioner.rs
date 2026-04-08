@@ -59,7 +59,10 @@ impl<'a> Provisioner<'a> {
         total += self.client.delete_managed("/ip/firewall/nat").await?;
         total += self.client.delete_managed("/ip/firewall/mangle").await?;
         total += self.client.delete_managed("/ip/route").await?;
-        total += self.client.delete_managed("/ip/firewall/address-list").await?;
+        total += self
+            .client
+            .delete_managed("/ip/firewall/address-list")
+            .await?;
         total += self.client.delete_managed("/routing/table").await?;
 
         tracing::info!("PBR teardown completed: {total} rules removed");
@@ -74,14 +77,14 @@ impl<'a> Provisioner<'a> {
         let tables: Vec<RoutingTable> = self.client.list("/routing/table").await?;
         let routing_table_exists = tables.iter().any(|t| t.name == self.config.routing_table);
         if !routing_table_exists {
-            warnings.push(format!("routing table '{}' not found", self.config.routing_table));
+            warnings.push(format!(
+                "routing table '{}' not found",
+                self.config.routing_table
+            ));
         }
 
         // Check mangle rules
-        let mangles: Vec<MangleRule> = self
-            .client
-            .list_managed("/ip/firewall/mangle")
-            .await?;
+        let mangles: Vec<MangleRule> = self.client.list_managed("/ip/firewall/mangle").await?;
         let mangle_rules_count = mangles.len();
         let mangle_rules_present = mangle_rules_count >= 2;
         if !mangle_rules_present {
@@ -92,9 +95,9 @@ impl<'a> Provisioner<'a> {
 
         // Check routes
         let routes: Vec<RouteEntry> = self.client.list_managed("/ip/route").await?;
-        let vpn_route_active = routes
-            .iter()
-            .any(|r| r.routing_table.as_deref() == Some(&self.config.routing_table) && r.route_type.is_none());
+        let vpn_route_active = routes.iter().any(|r| {
+            r.routing_table.as_deref() == Some(&self.config.routing_table) && r.route_type.is_none()
+        });
         let killswitch_present = routes
             .iter()
             .any(|r| r.route_type.as_deref() == Some("blackhole"));
@@ -111,13 +114,8 @@ impl<'a> Provisioner<'a> {
         let dns_redirect_active = nats.iter().any(|r| r.dst_port.as_deref() == Some("53"));
 
         // Check filter (FastTrack)
-        let filters: Vec<FilterRule> = self
-            .client
-            .list_managed("/ip/firewall/filter")
-            .await?;
-        let fasttrack_configured = filters
-            .iter()
-            .any(|r| r.action == "fasttrack-connection");
+        let filters: Vec<FilterRule> = self.client.list_managed("/ip/firewall/filter").await?;
+        let fasttrack_configured = filters.iter().any(|r| r.action == "fasttrack-connection");
 
         // Gateway reachability (simplified — just check route exists)
         let gateway_reachable = vpn_route_active;
@@ -175,7 +173,10 @@ impl<'a> Provisioner<'a> {
 
     async fn ensure_mangle_connection_mark(&self, tag: &str) -> Result<(), AppError> {
         let existing: Vec<MangleRule> = self.client.list_managed("/ip/firewall/mangle").await?;
-        if existing.iter().any(|m| m.new_connection_mark.as_deref() == Some(&self.config.connection_mark)) {
+        if existing
+            .iter()
+            .any(|m| m.new_connection_mark.as_deref() == Some(&self.config.connection_mark))
+        {
             return Ok(());
         }
         let body = serde_json::json!({
@@ -194,7 +195,10 @@ impl<'a> Provisioner<'a> {
 
     async fn ensure_mangle_routing_mark(&self, tag: &str) -> Result<(), AppError> {
         let existing: Vec<MangleRule> = self.client.list_managed("/ip/firewall/mangle").await?;
-        if existing.iter().any(|m| m.new_routing_mark.as_deref() == Some(&self.config.routing_mark)) {
+        if existing
+            .iter()
+            .any(|m| m.new_routing_mark.as_deref() == Some(&self.config.routing_mark))
+        {
             return Ok(());
         }
         let body = serde_json::json!({
@@ -232,7 +236,10 @@ impl<'a> Provisioner<'a> {
 
     async fn ensure_killswitch(&self, tag: &str) -> Result<(), AppError> {
         let existing: Vec<RouteEntry> = self.client.list_managed("/ip/route").await?;
-        if existing.iter().any(|r| r.route_type.as_deref() == Some("blackhole")) {
+        if existing
+            .iter()
+            .any(|r| r.route_type.as_deref() == Some("blackhole"))
+        {
             return Ok(());
         }
         let body = serde_json::json!({
@@ -270,7 +277,10 @@ impl<'a> Provisioner<'a> {
 
     async fn ensure_dot_block(&self, tag: &str) -> Result<(), AppError> {
         let existing: Vec<FilterRule> = self.client.list_managed("/ip/firewall/filter").await?;
-        if existing.iter().any(|r| r.dst_port.as_deref() == Some("853")) {
+        if existing
+            .iter()
+            .any(|r| r.dst_port.as_deref() == Some("853"))
+        {
             return Ok(());
         }
         let body = serde_json::json!({

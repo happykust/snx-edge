@@ -1,16 +1,13 @@
 use std::{str::FromStr, sync::Arc};
 
 use anyhow::anyhow;
-use ksni::{
-    Handle, Icon, MenuItem, TrayMethods,
-    menu::StandardItem,
-};
+use ksni::{Handle, Icon, MenuItem, TrayMethods, menu::StandardItem};
 use tokio::sync::mpsc::{Receiver, Sender};
 
 use crate::{
     assets,
-    theme::{SystemColorTheme, system_color_theme},
     client_settings::ClientSettings,
+    theme::{SystemColorTheme, system_color_theme},
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -332,7 +329,9 @@ impl ksni::Tray for KsniTray {
             MenuItem::Standard(StandardItem {
                 label: "Disconnect".to_string(),
                 enabled: self.disconnect_enabled,
-                activate: Box::new(|tray: &mut KsniTray| tray.send_tray_event(TrayEvent::Disconnect)),
+                activate: Box::new(|tray: &mut KsniTray| {
+                    tray.send_tray_event(TrayEvent::Disconnect)
+                }),
                 ..Default::default()
             }),
             MenuItem::Standard(StandardItem {

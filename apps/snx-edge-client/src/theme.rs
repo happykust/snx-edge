@@ -43,7 +43,9 @@ pub fn system_color_theme() -> anyhow::Result<SystemColorTheme> {
 pub async fn init_theme_monitoring() -> anyhow::Result<()> {
     let connection = Connection::session().await?;
     let proxy = DesktopSettingsProxy::new(&connection).await?;
-    let scheme = proxy.read_one("org.freedesktop.appearance", "color-scheme").await?;
+    let scheme = proxy
+        .read_one("org.freedesktop.appearance", "color-scheme")
+        .await?;
     let mut scheme = u32::try_from(scheme)?;
     if scheme == 0 && is_ubuntu() {
         scheme = 2;

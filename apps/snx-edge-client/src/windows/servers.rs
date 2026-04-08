@@ -82,15 +82,18 @@ pub fn show_servers_window() {
     });
 
     close_btn.connect_clicked(clone!(
-        #[weak] window,
+        #[weak]
+        window,
         move |_| window.close()
     ));
 
     // Escape to close
     let key_controller = gtk4::EventControllerKey::new();
     key_controller.connect_key_pressed(clone!(
-        #[weak] window,
-        #[upgrade_or] glib::Propagation::Proceed,
+        #[weak]
+        window,
+        #[upgrade_or]
+        glib::Propagation::Proceed,
         move |_, key, _, _| {
             if key == gtk4::gdk::Key::Escape {
                 window.close();
@@ -234,9 +237,7 @@ fn append_server_row(
         let url = server_url.clone();
         let list_box = list_box_edit.clone();
         glib::spawn_future_local(async move {
-            if let Some((new_name, new_url)) =
-                show_server_edit_dialog(Some((&name, &url))).await
-            {
+            if let Some((new_name, new_url)) = show_server_edit_dialog(Some((&name, &url))).await {
                 let mut settings = ClientSettings::load();
                 if let Some(s) = settings.servers.get_mut(idx) {
                     s.name = new_name;
@@ -370,10 +371,14 @@ async fn show_server_edit_dialog(existing: Option<(&str, &str)>) -> Option<(Stri
 
     let tx_ok = tx.clone();
     ok_btn.connect_clicked(clone!(
-        #[weak] window,
-        #[weak] name_entry,
-        #[weak] url_entry,
-        #[weak] error_label,
+        #[weak]
+        window,
+        #[weak]
+        name_entry,
+        #[weak]
+        url_entry,
+        #[weak]
+        error_label,
         move |_| {
             let name = name_entry.text().trim().to_string();
             let url = url_entry.text().trim().to_string();
@@ -396,7 +401,8 @@ async fn show_server_edit_dialog(existing: Option<(&str, &str)>) -> Option<(Stri
     ));
 
     cancel_btn.connect_clicked(clone!(
-        #[weak] window,
+        #[weak]
+        window,
         move |_| {
             let _ = tx.try_send(None::<(String, String)>);
             window.close();

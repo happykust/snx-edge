@@ -3,7 +3,7 @@ use axum::routing::get;
 use axum::{Extension, Json, Router};
 use serde::Deserialize;
 
-use crate::api::auth::{has_permission, Claims};
+use crate::api::auth::{Claims, has_permission};
 use crate::error::AppError;
 use crate::state::{AppState, ServerEvent};
 

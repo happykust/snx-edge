@@ -46,7 +46,12 @@ impl ProfileStore {
     }
 
     pub fn get(&self, id: &str) -> Option<Profile> {
-        self.profiles.read().unwrap().iter().find(|p| p.id == id).cloned()
+        self.profiles
+            .read()
+            .unwrap()
+            .iter()
+            .find(|p| p.id == id)
+            .cloned()
     }
 
     pub fn set_profiles(&self, profiles: Vec<Profile>) {
@@ -68,14 +73,20 @@ impl ProfileStore {
 }
 
 /// Load profiles from the server and update the store.
-pub async fn load_profiles(api: &ApiClient, store: &Arc<ProfileStore>) -> anyhow::Result<Vec<Profile>> {
+pub async fn load_profiles(
+    api: &ApiClient,
+    store: &Arc<ProfileStore>,
+) -> anyhow::Result<Vec<Profile>> {
     let values = api.list_profiles().await?;
     let profiles: Vec<Profile> = values
         .into_iter()
         .map(|v| Profile {
             id: v["id"].as_str().unwrap_or_default().to_string(),
             name: v["name"].as_str().unwrap_or("Unnamed").to_string(),
-            config: v.get("config").cloned().unwrap_or(Value::Object(serde_json::Map::new())),
+            config: v
+                .get("config")
+                .cloned()
+                .unwrap_or(Value::Object(serde_json::Map::new())),
             enabled: v["enabled"].as_bool().unwrap_or(true),
         })
         .collect();

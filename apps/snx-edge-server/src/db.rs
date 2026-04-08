@@ -337,7 +337,12 @@ impl UserDb {
 
     // === Login tracking ===
 
-    pub async fn record_failed_login(&self, user_id: &str, max_attempts: u32, lockout_minutes: u32) -> Result<(), AppError> {
+    pub async fn record_failed_login(
+        &self,
+        user_id: &str,
+        max_attempts: u32,
+        lockout_minutes: u32,
+    ) -> Result<(), AppError> {
         let conn = self.conn.lock().await;
 
         // Increment attempts
@@ -407,10 +412,7 @@ impl UserDb {
 
     pub async fn delete_user_sessions(&self, user_id: &str) -> Result<u64, AppError> {
         let conn = self.conn.lock().await;
-        let count = conn.execute(
-            "DELETE FROM sessions WHERE user_id = ?1",
-            params![user_id],
-        )?;
+        let count = conn.execute("DELETE FROM sessions WHERE user_id = ?1", params![user_id])?;
         Ok(count as u64)
     }
 

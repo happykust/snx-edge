@@ -1,13 +1,13 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use futures_util::StreamExt;
 use gtk4::{
     Align, Orientation, WrapMode,
     glib::{self, clone},
     prelude::*,
 };
 use reqwest_eventsource::{Event, EventSource};
-use futures_util::StreamExt;
 
 use crate::{api::ApiClient, get_window, main_window, set_window};
 
@@ -70,9 +70,7 @@ pub fn show_logs_window(api: ApiClient) {
         .margin_bottom(4)
         .build();
 
-    let scrolled = gtk4::ScrolledWindow::builder()
-        .vexpand(true)
-        .build();
+    let scrolled = gtk4::ScrolledWindow::builder().vexpand(true).build();
     scrolled.set_child(Some(&text_view));
     outer.append(&scrolled);
 
@@ -93,15 +91,18 @@ pub fn show_logs_window(api: ApiClient) {
     outer.append(&bottom_bar);
 
     close_btn.connect_clicked(clone!(
-        #[weak] window,
+        #[weak]
+        window,
         move |_| window.close()
     ));
 
     // Escape to close
     let key_controller = gtk4::EventControllerKey::new();
     key_controller.connect_key_pressed(clone!(
-        #[weak] window,
-        #[upgrade_or] glib::Propagation::Proceed,
+        #[weak]
+        window,
+        #[upgrade_or]
+        glib::Propagation::Proceed,
         move |_, key, _, _| {
             if key == gtk4::gdk::Key::Escape {
                 window.close();
@@ -132,7 +133,13 @@ pub fn show_logs_window(api: ApiClient) {
     let scrolled_init = scrolled.clone();
     let level_dropdown_load = level_dropdown.clone();
     glib::spawn_future_local(async move {
-        load_history(&api_init, &text_view_init, &scrolled_init, &level_dropdown_load).await;
+        load_history(
+            &api_init,
+            &text_view_init,
+            &scrolled_init,
+            &level_dropdown_load,
+        )
+        .await;
     });
 
     // Refresh button
@@ -155,7 +162,13 @@ pub fn show_logs_window(api: ApiClient) {
     let text_view_sse = text_view.clone();
     let scrolled_sse = scrolled.clone();
     let level_dropdown_sse = level_dropdown.clone();
-    start_sse_stream(api_sse, text_view_sse, scrolled_sse, level_dropdown_sse, stop_flag);
+    start_sse_stream(
+        api_sse,
+        text_view_sse,
+        scrolled_sse,
+        level_dropdown_sse,
+        stop_flag,
+    );
 
     window.present();
 }
@@ -167,12 +180,18 @@ async fn load_history(
     level_dropdown: &gtk4::DropDown,
 ) {
     let level = selected_level(level_dropdown);
-    let level_param = if level == "all" { None } else { Some(level.clone()) };
+    let level_param = if level == "all" {
+        None
+    } else {
+        Some(level.clone())
+    };
 
     let (tx, rx) = async_channel::bounded(1);
     let api2 = api.clone();
     tokio::spawn(async move {
-        let _ = tx.send(api2.logs_history(200, level_param.as_deref()).await).await;
+        let _ = tx
+            .send(api2.logs_history(200, level_param.as_deref()).await)
+            .await;
     });
 
     match rx.recv().await {

@@ -8,10 +8,10 @@ pub mod routing;
 pub mod tunnel;
 pub mod users;
 
-use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
-use axum::http::Method;
-use axum::middleware;
 use axum::Router;
+use axum::http::Method;
+use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
+use axum::middleware;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 
@@ -20,9 +20,7 @@ use crate::state::AppState;
 /// Build the complete API router.
 pub fn router(state: AppState) -> Router {
     // Public routes (no auth required)
-    let public = Router::new()
-        .merge(health::routes())
-        .merge(auth::routes());
+    let public = Router::new().merge(health::routes()).merge(auth::routes());
 
     // Protected routes (JWT auth required)
     let protected = Router::new()

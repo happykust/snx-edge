@@ -103,7 +103,14 @@ async fn login(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
-    let tokens = issue_tokens(&state, &user.id, &user.role, ip.as_deref(), user_agent.as_deref()).await?;
+    let tokens = issue_tokens(
+        &state,
+        &user.id,
+        &user.role,
+        ip.as_deref(),
+        user_agent.as_deref(),
+    )
+    .await?;
     Ok(Json(tokens))
 }
 
@@ -138,7 +145,14 @@ async fn refresh(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
-    let tokens = issue_tokens(&state, &user.id, &user.role, ip.as_deref(), user_agent.as_deref()).await?;
+    let tokens = issue_tokens(
+        &state,
+        &user.id,
+        &user.role,
+        ip.as_deref(),
+        user_agent.as_deref(),
+    )
+    .await?;
     Ok(Json(tokens))
 }
 
