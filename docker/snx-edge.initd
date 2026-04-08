@@ -16,6 +16,11 @@ depend() {
 }
 
 start_pre() {
+    # Auto-create config.toml from example on first boot
+    if [ ! -f /etc/snx-edge/config.toml ]; then
+        cp /etc/snx-edge/config.toml.example /etc/snx-edge/config.toml
+    fi
+
     # Ensure ip_forward is enabled
     sysctl -w net.ipv4.ip_forward=1 > /dev/null 2>&1
 
