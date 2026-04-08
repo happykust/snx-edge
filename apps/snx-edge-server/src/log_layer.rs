@@ -2,7 +2,6 @@
 //! and broadcasts them as SSE events.
 
 use std::fmt;
-use std::sync::Arc;
 
 use chrono::Utc;
 use tokio::sync::broadcast;

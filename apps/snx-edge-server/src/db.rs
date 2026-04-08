@@ -157,7 +157,7 @@ impl UserDb {
                     failed_login_attempts, locked_until, created_at, updated_at
              FROM users WHERE id = ?1",
             params![id],
-            |row| row_to_user(row),
+            row_to_user,
         )
         .map_err(|_| AppError::NotFound("user not found".to_string()))
     }
@@ -170,7 +170,7 @@ impl UserDb {
                     failed_login_attempts, locked_until, created_at, updated_at
              FROM users WHERE username = ?1",
             params![username],
-            |row| row_to_user(row),
+            row_to_user,
         )
         .map_err(|_| AppError::NotFound("user not found".to_string()))
     }
@@ -183,7 +183,7 @@ impl UserDb {
              FROM users ORDER BY created_at",
         )?;
         let users = stmt
-            .query_map([], |row| row_to_user(row))?
+            .query_map([], row_to_user)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(users)
     }
@@ -219,10 +219,10 @@ impl UserDb {
             params![id, username, hash, role, comment, now.to_rfc3339()],
         )
         .map_err(|e| {
-            if let rusqlite::Error::SqliteFailure(ref err, _) = e {
-                if err.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE {
-                    return AppError::Conflict(format!("username '{username}' already exists"));
-                }
+            if let rusqlite::Error::SqliteFailure(ref err, _) = e
+                && err.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+            {
+                return AppError::Conflict(format!("username '{username}' already exists"));
             }
             AppError::from(e)
         })?;
@@ -248,7 +248,7 @@ impl UserDb {
                         failed_login_attempts, locked_until, created_at, updated_at
                  FROM users WHERE id = ?1",
                 params![id],
-                |row| row_to_user(row),
+                row_to_user,
             )
             .map_err(|_| AppError::NotFound("user not found".to_string()))?;
 

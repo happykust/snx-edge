@@ -106,16 +106,16 @@ async fn update_config(
     }
 
     // Validate logging level if provided
-    if let Some(ref logging) = req.logging {
-        if let Some(ref level) = logging.level {
-            const VALID_LEVELS: &[&str] = &["trace", "debug", "info", "warn", "error"];
-            if !VALID_LEVELS.contains(&level.as_str()) {
-                return Err(AppError::BadRequest(format!(
-                    "invalid log level '{}', must be one of: {}",
-                    level,
-                    VALID_LEVELS.join(", ")
-                )));
-            }
+    if let Some(ref logging) = req.logging
+        && let Some(ref level) = logging.level
+    {
+        const VALID_LEVELS: &[&str] = &["trace", "debug", "info", "warn", "error"];
+        if !VALID_LEVELS.contains(&level.as_str()) {
+            return Err(AppError::BadRequest(format!(
+                "invalid log level '{}', must be one of: {}",
+                level,
+                VALID_LEVELS.join(", ")
+            )));
         }
     }
 
@@ -123,10 +123,10 @@ async fn update_config(
         let mut config = state.config.write().await;
 
         // Apply partial updates — only provided fields are changed
-        if let Some(api) = req.api {
-            if let Some(listen) = api.listen {
-                config.api.listen = listen;
-            }
+        if let Some(api) = req.api
+            && let Some(listen) = api.listen
+        {
+            config.api.listen = listen;
         }
 
         if let Some(auth) = req.auth {

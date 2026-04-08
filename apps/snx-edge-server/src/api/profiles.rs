@@ -1,7 +1,7 @@
 use axum::extract::{Multipart, Path, State};
 use axum::http::{StatusCode, header};
 use axum::response::IntoResponse;
-use axum::routing::{delete, get, post, put};
+use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
 
@@ -26,10 +26,11 @@ struct ProfileResponse {
 fn mask_secrets(mut config: serde_json::Value) -> serde_json::Value {
     if let Some(obj) = config.as_object_mut() {
         for key in ["password", "cert_password"] {
-            if let Some(val) = obj.get(key) {
-                if val.is_string() && !val.as_str().unwrap_or("").is_empty() {
-                    obj.insert(key.to_string(), serde_json::json!(SECRET_MASK));
-                }
+            if let Some(val) = obj.get(key)
+                && val.is_string()
+                && !val.as_str().unwrap_or("").is_empty()
+            {
+                obj.insert(key.to_string(), serde_json::json!(SECRET_MASK));
             }
         }
     }
@@ -147,12 +148,12 @@ async fn update_profile(
                 serde_json::from_str(&existing_config_str).unwrap_or_default();
 
             for key in ["password", "cert_password"] {
-                if let Some(val) = obj.get(key) {
-                    if val.as_str() == Some(SECRET_MASK) {
-                        // Keep existing secret
-                        if let Some(existing_val) = existing.get(key) {
-                            obj.insert(key.to_string(), existing_val.clone());
-                        }
+                if let Some(val) = obj.get(key)
+                    && val.as_str() == Some(SECRET_MASK)
+                {
+                    // Keep existing secret
+                    if let Some(existing_val) = existing.get(key) {
+                        obj.insert(key.to_string(), existing_val.clone());
                     }
                 }
             }
@@ -238,10 +239,10 @@ async fn upload_certs(
                 let ca_list = obj
                     .entry("ca_cert")
                     .or_insert_with(|| serde_json::json!([]));
-                if let Some(arr) = ca_list.as_array_mut() {
-                    if !arr.iter().any(|v| v.as_str() == Some(&dest_str)) {
-                        arr.push(serde_json::json!(dest_str));
-                    }
+                if let Some(arr) = ca_list.as_array_mut()
+                    && !arr.iter().any(|v| v.as_str() == Some(&dest_str))
+                {
+                    arr.push(serde_json::json!(dest_str));
                 }
             }
             _ => {}

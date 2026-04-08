@@ -173,10 +173,11 @@ fn map_connection_info(info: &snxcore::model::ConnectionInfo, mtu: u16) -> Conne
 
 /// Build snxcore TunnelParams from our VpnConfig.
 pub fn build_tunnel_params(vpn: &VpnConfig) -> snxcore::model::params::TunnelParams {
-    let mut params = snxcore::model::params::TunnelParams::default();
-
-    params.server_name = vpn.server.clone();
-    params.user_name = vpn.username.clone();
+    let mut params = snxcore::model::params::TunnelParams {
+        server_name: vpn.server.clone(),
+        user_name: vpn.username.clone(),
+        ..Default::default()
+    };
 
     if let Some(ref pw) = vpn.password {
         params.password = SecretString::new(pw.clone().into_boxed_str());
@@ -397,17 +398,17 @@ impl TunnelManager {
                 // Forward to connector for internal handling (rekey etc.)
                 {
                     let mut guard = connector.lock().await;
-                    if let Some(c) = guard.as_mut() {
-                        if let Err(e) = c.handle_tunnel_event(event.clone()).await {
-                            tracing::warn!("tunnel event handler error: {e}");
-                            *status.write().await = ConnectionStatus::Error {
-                                message: e.to_string(),
-                            };
-                            let _ = broadcast_tx.send(ServerEvent::ConnectionStatus {
-                                status: "error".to_string(),
-                            });
-                            break;
-                        }
+                    if let Some(c) = guard.as_mut()
+                        && let Err(e) = c.handle_tunnel_event(event.clone()).await
+                    {
+                        tracing::warn!("tunnel event handler error: {e}");
+                        *status.write().await = ConnectionStatus::Error {
+                            message: e.to_string(),
+                        };
+                        let _ = broadcast_tx.send(ServerEvent::ConnectionStatus {
+                            status: "error".to_string(),
+                        });
+                        break;
                     }
                 }
 

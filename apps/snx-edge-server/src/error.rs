@@ -55,7 +55,7 @@ impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let status = self.status_code();
         let body = ProblemDetails {
-            r#type: format!("about:blank"),
+            r#type: "about:blank".to_string(),
             title: status.canonical_reason().unwrap_or("Error").to_string(),
             status: status.as_u16(),
             detail: Some(self.to_string()),
