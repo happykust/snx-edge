@@ -15,7 +15,7 @@ Thank you for your interest in contributing! This document provides guidelines f
 
 ```bash
 git clone --recurse-submodules https://github.com/happykust/snx-edge.git
-cd snx-edge-proxy
+cd snx-edge
 cargo build
 ```
 

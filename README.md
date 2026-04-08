@@ -1,7 +1,7 @@
 # snx-edge
 
 [![CI](https://github.com/happykust/snx-edge/actions/workflows/ci.yml/badge.svg)](https://github.com/happykust/snx-edge/actions/workflows/ci.yml)
-[![Docker](https://github.com/happykust/snx-edge/actions/workflows/docker.yml/badge.svg)](https://github.com/happykust/snx-edge/actions/workflows/docker.yml)
+[![Release](https://github.com/happykust/snx-edge/actions/workflows/release.yml/badge.svg)](https://github.com/happykust/snx-edge/actions/workflows/release.yml)
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](LICENSE)
 
 Headless Check Point VPN client running inside a MikroTik container with a remote management API and a GTK4 tray application for Linux desktops.
@@ -45,7 +45,7 @@ Headless Check Point VPN client running inside a MikroTik container with a remot
 
 ```bash
 git clone --recurse-submodules https://github.com/happykust/snx-edge.git
-cd snx-edge-proxy
+cd snx-edge
 ```
 
 ### 2. Configure
@@ -174,7 +174,7 @@ Configuration is stored in `~/.config/snx-edge/client.toml`.
 ## Project Structure
 
 ```
-snx-edge-proxy/
+snx-edge/
 ├── apps/
 │   ├── snx-edge-server/       # Headless VPN server + API
 │   │   ├── src/

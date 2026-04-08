@@ -6,6 +6,7 @@ resolver = "3"
 edition = "2024"
 license = "AGPL-3.0"
 repository = "https://github.com/happykust/snx-edge"
+homepage = "https://github.com/happykust/snx-edge"
 
 [workspace.dependencies]
 # Async runtime
