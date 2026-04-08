@@ -248,7 +248,7 @@ async fn try_restore_or_login(ctx: Arc<tokio::sync::RwLock<AppContext>>, server:
     // Setup API for this server
     {
         let mut c = ctx.write().await;
-        c.api = ApiClient::new(&server.url);
+        c.api = ApiClient::with_insecure(&server.url, server.insecure);
         c.auth = AuthManager::new(c.api.clone(), &server.url);
     }
 
@@ -290,6 +290,7 @@ async fn show_add_server_dialog_inner(ctx: Arc<tokio::sync::RwLock<AppContext>>)
                 url: url.clone(),
                 auto_connect: false,
                 last_profile_id: None,
+                insecure: false,
             });
             settings.active_server = Some(settings.servers.len() - 1);
             let _ = settings.save();
@@ -582,12 +583,29 @@ async fn show_login_only_dialog(server_name: &str, server_url: &str) -> Option<(
 // === Actions ===
 
 async fn do_connect(ctx: &AppContext, profile_id: &str) {
+    // Resolve profile_id: if empty, use connected_profile_id or first available profile
+    let resolved_id = if profile_id.is_empty() {
+        if let Some(id) = ctx.profile_store.connected_profile_id().filter(|s| !s.is_empty()) {
+            id
+        } else {
+            let profiles = ctx.profile_store.all();
+            if let Some(first) = profiles.first() {
+                first.id.clone()
+            } else {
+                let _ = show_notification("Error", "No VPN profiles configured").await;
+                return;
+            }
+        }
+    } else {
+        profile_id.to_string()
+    };
+
     let _ = ctx
         .tray_cmd
         .send(TrayCommand::Update(Some(Arc::new(ConnectionState::Connecting))))
         .await;
 
-    match ctx.api.tunnel_connect(profile_id).await {
+    match ctx.api.tunnel_connect(&resolved_id).await {
         Ok(json) => {
             let state = ConnectionState::from_json(&json);
             let _ = show_notification("VPN", &format!("{state}")).await;

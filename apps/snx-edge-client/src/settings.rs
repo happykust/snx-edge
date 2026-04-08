@@ -1237,6 +1237,7 @@ impl SettingsDialog {
                 url: url.clone(),
                 auto_connect,
                 last_profile_id,
+                insecure: false,
             });
             settings.active_server = Some(settings.servers.len() - 1);
         }

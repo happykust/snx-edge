@@ -73,6 +73,7 @@ pub fn show_servers_window() {
                     url,
                     auto_connect: false,
                     last_profile_id: None,
+                    insecure: false,
                 });
                 let _ = settings.save();
                 reload_servers(&list_box);

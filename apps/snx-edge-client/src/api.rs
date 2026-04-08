@@ -21,11 +21,15 @@ pub struct TokenResponse {
 
 impl ApiClient {
     pub fn new(base_url: &str) -> Self {
+        Self::with_insecure(base_url, false)
+    }
+
+    pub fn with_insecure(base_url: &str, insecure: bool) -> Self {
         Self {
             client: Client::builder()
-                .danger_accept_invalid_certs(true)
+                .danger_accept_invalid_certs(insecure)
                 .build()
-                .unwrap_or_default(),
+                .expect("Failed to build HTTP client"),
             base_url: Arc::new(RwLock::new(base_url.trim_end_matches('/').to_string())),
             token: Arc::new(RwLock::new(None)),
         }

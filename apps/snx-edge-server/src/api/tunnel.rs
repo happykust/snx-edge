@@ -215,5 +215,5 @@ pub fn routes() -> Router<AppState> {
         .route("/tunnel/status", get(status))
         .route("/tunnel/challenge", post(challenge))
         .route("/server/info", get(server_info_current).post(server_info))
-        .route("/routes", get(vpn_routes))
+        .route("/tunnel/routes", get(vpn_routes))
 }
