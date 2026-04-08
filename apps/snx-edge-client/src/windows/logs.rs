@@ -252,11 +252,16 @@ fn start_sse_stream(
     // UI updater
     glib::spawn_future_local(async move {
         while let Ok(data) = rx.recv().await {
+            let line = if let Ok(entry) = serde_json::from_str::<serde_json::Value>(&data) {
+                format_log_entry(&entry)
+            } else {
+                data
+            };
             let level = selected_level(&level_dropdown);
-            if should_show(&data, &level) {
+            if should_show(&line, &level) {
                 let buffer = text_view.buffer();
                 let mut end = buffer.end_iter();
-                buffer.insert(&mut end, &data);
+                buffer.insert(&mut end, &line);
                 buffer.insert(&mut end, "\n");
                 scroll_to_bottom(&scrolled);
             }

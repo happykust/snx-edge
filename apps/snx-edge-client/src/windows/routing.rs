@@ -6,6 +6,14 @@ use gtk4::{
 
 use crate::{api::ApiClient, get_window, main_window, set_window};
 
+/// Detect the local IP address by connecting a UDP socket to a public address.
+/// No data is actually sent.
+fn get_local_ip() -> Option<String> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:80").ok()?;
+    socket.local_addr().ok().map(|a| a.ip().to_string())
+}
+
 /// Build and show the routing management window.
 /// Two-tab Notebook: "VPN-clients" and "Bypass rules".
 /// Each tab has a list of entries with add/delete, plus bottom action bar.
@@ -257,15 +265,25 @@ fn build_list_tab(api: ApiClient, kind: ListKind, can_edit: bool) -> gtk4::Box {
                 let list_box = list_box_ip.clone();
                 let btn2 = btn.clone();
                 glib::spawn_future_local(async move {
+                    let local_ip = match get_local_ip() {
+                        Some(ip) => ip,
+                        None => {
+                            let parent: gtk4::Window = main_window().upcast();
+                            show_info_dialog(&parent, "Error", "Could not detect local IP address.").await;
+                            btn2.set_sensitive(true);
+                            return;
+                        }
+                    };
                     let (tx, rx) = async_channel::bounded(1);
                     let api2 = api.clone();
+                    let ip = local_ip.clone();
                     tokio::spawn(async move {
-                        let _ = tx.send(api2.add_routing_client("auto", "Added from client (my IP)").await).await;
+                        let _ = tx.send(api2.add_routing_client(&ip, "Added from client (my IP)").await).await;
                     });
                     if let Ok(Ok(val)) = rx.recv().await {
                         let address = val["address"].as_str().unwrap_or("auto").to_string();
                         let comment = val["comment"].as_str().unwrap_or("").to_string();
-                        let id = val["id"].as_str().unwrap_or("").to_string();
+                        let id = val[".id"].as_str().unwrap_or("").to_string();
                         append_list_row(&list_box, &id, &address, &comment, api.clone(), ListKind::Clients, true);
                     }
                     btn2.set_sensitive(true);
@@ -294,7 +312,7 @@ fn build_list_tab(api: ApiClient, kind: ListKind, can_edit: bool) -> gtk4::Box {
                         let _ = tx.send(result).await;
                     });
                     if let Ok(Ok(val)) = rx.recv().await {
-                        let id = val["id"].as_str().unwrap_or("").to_string();
+                        let id = val[".id"].as_str().unwrap_or("").to_string();
                         let addr = val["address"].as_str().unwrap_or(&address).to_string();
                         let cmt = val["comment"].as_str().unwrap_or(&comment).to_string();
                         append_list_row(&list_box, &id, &addr, &cmt, api.clone(), kind, true);
@@ -348,7 +366,7 @@ async fn reload_list(list_box: &gtk4::ListBox, api: ApiClient, kind: ListKind, c
 
     if let Ok(Ok(items)) = rx.recv().await {
         for item in &items {
-            let id = item["id"].as_str().unwrap_or("").to_string();
+            let id = item[".id"].as_str().unwrap_or("").to_string();
             let address = item["address"].as_str().unwrap_or("").to_string();
             let comment = item["comment"].as_str().unwrap_or("").to_string();
             append_list_row(list_box, &id, &address, &comment, api.clone(), kind, can_edit);

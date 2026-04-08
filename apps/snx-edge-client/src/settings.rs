@@ -702,13 +702,13 @@ impl MyWidgets {
     }
 
     async fn on_profile_new(&self, parent: &Window) {
-        let name = show_entry_dialog(parent, "New Profile", "Profile name:", "").await;
-        if let Some(name) = name {
+        let result = show_new_profile_dialog(parent).await;
+        if let Some((name, server)) = result {
             let api = self.api.clone();
             let name_clone = name.clone();
-            // Create with a minimal config containing just the server address
+            // Create with a minimal config containing the server address
             let config = serde_json::json!({
-                "server": "",
+                "server": server,
                 "login_type": "password",
                 "mtu": 1350,
                 "ike_lifetime": 28800,
@@ -1879,4 +1879,141 @@ async fn show_entry_dialog(parent: &Window, title: &str, label: &str, value: &st
 
     let ok_clicked = rx.recv().await.unwrap_or(false);
     if ok_clicked { Some(entry.text().into()) } else { None }
+}
+
+/// Show a dialog asking for both profile name and server address when creating a new profile.
+async fn show_new_profile_dialog(parent: &Window) -> Option<(String, String)> {
+    let window = Window::builder()
+        .title("New Profile")
+        .transient_for(parent)
+        .modal(true)
+        .build();
+
+    let ok = gtk4::Button::builder().label("Create").build();
+    ok.set_sensitive(false);
+
+    let cancel = gtk4::Button::builder().label("Cancel").build();
+
+    let button_box = gtk4::Box::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(6)
+        .margin_top(6)
+        .margin_start(6)
+        .margin_end(6)
+        .margin_bottom(6)
+        .homogeneous(true)
+        .halign(Align::End)
+        .valign(Align::End)
+        .build();
+
+    button_box.append(&ok);
+    button_box.append(&cancel);
+
+    let content = gtk4::Box::builder().orientation(Orientation::Vertical).build();
+    window.set_child(Some(&content));
+    window.set_default_widget(Some(&ok));
+
+    let inner = gtk4::Box::builder()
+        .orientation(Orientation::Vertical)
+        .margin_bottom(6)
+        .margin_top(6)
+        .margin_start(6)
+        .margin_end(6)
+        .spacing(6)
+        .build();
+
+    inner.append(&gtk4::Label::builder().label("Profile name:").halign(Align::Start).build());
+    let name_entry = gtk4::Entry::builder()
+        .name("name")
+        .placeholder_text("My VPN Profile")
+        .build();
+    inner.append(&name_entry);
+
+    inner.append(&gtk4::Label::builder().label("Server address:").halign(Align::Start).build());
+    let server_entry = gtk4::Entry::builder()
+        .name("server")
+        .placeholder_text("vpn.example.com")
+        .activates_default(true)
+        .build();
+    inner.append(&server_entry);
+
+    // Enable OK only when both fields are non-empty
+    let update_ok = {
+        let ok = ok.clone();
+        let name_entry = name_entry.clone();
+        let server_entry = server_entry.clone();
+        move || {
+            let name_ok = !name_entry.text().trim().is_empty();
+            let server_ok = !server_entry.text().trim().is_empty();
+            ok.set_sensitive(name_ok && server_ok);
+        }
+    };
+    let update_ok2 = update_ok.clone();
+
+    name_entry.connect_changed(move |_| {
+        update_ok();
+    });
+    server_entry.connect_changed(move |_| {
+        update_ok2();
+    });
+
+    content.append(&inner);
+    content.append(&button_box);
+
+    let (tx, rx) = async_channel::bounded::<bool>(1);
+
+    let tx_ok = tx.clone();
+    ok.connect_clicked(clone!(
+        #[weak] window,
+        move |_| {
+            let _ = tx_ok.try_send(true);
+            window.close();
+        }
+    ));
+
+    let tx_cancel = tx.clone();
+    cancel.connect_clicked(clone!(
+        #[weak] window,
+        move |_| {
+            let _ = tx_cancel.try_send(false);
+            window.close();
+        }
+    ));
+
+    window.connect_close_request(move |_| {
+        let _ = tx.try_send(false);
+        glib::Propagation::Proceed
+    });
+
+    {
+        let key_controller = gtk4::EventControllerKey::new();
+        key_controller.connect_key_pressed(clone!(
+            #[weak] window,
+            #[upgrade_or] glib::Propagation::Proceed,
+            move |_, key, _, _| {
+                if key == gtk4::gdk::Key::Escape {
+                    window.close();
+                    glib::Propagation::Stop
+                } else {
+                    glib::Propagation::Proceed
+                }
+            }
+        ));
+        window.add_controller(key_controller);
+    }
+
+    window.present();
+    let current_size = window.default_size();
+    let new_width = current_size.0.max(400);
+    window.set_default_size(new_width, current_size.1);
+
+    let ok_clicked = rx.recv().await.unwrap_or(false);
+    if ok_clicked {
+        Some((
+            name_entry.text().trim().to_string(),
+            server_entry.text().trim().to_string(),
+        ))
+    } else {
+        None
+    }
 }

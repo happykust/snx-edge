@@ -172,8 +172,8 @@ impl AppTray {
     fn icon_theme(&self) -> &'static assets::IconTheme {
         let settings = ClientSettings::load();
         let system_theme = match settings.icon_theme.as_str() {
-            "dark" => SystemColorTheme::Light,
-            "light" => SystemColorTheme::Dark,
+            "dark" => SystemColorTheme::Dark,
+            "light" => SystemColorTheme::Light,
             _ => system_color_theme().ok().unwrap_or_default(),
         };
 
