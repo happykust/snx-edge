@@ -10,19 +10,9 @@ Headless Check Point VPN client running inside a MikroTik container with a remot
 
 **snx-edge** moves the VPN termination point from your workstation to a MikroTik router. The VPN tunnel runs inside a lightweight Docker container on the router, and selective traffic routing is handled by RouterOS policy-based routing (PBR). You manage everything from a system tray app on your desktop.
 
-```
-  Workstation              MikroTik Router                 Check Point
-  ┌──────────┐    REST     ┌──────────────────────┐        VPN Gateway
-  │ snx-edge │───/SSE────>│ Container            │        ┌──────────┐
-  │ -client  │            │  ┌────────┐ ┌──────┐ │ ESP/   │          │
-  │ (tray)   │            │  │ axum   │ │snx-  │ │ TCPT   │          │
-  └──────────┘            │  │ API    │ │core  │─┼───────>│          │
-                          │  └────┬───┘ └──────┘ │        └──────────┘
-                          │       │ RouterOS REST │
-                          └───────┼──────────────┘
-                                  v
-                          Firewall / Mangle / PBR
-```
+<p align="center">
+  <img src="docs/architecture.svg" alt="snx-edge architecture" width="780">
+</p>
 
 ### Key Features
 
