@@ -39,3 +39,12 @@ uuid.workspace = true
 futures-util.workspace = true
 base64.workspace = true
 dirs-next.workspace = true
+
+# Channels / async
+async-channel = "2"
+
+# D-Bus
+zbus = "5"
+
+# Image processing (tray icons)
+png = "0.17"

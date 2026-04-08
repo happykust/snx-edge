@@ -1,5 +1,5 @@
-ARG ALPINE_VERSION=3.23
-ARG RUST_VERSION=1.87
+ARG ALPINE_VERSION=3.20
+ARG RUST_VERSION=1
 
 # ---- Builder ----
 # NOTE: We do NOT use --platform=$BUILDPLATFORM here because cross-compiling
@@ -22,9 +22,10 @@ FROM alpine:${ALPINE_VERSION}
 RUN apk add --no-cache \
     ca-certificates \
     iproute2 \
-    iptables-legacy \
-    ip6tables-legacy \
-    openrc
+    iptables \
+    ip6tables \
+    openrc \
+    wget
 
 # iptables-legacy (nftables does not work in MikroTik containers)
 RUN rm -f /usr/sbin/iptables && ln -s /usr/sbin/iptables-legacy /usr/sbin/iptables && \

@@ -95,7 +95,7 @@ pub fn print_item<T: Serialize>(mode: OutputMode, item: &T) {
 pub fn print_ok(mode: OutputMode, message: &str) {
     match mode {
         OutputMode::Table => println!("{}", message),
-        OutputMode::Json => println!(r#"{{"status":"ok","message":"{}"}}"#, message),
+        OutputMode::Json => println!("{}", serde_json::json!({"status": "ok", "message": message})),
         OutputMode::Quiet => {}
     }
 }
@@ -104,10 +104,7 @@ pub fn print_ok(mode: OutputMode, message: &str) {
 pub fn print_error(mode: OutputMode, err: &anyhow::Error) {
     match mode {
         OutputMode::Json => {
-            eprintln!(
-                r#"{{"status":"error","message":"{}"}}"#,
-                err.to_string().replace('"', "\\\"")
-            );
+            eprintln!("{}", serde_json::json!({"status": "error", "message": err.to_string()}));
         }
         _ => {
             eprintln!("Error: {err:#}");

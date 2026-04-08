@@ -95,6 +95,9 @@ impl ApiClient {
             .await
             .context("Failed to connect to server")?;
 
+        if resp.status() == StatusCode::UNAUTHORIZED {
+            bail!("Session expired. Run: snx-edge-ctl login");
+        }
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
@@ -569,6 +572,31 @@ impl ApiClient {
 
         let resp = self
             .auth_builder(reqwest::Method::POST, &format!("/api/v1/users/{}/password", id))
+            .json(&body)
+            .send()
+            .await
+            .context("Failed to change password")?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("Change password failed: HTTP {} - {}", status, body);
+        }
+        Ok(())
+    }
+
+    pub async fn change_my_password(
+        &self,
+        current_password: &str,
+        new_password: &str,
+    ) -> anyhow::Result<()> {
+        let body = serde_json::json!({
+            "current_password": current_password,
+            "new_password": new_password,
+        });
+
+        let resp = self
+            .auth_builder(reqwest::Method::POST, "/api/v1/users/me/password")
             .json(&body)
             .send()
             .await

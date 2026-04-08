@@ -4,26 +4,14 @@ use tabled::Tabled;
 
 // === Auth ===
 
-#[derive(Debug, Serialize)]
-#[allow(dead_code)]
-pub struct LoginRequest {
-    pub username: String,
-    pub password: String,
-}
-
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 pub struct TokenResponse {
     pub access_token: String,
     pub refresh_token: String,
+    #[allow(dead_code)]
     pub token_type: String,
+    #[allow(dead_code)]
     pub expires_in: i64,
-}
-
-#[derive(Debug, Serialize)]
-#[allow(dead_code)]
-pub struct RefreshRequest {
-    pub refresh_token: String,
 }
 
 // === Tunnel ===
@@ -65,14 +53,6 @@ pub struct ConnectionInfo {
 pub struct MfaChallenge {
     pub mfa_type: String,
     pub prompt: String,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[allow(dead_code)]
-pub struct VpnRoute {
-    pub destination: String,
-    pub gateway: Option<String>,
-    pub interface: String,
 }
 
 // === Profiles ===
