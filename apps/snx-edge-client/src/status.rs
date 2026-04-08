@@ -92,26 +92,36 @@ fn status_entry(label: &str, value: &str) -> gtk4::Box {
 fn status_entries_from_json(value: &serde_json::Value) -> Vec<(String, String)> {
     let mut entries = vec![];
 
-    let state = value.get("state").and_then(|v| v.as_str()).unwrap_or("unknown");
+    // Server returns TunnelStatus: { connection: { state, server_name, ip_address, dns_servers, ... }, uptime_seconds, tx_bytes, rx_bytes }
+    let connection = value.get("connection").unwrap_or(value);
+    let state = connection.get("state").and_then(|v| v.as_str()).unwrap_or("Unknown");
     entries.push(("State:".to_string(), state.to_string()));
 
-    if let Some(server) = value.get("server").and_then(|v| v.as_str()) {
+    if let Some(server) = connection.get("server_name").and_then(|v| v.as_str()) {
         entries.push(("Server:".to_string(), server.to_string()));
     }
-    if let Some(ip) = value.get("ip_address").and_then(|v| v.as_str()) {
+    if let Some(ip) = connection.get("ip_address").and_then(|v| v.as_str()) {
         entries.push(("IP Address:".to_string(), ip.to_string()));
     }
-    if let Some(uptime) = value.get("uptime").and_then(|v| v.as_str()) {
-        entries.push(("Uptime:".to_string(), uptime.to_string()));
+    // uptime_seconds is at the top level
+    if let Some(uptime) = value.get("uptime_seconds").and_then(|v| v.as_u64()) {
+        let hours = uptime / 3600;
+        let minutes = (uptime % 3600) / 60;
+        let secs = uptime % 60;
+        entries.push(("Uptime:".to_string(), format!("{hours}h {minutes}m {secs}s")));
     }
+    // tx_bytes/rx_bytes are at the top level
     if let Some(tx) = value.get("tx_bytes").and_then(|v| v.as_u64()) {
         entries.push(("TX:".to_string(), format_bytes(tx)));
     }
     if let Some(rx) = value.get("rx_bytes").and_then(|v| v.as_u64()) {
         entries.push(("RX:".to_string(), format_bytes(rx)));
     }
-    if let Some(dns) = value.get("dns").and_then(|v| v.as_str()) {
-        entries.push(("DNS:".to_string(), dns.to_string()));
+    if let Some(dns) = connection.get("dns_servers").and_then(|v| v.as_array()) {
+        let dns_str: Vec<&str> = dns.iter().filter_map(|d| d.as_str()).collect();
+        if !dns_str.is_empty() {
+            entries.push(("DNS:".to_string(), dns_str.join(", ")));
+        }
     }
 
     entries

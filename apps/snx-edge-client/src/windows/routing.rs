@@ -538,41 +538,32 @@ fn format_diagnostics(val: &serde_json::Value) -> String {
         lines.push(String::new());
     }
 
-    // Check items — handle both array and object formats
-    if let Some(checks) = val.get("checks").and_then(|v| v.as_array()) {
-        for check in checks {
-            let name = check.get("name").and_then(|v| v.as_str()).unwrap_or("check");
-            let ok = check.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
-            let detail = check.get("detail").and_then(|v| v.as_str()).unwrap_or("");
-            let icon = if ok { "[ok]" } else { "[FAIL]" };
-            if detail.is_empty() {
-                lines.push(format!("{} {}", icon, name));
-            } else {
-                lines.push(format!("{} {} ({})", icon, name, detail));
-            }
-        }
-    } else if let Some(obj) = val.as_object() {
-        // Flat object: render each key-value pair
-        for (key, value) in obj {
-            if key == "status" {
-                continue; // Already shown above
-            }
+    // Server returns: { status, checks: { routing_table_exists: bool, mangle_rules_count: num, ... }, warnings: [] }
+    if let Some(checks) = val.get("checks").and_then(|v| v.as_object()) {
+        for (key, value) in checks {
             match value {
                 serde_json::Value::Bool(b) => {
                     let icon = if *b { "[ok]" } else { "[FAIL]" };
-                    lines.push(format!("{} {}", icon, key));
+                    lines.push(format!("{} {}", icon, key.replace('_', " ")));
                 }
                 serde_json::Value::Number(n) => {
-                    lines.push(format!("[ok] {} ({})", key, n));
-                }
-                serde_json::Value::String(s) => {
-                    lines.push(format!("  {}: {}", key, s));
-                }
-                serde_json::Value::Array(arr) => {
-                    lines.push(format!("  {}: {} items", key, arr.len()));
+                    lines.push(format!("  {} = {}", key.replace('_', " "), n));
                 }
                 _ => {
                     lines.push(format!("  {}: {}", key, value));
+                }
+            }
+        }
+    }
+
+    // Warnings
+    if let Some(warnings) = val.get("warnings").and_then(|v| v.as_array()) {
+        if !warnings.is_empty() {
+            lines.push(String::new());
+            lines.push("Warnings:".to_string());
+            for w in warnings {
+                if let Some(s) = w.as_str() {
+                    lines.push(format!("  - {}", s));
                 }
             }
         }

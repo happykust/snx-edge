@@ -108,8 +108,9 @@ impl ApiClient {
 
     pub async fn tunnel_connect(&self, profile_id: &str) -> anyhow::Result<Value> {
         let resp = self
-            .request_builder(reqwest::Method::POST, &format!("/api/v1/tunnel/connect/{}", profile_id))
+            .request_builder(reqwest::Method::POST, "/api/v1/tunnel/connect")
             .await
+            .json(&serde_json::json!({"profile_id": profile_id}))
             .send()
             .await
             .context("Failed to connect tunnel")?;
@@ -138,10 +139,11 @@ impl ApiClient {
         resp.json().await.context("Failed to parse tunnel disconnect response")
     }
 
-    pub async fn tunnel_reconnect(&self) -> anyhow::Result<Value> {
+    pub async fn tunnel_reconnect(&self, profile_id: &str) -> anyhow::Result<Value> {
         let resp = self
             .request_builder(reqwest::Method::POST, "/api/v1/tunnel/reconnect")
             .await
+            .json(&serde_json::json!({"profile_id": profile_id}))
             .send()
             .await
             .context("Failed to reconnect tunnel")?;
@@ -465,7 +467,7 @@ impl ApiClient {
             .request_builder(reqwest::Method::POST, &format!("/api/v1/users/{}/password", id))
             .await
             .json(&serde_json::json!({
-                "password": new_password,
+                "new_password": new_password,
             }))
             .send()
             .await

@@ -89,21 +89,33 @@ impl std::fmt::Display for ConnectionState {
 
 impl ConnectionState {
     /// Parse from a serde_json::Value returned by the tunnel status API.
+    /// Server returns TunnelStatus: { connection: { state: "Connected", server_name, ... }, uptime_seconds, ... }
     pub fn from_json(value: &serde_json::Value) -> Self {
-        let state = value
-            .get("state")
+        let connection = value.get("connection");
+        let state = connection
+            .and_then(|c| c.get("state"))
             .and_then(|v| v.as_str())
-            .unwrap_or("disconnected");
+            .unwrap_or("Disconnected");
         match state {
-            "connected" => {
-                let server = value.get("server").and_then(|v| v.as_str()).unwrap_or("unknown");
+            "Connected" => {
+                let server = connection
+                    .and_then(|c| c.get("server_name"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("VPN");
                 ConnectionState::Connected {
                     info: server.to_string(),
                 }
             }
-            "connecting" => ConnectionState::Connecting,
-            "disconnected" => ConnectionState::Disconnected,
-            _ => ConnectionState::Error(format!("Unknown state: {}", state)),
+            "Connecting" => ConnectionState::Connecting,
+            "Disconnected" => ConnectionState::Disconnected,
+            "Error" => {
+                let msg = connection
+                    .and_then(|c| c.get("message"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Unknown error");
+                ConnectionState::Error(msg.to_string())
+            }
+            _ => ConnectionState::Disconnected,
         }
     }
 }
