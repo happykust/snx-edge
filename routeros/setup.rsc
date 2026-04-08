@@ -52,8 +52,15 @@
 /container/mounts/add name=snx-data src=usb1/snx-edge/data dst=/var/lib/snx-edge
 /container/mounts/add name=snx-logs src=usb1/snx-edge/logs dst=/var/log/snx-edge
 
-# --- 5. Container ---
+# --- 5. Create directories on USB ---
+/file/mkdir usb1/snx-edge
+/file/mkdir usb1/snx-edge/config
+/file/mkdir usb1/snx-edge/data
+/file/mkdir usb1/snx-edge/logs
+
+# --- 6. Container ---
 /container/add \
+    name=snx-edge \
     remote-image=ghcr.io/happykust/snx-edge-server:latest \
     interface=veth-snx envlist=snx-env \
     root-dir=usb1/snx-edge \
