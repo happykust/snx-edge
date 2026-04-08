@@ -2,7 +2,7 @@ ARG ALPINE_VERSION=3.23
 FROM alpine:${ALPINE_VERSION}
 
 ARG TARGETARCH
-RUN apk add --no-cache ca-certificates iproute2 iptables-legacy ip6tables-legacy openrc wget
+RUN apk add --no-cache ca-certificates iproute2 iptables iptables-legacy openrc wget
 
 RUN rm -f /usr/sbin/iptables && ln -s /usr/sbin/iptables-legacy /usr/sbin/iptables && \
     rm -f /usr/sbin/ip6tables && ln -s /usr/sbin/ip6tables-legacy /usr/sbin/ip6tables
