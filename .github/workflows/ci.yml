@@ -80,7 +80,7 @@ jobs:
         run: cargo install cross --git https://github.com/cross-rs/cross --tag v0.2.5
 
       - name: Build
-        run: cross build --release --target ${{ matrix.target }} -p snx-edge-server
+        run: cross build --release --target ${{ matrix.target }} -p snx-edge-server --features snx-edge-server/vendored-openssl
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

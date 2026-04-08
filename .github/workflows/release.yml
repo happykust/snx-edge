@@ -32,7 +32,7 @@ jobs:
         run: cargo install cross@0.2.5 --locked
 
       - name: Build with cross
-        run: cross build --release -p snx-edge-server --target ${{ matrix.target }}
+        run: cross build --release -p snx-edge-server --target ${{ matrix.target }} --features snx-edge-server/vendored-openssl
 
       - name: Rename binary
         run: |
