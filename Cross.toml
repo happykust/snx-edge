@@ -1,5 +1,5 @@
 [target.x86_64-unknown-linux-musl]
-pre-build = ["apt-get update && apt-get install -y pkg-config libssl-dev musl-tools"]
+pre-build = ["DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends pkg-config libssl-dev"]
 
 [target.aarch64-unknown-linux-musl]
-pre-build = ["apt-get update && apt-get install -y pkg-config libssl-dev musl-tools"]
+pre-build = ["DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends pkg-config libssl-dev"]
