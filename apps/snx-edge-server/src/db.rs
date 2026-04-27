@@ -15,6 +15,9 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+#[allow(unused_imports)]
+pub use snx_edge_types::users::{Session, UserResponse};
+
 use crate::error::AppError;
 
 /// bcrypt cost used for new password hashes. Bumped from the historical
@@ -147,31 +150,6 @@ pub struct User {
     /// `require_auth` middleware can reject stale tokens.
     #[serde(default)]
     pub token_generation: i64,
-}
-
-/// Session record from the database.
-#[derive(Debug, Clone, Serialize)]
-pub struct Session {
-    pub id: String,
-    pub user_id: String,
-    pub ip_address: Option<String>,
-    pub user_agent: Option<String>,
-    pub created_at: DateTime<Utc>,
-    pub expires_at: DateTime<Utc>,
-}
-
-/// User data for API responses (without internal fields).
-#[derive(Debug, Clone, Serialize)]
-pub struct UserResponse {
-    pub id: String,
-    pub username: String,
-    pub role: String,
-    pub comment: String,
-    pub enabled: bool,
-    pub permissions: Vec<String>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-    pub active_sessions: usize,
 }
 
 /// Thread-safe database handle wrapping SQLite.
@@ -718,17 +696,7 @@ impl UserDb {
 
 // === VPN Profiles ===
 
-/// VPN connection profile stored in the database.
-#[derive(Debug, Clone, Serialize)]
-pub struct Profile {
-    pub id: String,
-    pub name: String,
-    /// Full VPN config as JSON (deserialized by caller into VpnConfig).
-    pub config: serde_json::Value,
-    pub enabled: bool,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-}
+pub use snx_edge_types::profiles::Profile;
 
 impl UserDb {
     /// Decrypt a config blob in-place using the configured key, if any. When

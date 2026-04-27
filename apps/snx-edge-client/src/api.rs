@@ -13,9 +13,16 @@ pub struct ApiClient {
     token: Arc<RwLock<Option<String>>>,
 }
 
+/// Local view of the auth response. The wire type
+/// (`snx_edge_types::auth::TokenResponse`) has additional fields
+/// (`token_type`, `expires_in`) that the client currently ignores; we keep
+/// this thinner shape with `serde(default)` on the surplus fields so we
+/// stay byte-compatible without forcing the rest of the client to thread
+/// fields it does not use.
 #[derive(Debug, serde::Deserialize)]
 pub struct TokenResponse {
     pub access_token: String,
+    #[serde(default)]
     pub refresh_token: Option<String>,
 }
 

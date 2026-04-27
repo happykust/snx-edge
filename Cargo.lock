@@ -4056,6 +4056,7 @@ dependencies = [
  "reqwest-eventsource",
  "serde",
  "serde_json",
+ "snx-edge-types",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
@@ -4081,6 +4082,7 @@ dependencies = [
  "rpassword",
  "serde",
  "serde_json",
+ "snx-edge-types",
  "tabled",
  "tokio",
  "toml",
@@ -4111,6 +4113,7 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
+ "snx-edge-types",
  "snxcore",
  "tempfile",
  "thiserror 2.0.18",
@@ -4125,6 +4128,16 @@ dependencies = [
  "tower_governor",
  "tracing",
  "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "snx-edge-types"
+version = "1.0.0-rc1"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
  "uuid",
 ]
 

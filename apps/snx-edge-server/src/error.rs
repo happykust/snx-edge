@@ -1,16 +1,7 @@
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use serde::Serialize;
 
-/// RFC 7807 Problem Details error response.
-#[derive(Debug, Serialize)]
-pub struct ProblemDetails {
-    pub r#type: String,
-    pub title: String,
-    pub status: u16,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub detail: Option<String>,
-}
+pub use snx_edge_types::error::ProblemDetails;
 
 /// Application error type used across all API handlers.
 #[derive(Debug, thiserror::Error)]

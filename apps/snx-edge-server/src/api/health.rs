@@ -9,6 +9,10 @@ use serde::Serialize;
 use crate::error::AppError;
 use crate::state::AppState;
 
+/// Local serialise-only view used by `/health`. The wire form matches
+/// `snx_edge_types::health::HealthResponse` (which uses owned `String`s);
+/// the server keeps `&'static str` here so it doesn't have to allocate
+/// on every healthcheck.
 #[derive(Serialize)]
 struct HealthResponse {
     status: &'static str,

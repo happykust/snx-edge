@@ -7,6 +7,7 @@ repository.workspace = true
 description = "Headless Check Point VPN client with Management API for MikroTik containers"
 
 [dependencies]
+snx-edge-types = { path = "../snx-edge-types" }
 tokio.workspace = true
 tokio-util.workspace = true
 axum.workspace = true

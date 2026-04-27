@@ -5,7 +5,8 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Extension, Json, Router};
-use serde::Deserialize;
+
+use snx_edge_types::routing::AddressListEntryCreate as AddClientRequest;
 
 use crate::api::auth::{Claims, has_permission};
 use crate::error::AppError;
@@ -57,15 +58,6 @@ fn validate_address(address: &str) -> Result<(), AppError> {
     Err(AppError::BadRequest(format!(
         "invalid address format: expected IPv4/IPv6 address, CIDR (x.x.x.x/N), or range (x.x.x.x-y.y.y.y), got: {address}"
     )))
-}
-
-#[derive(Deserialize)]
-pub struct AddClientRequest {
-    pub address: String,
-    #[serde(default)]
-    pub comment: Option<String>,
-    #[serde(default)]
-    pub disabled: Option<bool>,
 }
 
 // === VPN Clients (address-list) ===

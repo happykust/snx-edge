@@ -26,15 +26,7 @@ pub struct TokenGenEntry {
     pub fetched_at: Instant,
 }
 
-/// SSE event broadcast to all connected clients.
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(tag = "type", content = "data")]
-pub enum ServerEvent {
-    ConnectionStatus { status: String },
-    RoutingChanged,
-    ConfigChanged,
-    LogEntry { level: String, message: String },
-}
+pub use snx_edge_types::events::ServerEvent;
 
 /// Shared application state available to all handlers.
 #[derive(Clone)]

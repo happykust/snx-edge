@@ -1,28 +1,13 @@
 use axum::extract::State;
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
-use serde::Deserialize;
+
+use snx_edge_types::tunnel::{ChallengeRequest, ConnectRequest, ServerInfoRequest};
 
 use crate::api::auth::{Claims, has_permission};
 use crate::error::AppError;
 use crate::state::AppState;
 use crate::tunnel::{TunnelStatus, VpnConfig, VpnRoute};
-
-#[derive(Deserialize)]
-pub struct ConnectRequest {
-    /// ID of the VPN profile stored on the server.
-    pub profile_id: String,
-}
-
-#[derive(Deserialize)]
-pub struct ChallengeRequest {
-    pub code: String,
-}
-
-#[derive(Deserialize)]
-pub struct ServerInfoRequest {
-    pub server: String,
-}
 
 /// POST /api/v1/tunnel/connect
 async fn connect(

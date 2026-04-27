@@ -11,65 +11,19 @@ use axum::routing::post;
 use axum::{Json, Router};
 use chrono::{Duration, Utc};
 use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation};
-use serde::{Deserialize, Serialize};
 use tower_governor::GovernorLayer;
 use tower_governor::errors::GovernorError;
 use tower_governor::governor::GovernorConfigBuilder;
 use tower_governor::key_extractor::{KeyExtractor, PeerIpKeyExtractor};
 use uuid::Uuid;
 
+pub use snx_edge_types::auth::{Claims, LoginRequest, RefreshRequest, TokenResponse};
+
 use crate::config::AppConfig;
 use crate::db::UserDb;
 use crate::error::AppError;
 use crate::error::ProblemDetails;
 use crate::state::AppState;
-
-// === JWT Claims ===
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct Claims {
-    pub sub: String, // user_id
-    pub role: String,
-    pub permissions: Vec<String>,
-    pub exp: i64,
-    pub iat: i64,
-    pub jti: String,
-    /// "access" or "refresh"
-    pub token_type: String,
-    /// Snapshot of `users.token_generation` at the moment this token was
-    /// issued. The `require_auth` middleware compares the JWT's `gen` against
-    /// the user's current value and returns 401 when they differ — that's
-    /// how `delete_user`, `change_password`, etc., revoke outstanding access
-    /// tokens before their natural TTL.
-    ///
-    /// `default` so legacy tokens issued before the field was added (no `gen`
-    /// claim in the JWT body) decode as `gen = 0`. They will still be rejected
-    /// once the user's counter is bumped above 0, which is the desired
-    /// behaviour: a server upgrade fast-tracks tokens to the revocable scheme.
-    #[serde(default, rename = "gen")]
-    pub token_generation: i64,
-}
-
-// === Request/Response types ===
-
-#[derive(Deserialize)]
-pub struct LoginRequest {
-    pub username: String,
-    pub password: String,
-}
-
-#[derive(Serialize)]
-pub struct TokenResponse {
-    pub access_token: String,
-    pub refresh_token: String,
-    pub token_type: &'static str,
-    pub expires_in: i64,
-}
-
-#[derive(Deserialize)]
-pub struct RefreshRequest {
-    pub refresh_token: String,
-}
 
 // === Handlers ===
 
@@ -333,7 +287,7 @@ async fn issue_tokens(
     Ok(TokenResponse {
         access_token,
         refresh_token,
-        token_type: "Bearer",
+        token_type: "Bearer".to_string(),
         expires_in: access_ttl_min as i64 * 60,
     })
 }

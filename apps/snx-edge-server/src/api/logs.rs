@@ -5,27 +5,20 @@ use axum::extract::{Query, State};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::get;
 use axum::{Extension, Json, Router};
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use futures_util::stream::{self, Stream};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use tokio::sync::RwLock;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 
+pub use snx_edge_types::events::LogEntry;
+
 use crate::api::auth::{Claims, has_permission};
 use crate::api::events::{lag_event, schema_event};
 use crate::error::AppError;
 use crate::state::{AppState, ServerEvent};
-
-/// A single log entry.
-#[derive(Debug, Clone, Serialize)]
-pub struct LogEntry {
-    pub timestamp: DateTime<Utc>,
-    pub level: String,
-    pub target: String,
-    pub message: String,
-}
 
 /// Ring buffer for log history.
 pub struct LogBuffer {

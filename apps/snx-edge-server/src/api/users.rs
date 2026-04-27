@@ -1,37 +1,15 @@
 use axum::extract::{Path, State};
 use axum::routing::{delete, get, post};
 use axum::{Extension, Json, Router};
-use serde::Deserialize;
+
+use snx_edge_types::users::{
+    ChangePasswordRequest, CreateUserRequest, UpdateUserRequest, UserResponse,
+};
 
 use crate::api::auth::{Claims, has_permission};
-use crate::db::{UserDb, UserResponse};
+use crate::db::UserDb;
 use crate::error::AppError;
 use crate::state::AppState;
-
-// === Request types ===
-
-#[derive(Deserialize)]
-pub struct CreateUserRequest {
-    pub username: String,
-    pub password: String,
-    pub role: String,
-    #[serde(default)]
-    pub comment: String,
-}
-
-#[derive(Deserialize)]
-pub struct UpdateUserRequest {
-    pub role: Option<String>,
-    pub comment: Option<String>,
-    pub enabled: Option<bool>,
-}
-
-#[derive(Deserialize)]
-pub struct ChangePasswordRequest {
-    #[serde(default)]
-    pub current_password: Option<String>,
-    pub new_password: String,
-}
 
 // === Helpers ===
 

@@ -523,7 +523,7 @@ async fn cmd_connect(cli: &Cli, mode: OutputMode, profile: Option<&str>) -> anyh
                     // Fallback: use the first available profile
                     let profiles = client.list_profiles().await?;
                     match profiles.into_iter().next() {
-                        Some(p) => p.id,
+                        Some(p) => p.0.id,
                         None => bail!(
                             "No profile specified and no profiles found on server. \
                              Use --profile <id|name> or create a profile first."

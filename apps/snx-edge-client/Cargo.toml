@@ -7,6 +7,8 @@ repository.workspace = true
 description = "Tray application for remote management of snx-edge-server"
 
 [dependencies]
+snx-edge-types = { path = "../snx-edge-types" }
+
 # Async runtime
 tokio.workspace = true
 tokio-util.workspace = true

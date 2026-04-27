@@ -3,9 +3,8 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use secrecy::SecretString;
-use serde::{Deserialize, Serialize};
 use snxcore::model::SessionState;
 use snxcore::model::params::{CertType, TransportType, TunnelType};
 use snxcore::tunnel::{
@@ -14,148 +13,12 @@ use snxcore::tunnel::{
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
 use tokio::task::JoinHandle;
 
+pub use snx_edge_types::profiles::{VpnConfig, default_mtu};
+pub use snx_edge_types::tunnel::{
+    ConnectionInfo, ConnectionStatus, MfaChallenge, TunnelStatus, VpnRoute,
+};
+
 use crate::state::ServerEvent;
-
-/// VPN connection parameters — sent by the client with each connect request.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct VpnConfig {
-    #[serde(default)]
-    pub server: String,
-    #[serde(default = "default_login_type")]
-    pub login_type: String,
-    #[serde(default)]
-    pub username: String,
-    #[serde(default)]
-    pub password: Option<String>,
-    #[serde(default = "default_cert_type")]
-    pub cert_type: String,
-    #[serde(default)]
-    pub cert_path: Option<String>,
-    #[serde(default)]
-    pub cert_password: Option<String>,
-    #[serde(default)]
-    pub no_dns: bool,
-    #[serde(default)]
-    pub dns_servers: Vec<String>,
-    #[serde(default)]
-    pub ignored_dns_servers: Vec<String>,
-    #[serde(default)]
-    pub search_domains: Vec<String>,
-    #[serde(default)]
-    pub ignored_search_domains: Vec<String>,
-    #[serde(default)]
-    pub search_domains_as_routes: bool,
-    #[serde(default)]
-    pub no_routing: bool,
-    #[serde(default)]
-    pub default_route: bool,
-    #[serde(default)]
-    pub add_routes: Vec<String>,
-    #[serde(default)]
-    pub ignored_routes: Vec<String>,
-    #[serde(default)]
-    pub no_ipv6: bool,
-    #[serde(default)]
-    pub ca_cert: Vec<String>,
-    #[serde(default)]
-    pub no_cert_check: bool,
-    #[serde(default = "default_password_factor")]
-    pub password_factor: u32,
-    #[serde(default = "default_ike_lifetime")]
-    pub ike_lifetime: u32,
-    #[serde(default)]
-    pub ike_persist: bool,
-    #[serde(default)]
-    pub no_keepalive: bool,
-    #[serde(default)]
-    pub port_knock: bool,
-    #[serde(default)]
-    pub ip_lease_duration: Option<u32>,
-    #[serde(default = "default_mtu")]
-    pub mtu: u16,
-    #[serde(default = "default_transport_type")]
-    pub transport_type: String,
-    #[serde(default = "default_no_keychain")]
-    pub no_keychain: bool,
-}
-
-fn default_login_type() -> String {
-    "password".to_string()
-}
-fn default_cert_type() -> String {
-    "pkcs12".to_string()
-}
-fn default_password_factor() -> u32 {
-    1
-}
-fn default_ike_lifetime() -> u32 {
-    28800
-}
-fn default_mtu() -> u16 {
-    1350
-}
-fn default_transport_type() -> String {
-    "auto".to_string()
-}
-fn default_no_keychain() -> bool {
-    true
-}
-
-// === API response types (our own, serializable) ===
-
-/// VPN connection status returned by the API.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
-#[serde(tag = "state")]
-pub enum ConnectionStatus {
-    #[default]
-    Disconnected,
-    Connecting,
-    Connected(ConnectionInfo),
-    Mfa(MfaChallenge),
-    Error {
-        message: String,
-    },
-}
-
-/// Information about an active VPN connection.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
-pub struct ConnectionInfo {
-    pub since: Option<DateTime<Utc>>,
-    pub server_name: String,
-    pub username: String,
-    pub login_type: String,
-    pub tunnel_type: String,
-    pub transport_type: String,
-    pub ip_address: String,
-    pub dns_servers: Vec<String>,
-    pub search_domains: Vec<String>,
-    pub interface_name: String,
-    pub mtu: u16,
-}
-
-/// MFA challenge requiring user input.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct MfaChallenge {
-    pub mfa_type: String,
-    pub prompt: String,
-}
-
-/// Route received from the VPN server.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VpnRoute {
-    pub destination: String,
-    pub gateway: Option<String>,
-    pub interface: String,
-}
-
-/// Tunnel status with traffic statistics.
-#[derive(Debug, Clone, Serialize)]
-pub struct TunnelStatus {
-    pub connection: ConnectionStatus,
-    pub uptime_seconds: Option<u64>,
-    pub tx_bytes: u64,
-    pub rx_bytes: u64,
-}
 
 // === Conversion from snxcore types ===
 

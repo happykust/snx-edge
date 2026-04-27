@@ -3,7 +3,9 @@ use axum::http::{StatusCode, header};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
+
+use snx_edge_types::profiles::{CreateProfileRequest, UpdateProfileRequest};
 
 use crate::api::auth::{Claims, has_permission};
 use crate::db::Profile;
@@ -74,19 +76,6 @@ fn profile_to_response(p: Profile) -> ProfileResponse {
         created_at: p.created_at.to_rfc3339(),
         updated_at: p.updated_at.to_rfc3339(),
     }
-}
-
-#[derive(Deserialize)]
-pub struct CreateProfileRequest {
-    pub name: String,
-    pub config: serde_json::Value,
-}
-
-#[derive(Deserialize)]
-pub struct UpdateProfileRequest {
-    pub name: Option<String>,
-    pub config: Option<serde_json::Value>,
-    pub enabled: Option<bool>,
 }
 
 /// GET /api/v1/profiles
