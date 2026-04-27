@@ -1,12 +1,15 @@
 use std::{cell::RefCell, collections::HashMap, sync::Arc, time::Duration};
 
 use gtk4::{
-    Application, ApplicationWindow, License, Window,
+    ApplicationWindow, License, Window,
+    gio::ApplicationFlags,
     glib::{self, clone},
     prelude::*,
 };
-use tokio::sync::mpsc;
-use tracing::{info, level_filters::LevelFilter, warn};
+use libadwaita::{Application, prelude::AdwDialogExt};
+use tokio::sync::{mpsc, watch};
+use tracing::{info, warn};
+use tracing_subscriber::EnvFilter;
 
 use crate::{
     api::ApiClient,
@@ -16,7 +19,8 @@ use crate::{
     prompt::show_notification,
     status::show_status_dialog,
     theme::init_theme_monitoring,
-    tray::{ConnectionState, TrayCommand, TrayEvent},
+    toast::show_feedback,
+    tray::{ConnectionState, ProfileEntry, TrayCommand, TrayEvent},
 };
 
 mod api;
@@ -29,16 +33,35 @@ mod prompt;
 mod settings;
 mod status;
 mod theme;
+mod toast;
 mod tray;
 mod windows;
 
 pub const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
+// === WINDOWS singleton map ===
+//
+// `WINDOWS` is a per-thread map of named singleton windows. GTK4 widget types
+// are `!Send` / `!Sync`, so the map itself is `thread_local!`. All accessors
+// below MUST be called from the GTK main thread (the thread that owns the
+// default `glib::MainContext`). The `debug_assert!` calls catch accidental
+// calls from `tokio::spawn`'d tasks in debug builds — release builds will
+// still violate `!Send` invariants if you misuse them, but at least the
+// thread_local will return a fresh empty map and the bug becomes obvious.
 thread_local! {
     static WINDOWS: RefCell<HashMap<String, Window>> = RefCell::new(HashMap::new());
 }
 
+#[inline]
+fn assert_main_thread() {
+    debug_assert!(
+        glib::MainContext::default().is_owner(),
+        "WINDOWS must only be accessed from the GTK main thread"
+    );
+}
+
 pub fn main_window() -> ApplicationWindow {
+    assert_main_thread();
     get_window("main")
         .unwrap()
         .downcast::<ApplicationWindow>()
@@ -46,10 +69,12 @@ pub fn main_window() -> ApplicationWindow {
 }
 
 pub fn get_window(name: &str) -> Option<Window> {
+    assert_main_thread();
     WINDOWS.with(|cell| cell.borrow().get(name).cloned())
 }
 
 pub fn set_window<W: Cast + IsA<Window>>(name: &str, window: Option<W>) {
+    assert_main_thread();
     WINDOWS.with(|cell| {
         if let Some(window) = window {
             cell.borrow_mut()
@@ -70,6 +95,11 @@ pub struct AppContext {
     pub settings: Arc<tokio::sync::RwLock<ClientSettings>>,
     pub tray_cmd: mpsc::Sender<TrayCommand>,
     pub tray_evt: mpsc::Sender<TrayEvent>,
+    /// Latest tunnel status, updated by a single background poller. UI
+    /// surfaces (tray, status dialog) subscribe via `Receiver::changed`
+    /// instead of running independent timers.
+    pub status_tx: watch::Sender<Arc<ConnectionState>>,
+    pub status_rx: watch::Receiver<Arc<ConnectionState>>,
 }
 
 #[tokio::main]
@@ -85,7 +115,7 @@ async fn main() -> anyhow::Result<()> {
     // Create tray (retries)
     let mut retry_count = 5;
     let mut my_tray = loop {
-        match tray::AppTray::new(tray_event_sender.clone(), false).await {
+        match tray::AppTray::new(tray_event_sender.clone(), false, settings.clone()).await {
             Ok(tray) => break tray,
             Err(e) => {
                 if retry_count == 0 {
@@ -106,6 +136,8 @@ async fn main() -> anyhow::Result<()> {
     let auth = AuthManager::new(api.clone(), "http://localhost");
     let profile_store = Arc::new(ProfileStore::new());
 
+    let (status_tx, status_rx) = watch::channel(Arc::new(ConnectionState::Disconnected));
+
     let ctx = AppContext {
         api,
         auth,
@@ -113,19 +145,49 @@ async fn main() -> anyhow::Result<()> {
         settings: settings.clone(),
         tray_cmd: tray_command_sender.clone(),
         tray_evt: tray_event_sender.clone(),
+        status_tx,
+        status_rx,
     };
 
     // Wrap ctx in Arc<RwLock> so we can update it after login
     let ctx = Arc::new(tokio::sync::RwLock::new(ctx));
 
+    // libadwaita::Application initialises libadwaita (calls `adw_init()`,
+    // installs the StyleManager) so we don't have to do it manually.
+    //
+    // ApplicationFlags::default() makes the GApplication framework enforce
+    // single-instance: if another process with the same application_id is
+    // running, our `g_application_register` call will route the activation
+    // to that primary instance and `is_remote()` returns true here, after
+    // which we can simply exit. The user-visible behaviour is that
+    // double-clicking the desktop launcher just brings the running tray to
+    // focus instead of starting a duplicate process.
     let app = Application::builder()
         .application_id("com.github.snx-edge-client")
+        .flags(ApplicationFlags::default())
         .build();
+
+    // Style manager is now driven by libadwaita; this is a no-op in the
+    // common case but ensures the singleton exists and follows the system
+    // color scheme. The fallback theme detection in `theme.rs` is still
+    // used by `tray.rs` for the icon theme choice (libadwaita StyleManager
+    // doesn't influence the tray icon set we ship as PNG).
+    let _style_manager = libadwaita::StyleManager::default();
 
     let ctx_activate = ctx.clone();
     let settings_activate = settings.clone();
 
     app.connect_activate(move |app| {
+        // If a main window is already mapped, this is a re-activation
+        // (e.g. user double-clicked the launcher and GApplication routed
+        // the second activation to us). Just present the existing window
+        // and skip the startup flow so we don't open the add-server
+        // dialog a second time.
+        if let Some(existing) = get_window("main") {
+            existing.present();
+            return;
+        }
+
         let app_window = ApplicationWindow::builder()
             .application(app)
             .visible(false)
@@ -186,6 +248,7 @@ async fn main() -> anyhow::Result<()> {
                             ctx.api.clone(),
                             ctx.auth.clone(),
                             ctx.profile_store.clone(),
+                            ctx.settings.clone(),
                         );
                     }
                     TrayEvent::AddServer => {
@@ -198,7 +261,12 @@ async fn main() -> anyhow::Result<()> {
                     }
                     TrayEvent::About => do_about(),
                     TrayEvent::Status => {
-                        do_status(ctx.tray_evt.clone(), false, ctx.api.clone());
+                        do_status(
+                            ctx.tray_evt.clone(),
+                            false,
+                            ctx.api.clone(),
+                            ctx.status_rx.clone(),
+                        );
                     }
                     TrayEvent::Routing => {
                         let api = ctx.api.clone();
@@ -222,8 +290,9 @@ async fn main() -> anyhow::Result<()> {
                         });
                     }
                     TrayEvent::Servers => {
-                        glib::idle_add_once(|| {
-                            windows::servers::show_servers_window();
+                        let settings = ctx.settings.clone();
+                        glib::idle_add_once(move || {
+                            windows::servers::show_servers_window(settings);
                         });
                     }
                     TrayEvent::Logs => {
@@ -258,7 +327,8 @@ async fn try_restore_or_login(ctx: Arc<tokio::sync::RwLock<AppContext>>, server:
         Ok(()) => {
             info!("session restored for {}", server.url);
             let _ = profiles::load_profiles(&c.api, &c.profile_store).await;
-            start_status_polling(c.api.clone(), c.tray_cmd.clone());
+            push_profiles_to_tray(&c).await;
+            start_status_polling(c.api.clone(), c.tray_cmd.clone(), c.status_tx.clone());
         }
         Err(_) => {
             drop(c);
@@ -309,7 +379,8 @@ async fn show_add_server_dialog_inner(ctx: Arc<tokio::sync::RwLock<AppContext>>)
             Ok(()) => {
                 info!("logged in to {}", url);
                 let _ = profiles::load_profiles(&c.api, &c.profile_store).await;
-                start_status_polling(c.api.clone(), c.tray_cmd.clone());
+                push_profiles_to_tray(&c).await;
+                start_status_polling(c.api.clone(), c.tray_cmd.clone(), c.status_tx.clone());
             }
             Err(e) => {
                 let _ = show_notification("Login Failed", &e.to_string()).await;
@@ -348,7 +419,8 @@ async fn show_login_for_server_inner(
             Ok(()) => {
                 info!("logged in to {}", url);
                 let _ = profiles::load_profiles(&c.api, &c.profile_store).await;
-                start_status_polling(c.api.clone(), c.tray_cmd.clone());
+                push_profiles_to_tray(&c).await;
+                start_status_polling(c.api.clone(), c.tray_cmd.clone(), c.status_tx.clone());
             }
             Err(e) => {
                 let _ = show_notification("Login Failed", &e.to_string()).await;
@@ -359,7 +431,40 @@ async fn show_login_for_server_inner(
     }
 }
 
-fn start_status_polling(api: ApiClient, cmd_sender: mpsc::Sender<TrayCommand>) {
+/// Push the current profile list (and active profile id) into the tray so
+/// the "Profiles" submenu reflects the server. Safe to call repeatedly.
+async fn push_profiles_to_tray(ctx: &AppContext) {
+    let profiles: Vec<ProfileEntry> = ctx
+        .profile_store
+        .all()
+        .into_iter()
+        .map(|p| ProfileEntry {
+            id: p.id,
+            name: p.name,
+        })
+        .collect();
+    let active = ctx.profile_store.connected_profile_id().or_else(|| {
+        // Fall back to ClientSettings.last_profile_id of the active server
+        // when the store has no in-memory active id (i.e. fresh start).
+        let settings = ctx.settings.try_read().ok()?;
+        settings.active_server()?.last_profile_id.clone()
+    });
+    let _ = ctx
+        .tray_cmd
+        .send(TrayCommand::SetProfiles { profiles, active })
+        .await;
+}
+
+/// Single source of truth for tunnel status. Polls the server, then fans
+/// out to:
+///   * the tray (via `cmd_sender` so the icon/label updates),
+///   * `status_tx` so any UI subscriber (status dialog, future widgets)
+///     can `changed().await` instead of running its own poll timer.
+fn start_status_polling(
+    api: ApiClient,
+    cmd_sender: mpsc::Sender<TrayCommand>,
+    status_tx: watch::Sender<Arc<ConnectionState>>,
+) {
     tokio::spawn(async move {
         let mut old_state = ConnectionState::Disconnected;
         loop {
@@ -370,9 +475,13 @@ fn start_status_polling(api: ApiClient, cmd_sender: mpsc::Sender<TrayCommand>) {
 
             if !status::same_status(&new_state, &old_state) {
                 old_state = new_state.clone();
+                let arc = Arc::new(old_state.clone());
                 let _ = cmd_sender
-                    .send(TrayCommand::Update(Some(Arc::new(old_state.clone()))))
+                    .send(TrayCommand::Update(Some(arc.clone())))
                     .await;
+                // send_replace overrides regardless of receiver count, which
+                // matches our "always reflect latest" semantic.
+                status_tx.send_replace(arc);
             }
 
             tokio::time::sleep(POLL_INTERVAL).await;
@@ -636,7 +745,7 @@ async fn do_connect(ctx: &AppContext, profile_id: &str) {
             if let Some(first) = profiles.first() {
                 first.id.clone()
             } else {
-                let _ = show_notification("Error", "No VPN profiles configured").await;
+                show_feedback("Error", "No VPN profiles configured").await;
                 return;
             }
         }
@@ -654,14 +763,18 @@ async fn do_connect(ctx: &AppContext, profile_id: &str) {
     match ctx.api.tunnel_connect(&resolved_id).await {
         Ok(json) => {
             let state = ConnectionState::from_json(&json);
-            let _ = show_notification("VPN", &format!("{state}")).await;
+            show_feedback("VPN", &format!("{state}")).await;
+            // Track the active profile so the tray submenu shows the
+            // correct checkmark next time it opens.
+            ctx.profile_store.set_connected(Some(resolved_id.clone()));
+            push_profiles_to_tray(ctx).await;
             let _ = ctx
                 .tray_cmd
                 .send(TrayCommand::Update(Some(Arc::new(state))))
                 .await;
         }
         Err(e) => {
-            let _ = show_notification("Connection Error", &e.to_string()).await;
+            show_feedback("Connection Error", &e.to_string()).await;
             let _ = ctx
                 .tray_cmd
                 .send(TrayCommand::Update(Some(Arc::new(ConnectionState::Error(
@@ -682,21 +795,18 @@ async fn do_disconnect(ctx: &AppContext) {
                 .await;
         }
         Err(e) => {
-            let _ = show_notification("Disconnect Error", &e.to_string()).await;
+            show_feedback("Disconnect Error", &e.to_string()).await;
         }
     }
 }
 
 fn do_about() {
     glib::idle_add_once(|| {
-        // NOTE: AboutWindow is deprecated since libadwaita 1.5 in favor of AboutDialog,
-        // but AboutDialog requires the v1_5 feature flag which is not enabled.
-        // When upgrading to v1_5+, replace with:
-        //   libadwaita::AboutDialog::builder()...build().present(Some(&main_window()));
+        // libadwaita >= 1.5 prefers `AboutDialog` over the deprecated
+        // `AboutWindow`. The dialog uses `present(parent)` instead of being
+        // built with `transient_for` + `modal`.
         let parent = main_window();
-        let about = libadwaita::AboutWindow::builder()
-            .transient_for(&parent)
-            .modal(true)
+        let about = libadwaita::AboutDialog::builder()
             .application_name("snx-edge")
             .application_icon("network-vpn")
             .version(env!("CARGO_PKG_VERSION"))
@@ -706,21 +816,29 @@ fn do_about() {
             .issue_url("https://github.com/happykust/snx-edge/issues")
             .build();
 
-        about.present();
+        about.present(Some(&parent));
     });
 }
 
-fn do_status(sender: mpsc::Sender<TrayEvent>, exit_on_close: bool, api: ApiClient) {
+fn do_status(
+    sender: mpsc::Sender<TrayEvent>,
+    exit_on_close: bool,
+    api: ApiClient,
+    status_rx: watch::Receiver<Arc<ConnectionState>>,
+) {
     glib::idle_add_once(move || {
-        glib::spawn_future_local(
-            async move { show_status_dialog(sender, exit_on_close, api).await },
-        );
+        glib::spawn_future_local(async move {
+            show_status_dialog(sender, exit_on_close, api, status_rx).await
+        });
     });
 }
 
 fn init_logging() {
-    let subscriber = tracing_subscriber::fmt()
-        .with_max_level(LevelFilter::INFO)
-        .finish();
-    tracing::subscriber::set_global_default(subscriber).unwrap();
+    // Use try_init so we never panic if another library has already installed
+    // a global subscriber. EnvFilter honors RUST_LOG (default: info).
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .try_init();
 }

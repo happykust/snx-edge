@@ -1,8 +1,14 @@
 use std::{str::FromStr, sync::Arc};
 
 use anyhow::anyhow;
-use ksni::{Handle, Icon, MenuItem, TrayMethods, menu::StandardItem};
-use tokio::sync::mpsc::{Receiver, Sender};
+use ksni::{
+    Handle, Icon, MenuItem, TrayMethods,
+    menu::{CheckmarkItem, StandardItem, SubMenu},
+};
+use tokio::sync::{
+    RwLock,
+    mpsc::{Receiver, Sender},
+};
 
 use crate::{
     assets,
@@ -117,9 +123,22 @@ impl ConnectionState {
     }
 }
 
+/// `(id, name)` of a VPN profile shown in the tray submenu.
+#[derive(Debug, Clone)]
+pub struct ProfileEntry {
+    pub id: String,
+    pub name: String,
+}
+
 #[derive(Debug, Clone)]
 pub enum TrayCommand {
     Update(Option<Arc<ConnectionState>>),
+    /// Replace the profile submenu contents. `active` is the id of the
+    /// currently-connected (or last-used) profile so the menu can mark it.
+    SetProfiles {
+        profiles: Vec<ProfileEntry>,
+        active: Option<String>,
+    },
     Exit,
 }
 
@@ -133,10 +152,15 @@ pub struct AppTray {
     command_receiver: Option<Receiver<TrayCommand>>,
     status: Arc<ConnectionState>,
     tray_icon: Option<Handle<KsniTray>>,
+    settings: Arc<RwLock<ClientSettings>>,
 }
 
 impl AppTray {
-    pub async fn new(event_sender: Sender<TrayEvent>, no_tray: bool) -> anyhow::Result<Self> {
+    pub async fn new(
+        event_sender: Sender<TrayEvent>,
+        no_tray: bool,
+        settings: Arc<RwLock<ClientSettings>>,
+    ) -> anyhow::Result<Self> {
         let (tx, rx) = tokio::sync::mpsc::channel(16);
 
         let handle = if !no_tray {
@@ -151,6 +175,7 @@ impl AppTray {
             command_receiver: Some(rx),
             status: Arc::new(ConnectionState::Disconnected),
             tray_icon: handle,
+            settings,
         };
 
         app_tray.update().await;
@@ -166,9 +191,15 @@ impl AppTray {
         self.status.to_string()
     }
 
-    fn icon_theme(&self) -> &'static assets::IconTheme {
-        let settings = ClientSettings::load();
-        let system_theme = match settings.icon_theme.as_str() {
+    /// Resolve the active icon theme using the shared, in-memory
+    /// `ClientSettings`. Don't hold the read guard across awaits — copy the
+    /// theme name out and drop the guard before doing any I/O.
+    async fn icon_theme(&self) -> &'static assets::IconTheme {
+        let theme_name = {
+            let s = self.settings.read().await;
+            s.icon_theme.clone()
+        };
+        let system_theme = match theme_name.as_str() {
             "dark" => SystemColorTheme::Dark,
             "light" => SystemColorTheme::Light,
             _ => system_color_theme().ok().unwrap_or_default(),
@@ -181,8 +212,8 @@ impl AppTray {
         }
     }
 
-    fn icon(&self) -> Icon {
-        let theme = self.icon_theme();
+    async fn icon(&self) -> Icon {
+        let theme = self.icon_theme().await;
 
         let data = match &*self.status {
             ConnectionState::Connected { .. } => theme.connected.clone(),
@@ -211,7 +242,7 @@ impl AppTray {
         let status_label = self.status_label();
 
         let icon = if self.pixmap_icons_supported() {
-            PixmapOrName::Pixmap(self.icon())
+            PixmapOrName::Pixmap(self.icon().await)
         } else {
             PixmapOrName::Name(self.icon_name())
         };
@@ -242,6 +273,16 @@ impl AppTray {
                     }
                     self.update().await;
                 }
+                TrayCommand::SetProfiles { profiles, active } => {
+                    if let Some(ref tray_icon) = self.tray_icon {
+                        tray_icon
+                            .update(|tray| {
+                                tray.profiles = profiles;
+                                tray.active_profile = active;
+                            })
+                            .await;
+                    }
+                }
                 TrayCommand::Exit => {
                     break;
                 }
@@ -264,6 +305,8 @@ struct KsniTray {
     disconnect_enabled: bool,
     icon: PixmapOrName,
     event_sender: Sender<TrayEvent>,
+    profiles: Vec<ProfileEntry>,
+    active_profile: Option<String>,
 }
 
 impl KsniTray {
@@ -274,12 +317,22 @@ impl KsniTray {
             disconnect_enabled: false,
             icon: PixmapOrName::Name(""),
             event_sender,
+            profiles: Vec::new(),
+            active_profile: None,
         }
     }
 
     fn send_tray_event(&self, event: TrayEvent) {
         let sender = self.event_sender.clone();
-        tokio::spawn(async move { sender.send(event).await });
+        // Log send failures: the channel has a small bounded capacity, so
+        // under rapid menu activity events could otherwise be silently
+        // dropped (channel-full) or lost across receiver shutdown
+        // (channel-closed).
+        tokio::spawn(async move {
+            if let Err(e) = sender.send(event).await {
+                tracing::warn!(error = %e, "tray event drop: channel full or closed");
+            }
+        });
     }
 }
 
@@ -307,8 +360,8 @@ impl ksni::Tray for KsniTray {
     }
 
     fn menu(&self) -> Vec<MenuItem<Self>> {
-        // TODO: When profiles are loaded from the server, populate Connect submenu.
-        // For now, simple connect with empty profile ID (server picks default).
+        // Default Connect uses empty profile_id; `do_connect` will resolve
+        // the active or first available profile.
         let connect_item = MenuItem::Standard(StandardItem {
             label: "Connect".to_string(),
             enabled: self.connect_enabled,
@@ -318,7 +371,49 @@ impl ksni::Tray for KsniTray {
             ..Default::default()
         });
 
-        vec![
+        // Profiles submenu: only shown when at least one profile is known.
+        // Each entry uses a CheckmarkItem so the active profile is marked.
+        // Clicking sends a Connect event with the chosen profile id; the
+        // main event loop dispatches it through `do_connect` which both
+        // selects the profile and fires the connection.
+        let profiles_submenu = if self.profiles.is_empty() {
+            None
+        } else {
+            let active = self.active_profile.clone();
+            let active_label = active
+                .as_ref()
+                .and_then(|id| {
+                    self.profiles
+                        .iter()
+                        .find(|p| &p.id == id)
+                        .map(|p| p.name.clone())
+                })
+                .unwrap_or_else(|| "select…".to_string());
+            let items = self
+                .profiles
+                .iter()
+                .map(|p| {
+                    let id = p.id.clone();
+                    let checked = active.as_deref() == Some(&id);
+                    MenuItem::Checkmark(CheckmarkItem {
+                        label: p.name.clone(),
+                        checked,
+                        activate: Box::new(move |tray: &mut KsniTray| {
+                            tray.send_tray_event(TrayEvent::Connect(id.clone()))
+                        }),
+                        ..Default::default()
+                    })
+                })
+                .collect();
+            Some(MenuItem::SubMenu(SubMenu {
+                label: format!("Profiles ({active_label})"),
+                enabled: !self.profiles.is_empty(),
+                submenu: items,
+                ..Default::default()
+            }))
+        };
+
+        let mut items: Vec<MenuItem<Self>> = vec![
             MenuItem::Standard(StandardItem {
                 label: self.status_label.clone(),
                 enabled: false,
@@ -378,6 +473,14 @@ impl ksni::Tray for KsniTray {
                 activate: Box::new(|tray: &mut KsniTray| tray.send_tray_event(TrayEvent::Exit)),
                 ..Default::default()
             }),
-        ]
+        ];
+
+        // Insert profile picker right after the Connect item if we have any.
+        if let Some(submenu) = profiles_submenu {
+            // index of `connect_item` is 2 (status, separator, connect, …)
+            items.insert(3, submenu);
+        }
+
+        items
     }
 }

@@ -1,10 +1,12 @@
+use std::sync::Arc;
+
 use gtk4::{
     Align, Orientation,
     glib::{self, clone},
     prelude::{BoxExt, ButtonExt, Cast, DisplayExt, GtkWindowExt, WidgetExt},
 };
 use libadwaita::prelude::ActionRowExt;
-use tokio::sync::mpsc::Sender;
+use tokio::sync::{mpsc::Sender, watch};
 
 use crate::{
     POLL_INTERVAL,
@@ -146,7 +148,12 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-pub async fn show_status_dialog(sender: Sender<TrayEvent>, exit_on_close: bool, api: ApiClient) {
+pub async fn show_status_dialog(
+    sender: Sender<TrayEvent>,
+    exit_on_close: bool,
+    api: ApiClient,
+    status_rx: watch::Receiver<Arc<ConnectionState>>,
+) {
     if let Some(window) = get_window("status") {
         window.present();
         return;
@@ -236,7 +243,14 @@ pub async fn show_status_dialog(sender: Sender<TrayEvent>, exit_on_close: bool, 
         .orientation(Orientation::Vertical)
         .spacing(6)
         .build();
-    window.set_child(Some(&content));
+    // Wrap the content in a ToastOverlay so transient feedback (errors,
+    // confirmations) can be surfaced inline even on WMs without a
+    // notification daemon. The overlay is registered globally so other
+    // modules can target it via `toast::show_feedback`.
+    let toast_overlay = libadwaita::ToastOverlay::new();
+    toast_overlay.set_child(Some(&content));
+    window.set_child(Some(&toast_overlay));
+    crate::toast::register_overlay("status", toast_overlay);
 
     let inner = gtk4::Box::builder()
         .orientation(Orientation::Vertical)
@@ -315,13 +329,27 @@ pub async fn show_status_dialog(sender: Sender<TrayEvent>, exit_on_close: bool, 
 
     let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel();
 
+    // Subscribe to the central status watch (driven by `start_status_polling`
+    // in `main.rs`). The dialog used to run a parallel 2-second poll —
+    // doubling load and producing flicker between tray and dialog. Now it
+    // only fetches the full JSON when the upstream state actually changes,
+    // and runs a slower independent timer for the routing-diagnostics
+    // endpoint (which the central poller does not track).
+    let mut status_rx = status_rx;
     tokio::spawn(async move {
-        let mut old_state = ConnectionState::Error("Connecting to server...".to_string());
-        let mut poll_count: u32 = 0;
+        // Force a first refresh so the dialog is populated even if the
+        // central state has not changed since opening.
+        let mut force_refresh = true;
         let mut last_routing_health = RoutingHealth::Unknown;
+        let mut routing_tick =
+            tokio::time::interval(POLL_INTERVAL.saturating_mul(5).max(POLL_INTERVAL));
+        // Skip the immediate first tick; we already do an inline check below.
+        routing_tick.tick().await;
+        let mut do_routing = true;
+
         loop {
-            // Check routing diagnostics every 5th poll (~10 seconds) or on first load
-            let routing_health = if poll_count.is_multiple_of(5) {
+            let routing_health = if do_routing {
+                do_routing = false;
                 match api.routing_diagnostics().await {
                     Ok(json) => {
                         let health = RoutingHealth::from_diagnostics(&json);
@@ -345,35 +373,35 @@ pub async fn show_status_dialog(sender: Sender<TrayEvent>, exit_on_close: bool, 
                 None
             };
 
-            let _new_state = match api.tunnel_status().await {
-                Ok(json) => {
-                    let state = ConnectionState::from_json(&json);
-                    let entries = status_entries_from_json(&json);
-                    if !same_status(&state, &old_state) || routing_health.is_some() {
-                        old_state = state.clone();
+            if force_refresh || routing_health.is_some() {
+                // Pull full JSON once for the dialog's entries panel.
+                match api.tunnel_status().await {
+                    Ok(json) => {
+                        let state = ConnectionState::from_json(&json);
+                        let entries = status_entries_from_json(&json);
                         if tx.send((state, entries, routing_health)).await.is_err() {
                             break;
                         }
                     }
-                    old_state.clone()
-                }
-                Err(e) => {
-                    let state = ConnectionState::Error(e.to_string());
-                    let entries = vec![("State:".to_string(), format!("Error: {}", e))];
-                    if !same_status(&state, &old_state) || routing_health.is_some() {
-                        old_state = state.clone();
+                    Err(e) => {
+                        let state = ConnectionState::Error(e.to_string());
+                        let entries = vec![("State:".to_string(), format!("Error: {}", e))];
                         if tx.send((state, entries, routing_health)).await.is_err() {
                             break;
                         }
                     }
-                    old_state.clone()
                 }
-            };
-
-            poll_count = poll_count.wrapping_add(1);
+                force_refresh = false;
+            }
 
             tokio::select! {
-                _ = tokio::time::sleep(POLL_INTERVAL) => {}
+                _ = status_rx.changed() => {
+                    // Central poller saw a state change → refresh entries.
+                    force_refresh = true;
+                }
+                _ = routing_tick.tick() => {
+                    do_routing = true;
+                }
                 _ = &mut stop_rx => break,
             }
         }
@@ -415,6 +443,7 @@ pub async fn show_status_dialog(sender: Sender<TrayEvent>, exit_on_close: bool, 
     window.present();
     close_rx.recv().await.ok();
     set_window("status", None::<gtk4::Window>);
+    crate::toast::unregister_overlay("status");
     let _ = stop_tx.send(());
 
     if exit_on_close {

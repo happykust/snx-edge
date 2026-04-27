@@ -1,10 +1,27 @@
+use std::cell::Cell;
+use std::rc::Rc;
+
 use gtk4::{
     Align, Orientation,
     glib::{self, clone},
     prelude::*,
 };
+use tokio::task::JoinHandle;
 
 use crate::{api::ApiClient, get_window, main_window, set_window};
+
+/// Per-button JoinHandle slot — see `windows/users.rs` for rationale.
+type TaskSlot = Rc<Cell<Option<JoinHandle<()>>>>;
+
+fn new_task_slot() -> TaskSlot {
+    Rc::new(Cell::new(None))
+}
+
+fn abort_previous(slot: &TaskSlot) {
+    if let Some(h) = slot.take() {
+        h.abort();
+    }
+}
 
 /// Detect the local IP address by connecting a UDP socket to a public address.
 /// No data is actually sent.
@@ -91,21 +108,25 @@ pub fn show_routing_window(api: ApiClient, role: &str) {
 
     // --- Callbacks ---
     let api_setup = api.clone();
+    let setup_slot = new_task_slot();
     setup_btn.connect_clicked(clone!(
         #[weak]
         window,
         move |btn| {
             btn.set_sensitive(false);
+            abort_previous(&setup_slot);
             let api = api_setup.clone();
             let btn2 = btn.clone();
+            let slot = setup_slot.clone();
             glib::spawn_future_local(clone!(
                 #[weak]
                 window,
                 async move {
                     let (tx, rx) = async_channel::bounded(1);
-                    tokio::spawn(async move {
+                    let handle = tokio::spawn(async move {
                         let _ = tx.send(api.routing_setup().await).await;
                     });
+                    slot.set(Some(handle));
                     match rx.recv().await {
                         Ok(Ok(val)) => {
                             let msg = serde_json::to_string_pretty(&val).unwrap_or_default();
@@ -123,21 +144,25 @@ pub fn show_routing_window(api: ApiClient, role: &str) {
     ));
 
     let api_teardown = api.clone();
+    let teardown_slot = new_task_slot();
     teardown_btn.connect_clicked(clone!(
         #[weak]
         window,
         move |btn| {
             btn.set_sensitive(false);
+            abort_previous(&teardown_slot);
             let api = api_teardown.clone();
             let btn2 = btn.clone();
+            let slot = teardown_slot.clone();
             glib::spawn_future_local(clone!(
                 #[weak]
                 window,
                 async move {
                     let (tx, rx) = async_channel::bounded(1);
-                    tokio::spawn(async move {
+                    let handle = tokio::spawn(async move {
                         let _ = tx.send(api.routing_teardown().await).await;
                     });
+                    slot.set(Some(handle));
                     match rx.recv().await {
                         Ok(Ok(())) => {
                             show_info_dialog(
@@ -160,21 +185,25 @@ pub fn show_routing_window(api: ApiClient, role: &str) {
     ));
 
     let api_diag = api.clone();
+    let diag_slot = new_task_slot();
     diag_btn.connect_clicked(clone!(
         #[weak]
         window,
         move |btn| {
             btn.set_sensitive(false);
+            abort_previous(&diag_slot);
             let api = api_diag.clone();
             let btn2 = btn.clone();
+            let slot = diag_slot.clone();
             glib::spawn_future_local(clone!(
                 #[weak]
                 window,
                 async move {
                     let (tx, rx) = async_channel::bounded(1);
-                    tokio::spawn(async move {
+                    let handle = tokio::spawn(async move {
                         let _ = tx.send(api.routing_diagnostics().await).await;
                     });
+                    slot.set(Some(handle));
                     match rx.recv().await {
                         Ok(Ok(val)) => {
                             let msg = format_diagnostics(&val);
@@ -270,11 +299,14 @@ fn build_list_tab(api: ApiClient, kind: ListKind, can_edit: bool) -> gtk4::Box {
             let add_my_ip_btn = gtk4::Button::builder().label("Add My IP").build();
             let api_ip = api.clone();
             let list_box_ip = list_box.clone();
+            let myip_slot = new_task_slot();
             add_my_ip_btn.connect_clicked(move |btn| {
                 btn.set_sensitive(false);
+                abort_previous(&myip_slot);
                 let api = api_ip.clone();
                 let list_box = list_box_ip.clone();
                 let btn2 = btn.clone();
+                let slot = myip_slot.clone();
                 glib::spawn_future_local(async move {
                     let local_ip = match get_local_ip() {
                         Some(ip) => ip,
@@ -293,7 +325,7 @@ fn build_list_tab(api: ApiClient, kind: ListKind, can_edit: bool) -> gtk4::Box {
                     let (tx, rx) = async_channel::bounded(1);
                     let api2 = api.clone();
                     let ip = local_ip.clone();
-                    tokio::spawn(async move {
+                    let handle = tokio::spawn(async move {
                         let _ = tx
                             .send(
                                 api2.add_routing_client(&ip, "Added from client (my IP)")
@@ -301,6 +333,7 @@ fn build_list_tab(api: ApiClient, kind: ListKind, can_edit: bool) -> gtk4::Box {
                             )
                             .await;
                     });
+                    slot.set(Some(handle));
                     if let Ok(Ok(val)) = rx.recv().await {
                         let address = val["address"].as_str().unwrap_or("auto").to_string();
                         let comment = val["comment"].as_str().unwrap_or("").to_string();
@@ -324,16 +357,21 @@ fn build_list_tab(api: ApiClient, kind: ListKind, can_edit: bool) -> gtk4::Box {
         // Add button callback
         let api_add = api.clone();
         let list_box_add = list_box.clone();
-        add_btn.connect_clicked(move |_| {
+        let add_slot = new_task_slot();
+        add_btn.connect_clicked(move |btn| {
+            btn.set_sensitive(false);
+            abort_previous(&add_slot);
+            let btn = btn.clone();
             let api = api_add.clone();
             let list_box = list_box_add.clone();
+            let slot = add_slot.clone();
             glib::spawn_future_local(async move {
                 if let Some((address, comment)) = show_add_entry_dialog().await {
                     let (tx, rx) = async_channel::bounded(1);
                     let api2 = api.clone();
                     let address2 = address.clone();
                     let comment2 = comment.clone();
-                    tokio::spawn(async move {
+                    let handle = tokio::spawn(async move {
                         let result = match kind {
                             ListKind::Clients => {
                                 api2.add_routing_client(&address2, &comment2).await
@@ -342,6 +380,7 @@ fn build_list_tab(api: ApiClient, kind: ListKind, can_edit: bool) -> gtk4::Box {
                         };
                         let _ = tx.send(result).await;
                     });
+                    slot.set(Some(handle));
                     if let Ok(Ok(val)) = rx.recv().await {
                         let id = val[".id"].as_str().unwrap_or("").to_string();
                         let addr = val["address"].as_str().unwrap_or(&address).to_string();
@@ -349,6 +388,7 @@ fn build_list_tab(api: ApiClient, kind: ListKind, can_edit: bool) -> gtk4::Box {
                         append_list_row(&list_box, &id, &addr, &cmt, api.clone(), kind, true);
                     }
                 }
+                btn.set_sensitive(true);
             });
         });
     }
@@ -356,14 +396,18 @@ fn build_list_tab(api: ApiClient, kind: ListKind, can_edit: bool) -> gtk4::Box {
     let refresh_btn = gtk4::Button::builder().label("Refresh").build();
     btn_box.append(&refresh_btn);
 
-    // Refresh callback
+    // Refresh callback — single in-flight reload per click; the button
+    // stays disabled until the reload completes.
     let api_refresh = api.clone();
     let list_box_refresh = list_box.clone();
-    refresh_btn.connect_clicked(move |_| {
+    refresh_btn.connect_clicked(move |btn| {
+        btn.set_sensitive(false);
+        let btn = btn.clone();
         let api = api_refresh.clone();
         let list_box = list_box_refresh.clone();
         glib::spawn_future_local(async move {
             reload_list(&list_box, api, kind, can_edit).await;
+            btn.set_sensitive(true);
         });
     });
 
@@ -465,24 +509,31 @@ fn append_list_row(
 
         let id_owned = id.to_string();
         let list_box_ref = list_box.clone();
-        delete_btn.connect_clicked(move |_| {
+        let del_slot = new_task_slot();
+        delete_btn.connect_clicked(move |btn| {
+            btn.set_sensitive(false);
+            abort_previous(&del_slot);
+            let btn = btn.clone();
             let api = api.clone();
             let id = id_owned.clone();
             let list_box = list_box_ref.clone();
+            let slot = del_slot.clone();
             glib::spawn_future_local(async move {
                 let (tx, rx) = async_channel::bounded(1);
                 let api2 = api.clone();
                 let id2 = id.clone();
-                tokio::spawn(async move {
+                let handle = tokio::spawn(async move {
                     let result = match kind {
                         ListKind::Clients => api2.remove_routing_client(&id2).await,
                         ListKind::Bypass => api2.remove_routing_bypass(&id2).await,
                     };
                     let _ = tx.send(result).await;
                 });
+                slot.set(Some(handle));
                 if let Ok(Ok(())) = rx.recv().await {
                     reload_list(&list_box, api, kind, can_edit).await;
                 }
+                btn.set_sensitive(true);
             });
         });
 

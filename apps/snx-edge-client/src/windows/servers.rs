@@ -1,16 +1,24 @@
+use std::sync::Arc;
+
 use gtk4::{
     Align, Orientation,
     glib::{self, clone},
     prelude::*,
 };
+use tokio::sync::RwLock;
+use tracing::warn;
 
 use crate::{
     client_settings::{ClientSettings, ServerConnection},
     get_window, main_window, set_window,
 };
 
+/// Convenience alias for the shared `ClientSettings`. Keeping it here keeps
+/// each call site short.
+type SharedSettings = Arc<RwLock<ClientSettings>>;
+
 /// Show the server management window.
-pub fn show_servers_window() {
+pub fn show_servers_window(settings: SharedSettings) {
     if let Some(window) = get_window("servers") {
         window.present();
         return;
@@ -63,20 +71,26 @@ pub fn show_servers_window() {
 
     // Add server
     let list_box_add = list_box.clone();
+    let settings_add = settings.clone();
     add_btn.connect_clicked(move |_| {
         let list_box = list_box_add.clone();
+        let settings = settings_add.clone();
         glib::spawn_future_local(async move {
             if let Some((name, url)) = show_server_edit_dialog(None).await {
-                let mut settings = ClientSettings::load();
-                settings.servers.push(ServerConnection {
-                    name,
-                    url,
-                    auto_connect: false,
-                    last_profile_id: None,
-                    insecure: false,
-                });
-                let _ = settings.save();
-                reload_servers(&list_box);
+                {
+                    let mut s = settings.write().await;
+                    s.servers.push(ServerConnection {
+                        name,
+                        url,
+                        auto_connect: false,
+                        last_profile_id: None,
+                        insecure: false,
+                    });
+                    if let Err(e) = s.save() {
+                        warn!("Failed to save settings: {}", e);
+                    }
+                }
+                reload_servers(&list_box, settings).await;
             }
         });
     });
@@ -113,22 +127,33 @@ pub fn show_servers_window() {
     set_window("servers", Some(window.clone()));
 
     // Initial load
-    reload_servers(&list_box);
+    let list_box_init = list_box.clone();
+    let settings_init = settings.clone();
+    glib::spawn_future_local(async move {
+        reload_servers(&list_box_init, settings_init).await;
+    });
 
     window.present();
 }
 
-fn reload_servers(list_box: &gtk4::ListBox) {
+async fn reload_servers(list_box: &gtk4::ListBox, settings: SharedSettings) {
     while let Some(child) = list_box.first_child() {
         list_box.remove(&child);
     }
 
-    let settings = ClientSettings::load();
-    let active_idx = settings.active_server;
+    // Snapshot the servers list to avoid holding the read guard across the
+    // (synchronous but UI-touching) row construction.
+    let snapshot = {
+        let s = settings.read().await;
+        let active = s.active_server;
+        let servers = s.servers.clone();
+        (active, servers)
+    };
+    let (active_idx, servers) = snapshot;
 
-    for (idx, server) in settings.servers.iter().enumerate() {
+    for (idx, server) in servers.iter().enumerate() {
         let is_active = active_idx == Some(idx);
-        append_server_row(list_box, idx, server, is_active);
+        append_server_row(list_box, idx, server, is_active, settings.clone());
     }
 }
 
@@ -137,6 +162,7 @@ fn append_server_row(
     idx: usize,
     server: &ServerConnection,
     is_active: bool,
+    settings: SharedSettings,
 ) {
     let row_box = gtk4::Box::builder()
         .orientation(Orientation::Horizontal)
@@ -196,16 +222,22 @@ fn append_server_row(
             .build();
 
         let list_box_ref = list_box.clone();
+        let settings_def = settings.clone();
         default_btn.connect_clicked(move |_| {
-            let mut settings = ClientSettings::load();
-            settings.active_server = Some(idx);
-            let _ = settings.save();
-            reload_servers(&list_box_ref);
-
-            // Notify user that a restart is required
-            let list_box_ref2 = list_box_ref.clone();
+            let list_box_ref = list_box_ref.clone();
+            let settings = settings_def.clone();
             glib::spawn_future_local(async move {
-                let parent = list_box_ref2
+                {
+                    let mut s = settings.write().await;
+                    s.active_server = Some(idx);
+                    if let Err(e) = s.save() {
+                        warn!("Failed to save settings: {}", e);
+                    }
+                }
+                reload_servers(&list_box_ref, settings).await;
+
+                // Notify user that a restart is required
+                let parent = list_box_ref
                     .root()
                     .and_then(|r| r.downcast::<gtk4::Window>().ok());
                 let alert = gtk4::AlertDialog::builder()
@@ -232,19 +264,25 @@ fn append_server_row(
     let server_name = server.name.clone();
     let server_url = server.url.clone();
     let list_box_edit = list_box.clone();
+    let settings_edit = settings.clone();
     edit_btn.connect_clicked(move |_| {
         let name = server_name.clone();
         let url = server_url.clone();
         let list_box = list_box_edit.clone();
+        let settings = settings_edit.clone();
         glib::spawn_future_local(async move {
             if let Some((new_name, new_url)) = show_server_edit_dialog(Some((&name, &url))).await {
-                let mut settings = ClientSettings::load();
-                if let Some(s) = settings.servers.get_mut(idx) {
-                    s.name = new_name;
-                    s.url = new_url;
+                {
+                    let mut s = settings.write().await;
+                    if let Some(srv) = s.servers.get_mut(idx) {
+                        srv.name = new_name;
+                        srv.url = new_url;
+                    }
+                    if let Err(e) = s.save() {
+                        warn!("Failed to save settings: {}", e);
+                    }
                 }
-                let _ = settings.save();
-                reload_servers(&list_box);
+                reload_servers(&list_box, settings).await;
             }
         });
     });
@@ -260,31 +298,33 @@ fn append_server_row(
 
     let list_box_del = list_box.clone();
     let server_name_del = server.name.clone();
+    let settings_del = settings.clone();
     delete_btn.connect_clicked(move |_| {
         let list_box = list_box_del.clone();
         let name = server_name_del.clone();
+        let settings = settings_del.clone();
         glib::spawn_future_local(async move {
             if show_confirm_dialog(&format!("Remove server '{}'?", name)).await {
-                let mut settings = ClientSettings::load();
-                if idx < settings.servers.len() {
-                    settings.servers.remove(idx);
-                    // Adjust active_server index
-                    match settings.active_server {
-                        Some(active) if active == idx => {
-                            settings.active_server = if settings.servers.is_empty() {
-                                None
-                            } else {
-                                Some(0)
-                            };
+                {
+                    let mut s = settings.write().await;
+                    if idx < s.servers.len() {
+                        s.servers.remove(idx);
+                        // Adjust active_server index
+                        match s.active_server {
+                            Some(active) if active == idx => {
+                                s.active_server = if s.servers.is_empty() { None } else { Some(0) };
+                            }
+                            Some(active) if active > idx => {
+                                s.active_server = Some(active - 1);
+                            }
+                            _ => {}
                         }
-                        Some(active) if active > idx => {
-                            settings.active_server = Some(active - 1);
+                        if let Err(e) = s.save() {
+                            warn!("Failed to save settings: {}", e);
                         }
-                        _ => {}
                     }
-                    let _ = settings.save();
                 }
-                reload_servers(&list_box);
+                reload_servers(&list_box, settings).await;
             }
         });
     });

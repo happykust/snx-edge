@@ -1,5 +1,4 @@
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use futures_util::StreamExt;
 use gtk4::{
@@ -8,8 +7,14 @@ use gtk4::{
     prelude::*,
 };
 use reqwest_eventsource::{Event, EventSource};
+use tokio_util::sync::CancellationToken;
+use tracing::warn;
 
 use crate::{api::ApiClient, get_window, main_window, set_window};
+
+/// SSE reconnect backoff configuration.
+const SSE_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+const SSE_MAX_BACKOFF: Duration = Duration::from_secs(30);
 
 /// Show the logs viewer window.
 pub fn show_logs_window(api: ApiClient) {
@@ -29,7 +34,7 @@ pub fn show_logs_window(api: ApiClient) {
         .orientation(Orientation::Vertical)
         .build();
 
-    // --- Header: level filter ---
+    // --- Header: level filter + connection status label ---
     let header = gtk4::Box::builder()
         .orientation(Orientation::Horizontal)
         .spacing(8)
@@ -54,6 +59,17 @@ pub fn show_logs_window(api: ApiClient) {
 
     let refresh_btn = gtk4::Button::builder().label("Reload").build();
     header.append(&refresh_btn);
+
+    // Spacer + status label
+    let spacer = gtk4::Box::builder().hexpand(true).build();
+    header.append(&spacer);
+
+    let status_label = gtk4::Label::builder()
+        .label("")
+        .halign(Align::End)
+        .css_classes(vec!["dim-label".to_string()])
+        .build();
+    header.append(&status_label);
 
     outer.append(&header);
 
@@ -116,12 +132,12 @@ pub fn show_logs_window(api: ApiClient) {
 
     window.set_child(Some(&outer));
 
-    // SSE cancellation flag — set when window is closed
-    let stop_flag = Arc::new(AtomicBool::new(false));
-    let stop_flag_close = stop_flag.clone();
+    // SSE cancellation token — cancelled when window is closed.
+    let cancel = CancellationToken::new();
+    let cancel_close = cancel.clone();
 
     window.connect_close_request(move |_| {
-        stop_flag_close.store(true, Ordering::SeqCst);
+        cancel_close.cancel();
         set_window("logs", None::<gtk4::Window>);
         glib::Propagation::Proceed
     });
@@ -157,17 +173,14 @@ pub fn show_logs_window(api: ApiClient) {
         });
     });
 
-    // Start SSE streaming with cancellation support
-    let api_sse = api.clone();
-    let text_view_sse = text_view.clone();
-    let scrolled_sse = scrolled.clone();
-    let level_dropdown_sse = level_dropdown.clone();
+    // Start SSE streaming with cancellation + reconnect-with-backoff
     start_sse_stream(
-        api_sse,
-        text_view_sse,
-        scrolled_sse,
-        level_dropdown_sse,
-        stop_flag,
+        api,
+        text_view,
+        scrolled,
+        level_dropdown,
+        status_label,
+        cancel,
     );
 
     window.present();
@@ -218,74 +231,150 @@ async fn load_history(
     }
 }
 
+/// Status events sent from the SSE worker task to the UI updater.
+enum SseUiMsg {
+    /// A log line received from the server (raw SSE message data).
+    Line(String),
+    /// Stream is connected and receiving events.
+    Connected,
+    /// Stream is reconnecting; payload is the next attempt delay.
+    Reconnecting(Duration),
+}
+
 fn start_sse_stream(
     api: ApiClient,
     text_view: gtk4::TextView,
     scrolled: gtk4::ScrolledWindow,
     level_dropdown: gtk4::DropDown,
-    stop_flag: Arc<AtomicBool>,
+    status_label: gtk4::Label,
+    cancel: CancellationToken,
 ) {
-    let (tx, rx) = async_channel::unbounded::<String>();
+    let (tx, rx) = async_channel::unbounded::<SseUiMsg>();
 
-    // SSE reader task — checks stop_flag and drops tx on exit
+    // SSE reader task: reconnect loop with exponential backoff.
+    // Honours the per-server `insecure` flag because we reuse the ApiClient's
+    // underlying reqwest::Client (configured in ApiClient::with_insecure).
+    let cancel_task = cancel.clone();
     tokio::spawn(async move {
-        let base_url = api.base_url().await;
-        let token = api.token().await;
-        let url = format!("{}/api/v1/logs", base_url);
+        let mut delay = SSE_INITIAL_BACKOFF;
+        let mut attempt: u32 = 0;
 
-        let client = reqwest::Client::builder()
-            .danger_accept_invalid_certs(true)
-            .build()
-            .unwrap_or_default();
-
-        let mut builder = client.get(&url);
-
-        if let Some(ref tok) = token {
-            builder = builder.bearer_auth(tok);
-        }
-
-        let Ok(mut es) = EventSource::new(builder) else {
-            return;
-        };
-
-        while let Some(event) = es.next().await {
-            if stop_flag.load(Ordering::SeqCst) {
-                break;
+        loop {
+            if cancel_task.is_cancelled() {
+                return;
             }
-            match event {
-                Ok(Event::Message(msg)) => {
-                    if tx.send(msg.data).await.is_err() {
-                        break;
+
+            // Build a fresh authenticated request each iteration since
+            // RequestBuilder is not Clone.
+            let builder = api.sse_request("/api/v1/logs").await;
+            let mut es = match EventSource::new(builder) {
+                Ok(es) => es,
+                Err(e) => {
+                    warn!("SSE: failed to construct EventSource: {}", e);
+                    let _ = tx.send(SseUiMsg::Reconnecting(delay)).await;
+                    if wait_or_cancel(&cancel_task, delay).await {
+                        return;
+                    }
+                    delay = (delay * 2).min(SSE_MAX_BACKOFF);
+                    attempt = attempt.saturating_add(1);
+                    continue;
+                }
+            };
+
+            let mut got_event = false;
+            loop {
+                tokio::select! {
+                    _ = cancel_task.cancelled() => return,
+                    next = es.next() => match next {
+                        Some(Ok(Event::Open)) => {
+                            got_event = true;
+                            // Reset backoff once the connection is open.
+                            delay = SSE_INITIAL_BACKOFF;
+                            attempt = 0;
+                            let _ = tx.send(SseUiMsg::Connected).await;
+                        }
+                        Some(Ok(Event::Message(m))) => {
+                            got_event = true;
+                            // Reset backoff on a successful event received.
+                            delay = SSE_INITIAL_BACKOFF;
+                            attempt = 0;
+                            if tx.send(SseUiMsg::Line(m.data)).await.is_err() {
+                                return;
+                            }
+                        }
+                        Some(Err(e)) => {
+                            warn!("SSE: connection error (attempt {}): {}", attempt, e);
+                            break;
+                        }
+                        None => {
+                            warn!("SSE: stream ended (attempt {})", attempt);
+                            break;
+                        }
                     }
                 }
-                Ok(Event::Open) => {}
-                Err(_) => {
-                    // Connection lost; stop
-                    break;
+            }
+
+            // If we never received an event this attempt, increase backoff;
+            // otherwise the loop above already reset it.
+            if !got_event {
+                attempt = attempt.saturating_add(1);
+            }
+
+            let _ = tx.send(SseUiMsg::Reconnecting(delay)).await;
+
+            if wait_or_cancel(&cancel_task, delay).await {
+                return;
+            }
+            delay = (delay * 2).min(SSE_MAX_BACKOFF);
+        }
+    });
+
+    // UI updater. Cancellation breaks out of the recv loop too — but the
+    // sender task drops `tx` when it returns, which closes `rx` naturally.
+    glib::spawn_future_local(async move {
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                msg = rx.recv() => match msg {
+                    Ok(SseUiMsg::Line(data)) => {
+                        let line = if let Ok(entry) =
+                            serde_json::from_str::<serde_json::Value>(&data)
+                        {
+                            format_log_entry(&entry)
+                        } else {
+                            data
+                        };
+                        let level = selected_level(&level_dropdown);
+                        if should_show(&line, &level) {
+                            let buffer = text_view.buffer();
+                            let mut end = buffer.end_iter();
+                            buffer.insert(&mut end, &line);
+                            buffer.insert(&mut end, "\n");
+                            scroll_to_bottom(&scrolled);
+                        }
+                    }
+                    Ok(SseUiMsg::Connected) => {
+                        status_label.set_label("");
+                    }
+                    Ok(SseUiMsg::Reconnecting(d)) => {
+                        status_label.set_label(&format!(
+                            "Reconnecting in {}s...",
+                            d.as_secs().max(1),
+                        ));
+                    }
+                    Err(_) => break,
                 }
             }
         }
-        // tx is dropped here, causing the rx receiver to finish
     });
+}
 
-    // UI updater
-    glib::spawn_future_local(async move {
-        while let Ok(data) = rx.recv().await {
-            let line = if let Ok(entry) = serde_json::from_str::<serde_json::Value>(&data) {
-                format_log_entry(&entry)
-            } else {
-                data
-            };
-            let level = selected_level(&level_dropdown);
-            if should_show(&line, &level) {
-                let buffer = text_view.buffer();
-                let mut end = buffer.end_iter();
-                buffer.insert(&mut end, &line);
-                buffer.insert(&mut end, "\n");
-                scroll_to_bottom(&scrolled);
-            }
-        }
-    });
+/// Wait for `delay` or until `cancel` fires. Returns `true` if cancelled.
+async fn wait_or_cancel(cancel: &CancellationToken, delay: Duration) -> bool {
+    tokio::select! {
+        _ = tokio::time::sleep(delay) => false,
+        _ = cancel.cancelled() => true,
+    }
 }
 
 fn format_log_entry(entry: &serde_json::Value) -> String {

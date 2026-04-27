@@ -46,7 +46,7 @@ futures-util = "0.3"
 
 # GUI (client only)
 gtk4 = { version = "0.11", features = ["v4_12"] }
-libadwaita = { version = "0.9", features = ["v1_4"] }
+libadwaita = { version = "0.9", features = ["v1_5"] }
 ksni = "0.3"
 reqwest-eventsource = "0.6"
 keyring = { version = "3", features = ["sync-secret-service"] }

@@ -68,6 +68,19 @@ impl ApiClient {
         builder
     }
 
+    /// Build an authenticated GET RequestBuilder suitable for an SSE stream.
+    ///
+    /// Uses the same underlying `reqwest::Client` as the rest of the API —
+    /// so the per-server `insecure` flag set via [`with_insecure`] is
+    /// honoured here. Callers should pass the result to
+    /// `reqwest_eventsource::EventSource::new`.
+    ///
+    /// `RequestBuilder` is not `Clone`; for reconnect loops, call this
+    /// method again on each attempt.
+    pub async fn sse_request(&self, path: &str) -> reqwest::RequestBuilder {
+        self.request_builder(reqwest::Method::GET, path).await
+    }
+
     pub async fn login(&self, username: &str, password: &str) -> anyhow::Result<TokenResponse> {
         let url = self.url("/api/v1/auth/login").await;
         let resp = self

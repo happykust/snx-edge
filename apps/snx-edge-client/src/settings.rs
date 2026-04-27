@@ -6,7 +6,7 @@ use gtk4::{
     prelude::*,
 };
 use serde_json::Value;
-use tokio::sync::mpsc::Sender;
+use tokio::sync::{RwLock, mpsc::Sender};
 use tracing::warn;
 
 use crate::{
@@ -597,6 +597,10 @@ struct MyWidgets {
     auth: AuthManager,
     profile_store: Arc<ProfileStore>,
     user_role: RefCell<Option<String>>,
+    /// Shared settings state. Reads/writes to this drive the persisted
+    /// `client.toml` file and keep the rest of the app (tray icon theme,
+    /// servers list) in sync with the dialog.
+    settings: Arc<RwLock<ClientSettings>>,
 }
 
 impl MyWidgets {
@@ -809,11 +813,17 @@ fn profile_active_id(widgets: &MyWidgets) -> Option<String> {
 }
 
 impl SettingsDialog {
+    /// `initial` is a snapshot of the shared `ClientSettings` taken at the
+    /// async call site so the constructor can stay synchronous (the GTK
+    /// widget tree is built on the main thread). `settings` is the shared
+    /// handle used by `save()` and surfaced to the rest of the app.
     pub fn new<W: IsA<Window>>(
         parent: W,
         api: ApiClient,
         auth: AuthManager,
         profile_store: Arc<ProfileStore>,
+        initial: ClientSettings,
+        settings: Arc<RwLock<ClientSettings>>,
     ) -> Self {
         let (response_tx, response_rx) = async_channel::unbounded::<ResponseType>();
 
@@ -838,19 +848,21 @@ impl SettingsDialog {
         button_box.append(&apply_button);
         button_box.append(&cancel_button);
 
-        let settings = ClientSettings::load();
+        // Use the snapshot for initial widget population. The shared handle
+        // is stashed on `MyWidgets` for `save()` and any later reads.
+        let settings_initial = initial;
 
         let server_url = gtk4::Entry::builder()
             .hexpand(true)
             .placeholder_text("https://server:8443")
-            .text(settings.active_server_url().unwrap_or_default())
+            .text(settings_initial.active_server_url().unwrap_or_default())
             .build();
 
         let server_name = gtk4::Entry::builder()
             .hexpand(true)
             .placeholder_text("My VPN Server")
             .text(
-                settings
+                settings_initial
                     .active_server()
                     .map(|s| s.name.as_str())
                     .unwrap_or_default(),
@@ -872,7 +884,7 @@ impl SettingsDialog {
         error.add_css_class("error");
 
         auto_connect.set_active(
-            settings
+            settings_initial
                 .active_server()
                 .map(|s| s.auto_connect)
                 .unwrap_or(false),
@@ -898,6 +910,7 @@ impl SettingsDialog {
             auth: auth.clone(),
             profile_store: profile_store.clone(),
             user_role: RefCell::new(None),
+            settings: settings.clone(),
         });
 
         // Populate profiles from the store
@@ -1254,48 +1267,48 @@ impl SettingsDialog {
         result
     }
 
-    pub fn save(&mut self) -> anyhow::Result<()> {
-        let mut settings = ClientSettings::load();
-
+    pub async fn save(&mut self) -> anyhow::Result<()> {
         let url = self.widgets.server_url.text().to_string();
         let name = self.widgets.server_name.text().to_string();
         let auto_connect = self.widgets.auto_connect.is_active();
-
         let icon_theme_idx = self.widgets.icon_theme.selected();
-        settings.icon_theme = match icon_theme_idx {
+        let last_profile_id = profile_active_id(&self.widgets);
+        let icon_theme = match icon_theme_idx {
             1 => "dark".to_string(),
             2 => "light".to_string(),
             _ => "system".to_string(),
         };
 
-        let last_profile_id = profile_active_id(&self.widgets);
+        // Mutate the shared in-memory ClientSettings, persist to disk, and
+        // release the lock — keeping the rest of the app (tray, servers
+        // window) in sync without re-reading from disk.
+        {
+            let mut s = self.widgets.settings.write().await;
+            s.icon_theme = icon_theme;
 
-        // Update or add server
-        if let Some(idx) = settings.active_server {
-            if let Some(server) = settings.servers.get_mut(idx) {
-                server.url = url.clone();
-                server.name = name;
-                server.auto_connect = auto_connect;
-                server.last_profile_id = last_profile_id;
+            if let Some(idx) = s.active_server {
+                if let Some(server) = s.servers.get_mut(idx) {
+                    server.url = url.clone();
+                    server.name = name;
+                    server.auto_connect = auto_connect;
+                    server.last_profile_id = last_profile_id;
+                }
+            } else {
+                s.servers.push(ServerConnection {
+                    name,
+                    url: url.clone(),
+                    auto_connect,
+                    last_profile_id,
+                    insecure: false,
+                });
+                s.active_server = Some(s.servers.len() - 1);
             }
-        } else {
-            settings.servers.push(ServerConnection {
-                name,
-                url: url.clone(),
-                auto_connect,
-                last_profile_id,
-                insecure: false,
-            });
-            settings.active_server = Some(settings.servers.len() - 1);
+
+            s.save()?;
         }
 
-        settings.save()?;
-
         // Update the API base URL
-        let api = self.widgets.api.clone();
-        tokio::spawn(async move {
-            api.set_base_url(&url).await;
-        });
+        self.widgets.api.set_base_url(&url).await;
 
         Ok(())
     }
@@ -1377,10 +1390,19 @@ impl SettingsDialog {
         let icon_theme_box = self.form_row("Icon Theme:");
         let model = gtk4::StringList::new(&["Auto-detect", "Dark", "Light"]);
         self.widgets.icon_theme.set_model(Some(&model));
-        let settings = ClientSettings::load();
-        let idx = match settings.icon_theme.as_str() {
-            "dark" => 1u32,
-            "light" => 2,
+        // Read from the shared in-memory settings via try_read — fall back
+        // to "auto-detect" if a writer happens to hold the lock right now.
+        // This runs during sync widget construction so we cannot await.
+        let idx = match self
+            .widgets
+            .settings
+            .try_read()
+            .ok()
+            .map(|s| s.icon_theme.clone())
+            .as_deref()
+        {
+            Some("dark") => 1u32,
+            Some("light") => 2,
             _ => 0,
         };
         self.widgets.icon_theme.set_selected(idx);
@@ -1760,11 +1782,12 @@ impl SettingsDialog {
     }
 }
 
-impl Drop for SettingsDialog {
-    fn drop(&mut self) {
-        self.window.close();
-    }
-}
+// NOTE: a `Drop for SettingsDialog` used to call `self.window.close()`
+// here. That was unsafe because `gtk4::Window::close` is only sound on
+// the GTK main thread, while `Drop` can fire on whichever task last held
+// the dialog. The window's own `connect_close_request` handler (set up
+// in `SettingsDialog::new`) and the `set_window("settings", None)` in
+// `run` already cover cleanup, so no explicit `Drop` is needed.
 
 pub fn start_settings_dialog<W: IsA<Window>>(
     parent: W,
@@ -1772,21 +1795,26 @@ pub fn start_settings_dialog<W: IsA<Window>>(
     api: ApiClient,
     auth: AuthManager,
     profile_store: Arc<ProfileStore>,
+    settings: Arc<RwLock<ClientSettings>>,
 ) {
     if let Some(window) = get_window("settings") {
         window.present();
         return;
     }
 
-    let mut dialog = SettingsDialog::new(parent, api, auth, profile_store);
     let sender = sender.clone();
     glib::spawn_future_local(async move {
+        // Snapshot the shared settings on the GTK main thread so the
+        // synchronous `SettingsDialog::new` constructor can build the widget
+        // tree from the current values without holding any locks.
+        let snapshot = settings.read().await.clone();
+        let mut dialog = SettingsDialog::new(parent, api, auth, profile_store, snapshot, settings);
         loop {
             let response = dialog.run().await;
 
             match response {
                 ResponseType::Ok | ResponseType::Apply => {
-                    if let Err(e) = dialog.save() {
+                    if let Err(e) = dialog.save().await {
                         warn!("{}", e);
                     } else {
                         let _ = sender.send(TrayCommand::Update(None)).await;

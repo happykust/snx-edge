@@ -1,10 +1,32 @@
+use std::cell::Cell;
+use std::rc::Rc;
+
 use gtk4::{
     Align, Orientation,
     glib::{self, clone},
     prelude::*,
 };
+use tokio::task::JoinHandle;
 
 use crate::{api::ApiClient, get_window, main_window, set_window};
+
+/// Per-button JoinHandle slot. Cell because `connect_clicked` callbacks
+/// are `Fn` (not `FnMut`); Rc because each button-callback move-closure
+/// owns its own clone of the handle.
+type TaskSlot = Rc<Cell<Option<JoinHandle<()>>>>;
+
+fn new_task_slot() -> TaskSlot {
+    Rc::new(Cell::new(None))
+}
+
+/// Abort any in-flight task previously stored in `slot` (a no-op if the
+/// task has already finished). Call before spawning a fresh tokio task on
+/// rapid double-click.
+fn abort_previous(slot: &TaskSlot) {
+    if let Some(h) = slot.take() {
+        h.abort();
+    }
+}
 
 /// Show the user management window.
 /// Only admin users are allowed to open this window.
@@ -80,14 +102,20 @@ pub fn show_users_window(api: ApiClient, role: &str) {
     // Add user
     let api_add = api.clone();
     let list_box_add = list_box.clone();
-    add_btn.connect_clicked(move |_| {
+    let add_slot = new_task_slot();
+    add_btn.connect_clicked(move |btn| {
+        // Disable to prevent rapid double-click stacking another task on top.
+        btn.set_sensitive(false);
+        abort_previous(&add_slot);
+        let btn = btn.clone();
         let api = api_add.clone();
         let list_box = list_box_add.clone();
+        let slot = add_slot.clone();
         glib::spawn_future_local(async move {
             if let Some((username, password, role, comment)) = show_add_user_dialog().await {
                 let (tx, rx) = async_channel::bounded(1);
                 let api2 = api.clone();
-                tokio::spawn(async move {
+                let handle = tokio::spawn(async move {
                     let _ = tx
                         .send(
                             api2.create_user(&username, &password, &role, &comment)
@@ -95,21 +123,27 @@ pub fn show_users_window(api: ApiClient, role: &str) {
                         )
                         .await;
                 });
+                slot.set(Some(handle));
                 if let Ok(Ok(_)) = rx.recv().await {
                     reload_users(&list_box, api).await;
                 }
             }
+            btn.set_sensitive(true);
         });
     });
 
-    // Refresh
+    // Refresh — single in-flight reload per click; the button stays
+    // disabled until the reload completes so we cannot spawn racing tasks.
     let api_refresh = api.clone();
     let list_box_refresh = list_box.clone();
-    refresh_btn.connect_clicked(move |_| {
+    refresh_btn.connect_clicked(move |btn| {
+        btn.set_sensitive(false);
+        let btn = btn.clone();
         let api = api_refresh.clone();
         let list_box = list_box_refresh.clone();
         glib::spawn_future_local(async move {
             reload_users(&list_box, api).await;
+            btn.set_sensitive(true);
         });
     });
 
@@ -284,24 +318,31 @@ fn append_user_row(
     let api_reset = api.clone();
     let id_reset = id.to_string();
     let list_box_reset = list_box.clone();
-    reset_btn.connect_clicked(move |_| {
+    let reset_slot = new_task_slot();
+    reset_btn.connect_clicked(move |btn| {
+        btn.set_sensitive(false);
+        abort_previous(&reset_slot);
+        let btn = btn.clone();
         let api = api_reset.clone();
         let id = id_reset.clone();
         let list_box = list_box_reset.clone();
+        let slot = reset_slot.clone();
         glib::spawn_future_local(async move {
             if let Some(new_password) = show_password_dialog().await {
                 let (tx, rx) = async_channel::bounded(1);
                 let api2 = api.clone();
                 let id2 = id.clone();
-                tokio::spawn(async move {
+                let handle = tokio::spawn(async move {
                     let _ = tx
                         .send(api2.change_user_password(&id2, &new_password).await)
                         .await;
                 });
+                slot.set(Some(handle));
                 if let Ok(Ok(())) = rx.recv().await {
                     reload_users(&list_box, api).await;
                 }
             }
+            btn.set_sensitive(true);
         });
     });
 
@@ -320,23 +361,30 @@ fn append_user_row(
     let id_del = id.to_string();
     let username_del = username.to_string();
     let list_box_del = list_box.clone();
-    delete_btn.connect_clicked(move |_| {
+    let del_slot = new_task_slot();
+    delete_btn.connect_clicked(move |btn| {
+        btn.set_sensitive(false);
+        abort_previous(&del_slot);
+        let btn = btn.clone();
         let api = api_del.clone();
         let id = id_del.clone();
         let username = username_del.clone();
         let list_box = list_box_del.clone();
+        let slot = del_slot.clone();
         glib::spawn_future_local(async move {
             if show_confirm_dialog(&format!("Delete user '{}'?", username)).await {
                 let (tx, rx) = async_channel::bounded(1);
                 let api2 = api.clone();
                 let id2 = id.clone();
-                tokio::spawn(async move {
+                let handle = tokio::spawn(async move {
                     let _ = tx.send(api2.delete_user(&id2).await).await;
                 });
+                slot.set(Some(handle));
                 if let Ok(Ok(())) = rx.recv().await {
                     reload_users(&list_box, api).await;
                 }
             }
+            btn.set_sensitive(true);
         });
     });
 

@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 
+use tokio::sync::OnceCell;
 use zbus::{Connection, zvariant};
 
 #[zbus::proxy(
@@ -40,9 +41,22 @@ pub trait Notifications {
     ) -> zbus::Result<u32>;
 }
 
+/// Process-wide cached session bus connection. Establishing a fresh
+/// connection per call costs an authentication roundtrip (~30–80ms) and
+/// keeps a file descriptor open for the duration of the call. We use one
+/// connection for notifications, theme monitoring, and any future zbus
+/// usage.
+static DBUS_SESSION: OnceCell<Connection> = OnceCell::const_new();
+
+pub async fn session_connection() -> zbus::Result<&'static Connection> {
+    DBUS_SESSION
+        .get_or_try_init(|| async { Connection::session().await })
+        .await
+}
+
 pub async fn send_notification(summary: &str, message: &str) -> anyhow::Result<()> {
-    let connection = Connection::session().await?;
-    let proxy = NotificationsProxy::new(&connection).await?;
+    let connection = session_connection().await?;
+    let proxy = NotificationsProxy::new(connection).await?;
     proxy
         .notify(
             "SNX-RS VPN client",

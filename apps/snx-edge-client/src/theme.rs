@@ -1,11 +1,14 @@
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::{
+    sync::atomic::{AtomicU32, Ordering},
+    time::Duration,
+};
 
 use anyhow::anyhow;
 use futures_util::StreamExt;
-use tracing::debug;
+use tracing::{debug, warn};
 use zbus::Connection;
 
-use crate::dbus::DesktopSettingsProxy;
+use crate::dbus::{DesktopSettingsProxy, session_connection};
 
 static COLOR_THEME: AtomicU32 = AtomicU32::new(0);
 
@@ -18,8 +21,12 @@ pub enum SystemColorTheme {
 }
 
 impl SystemColorTheme {
+    /// Returns true only when the system explicitly prefers a dark color
+    /// scheme. `NoPreference` defaults to *light*: many desktops (XFCE,
+    /// Cinnamon stock) report `NoPreference` even though their default
+    /// theme is light, and choosing dark icons there is wrong.
     pub fn is_dark(self) -> bool {
-        matches!(self, Self::NoPreference | Self::Dark)
+        matches!(self, Self::Dark)
     }
 }
 
@@ -40,9 +47,13 @@ pub fn system_color_theme() -> anyhow::Result<SystemColorTheme> {
     COLOR_THEME.load(Ordering::SeqCst).try_into()
 }
 
-pub async fn init_theme_monitoring() -> anyhow::Result<()> {
-    let connection = Connection::session().await?;
-    let proxy = DesktopSettingsProxy::new(&connection).await?;
+/// Connect, fetch the initial color scheme, then return the proxy ready to
+/// stream `SettingChanged` signals. Returns `Err` on any failure so the
+/// outer retry loop can reschedule.
+async fn fetch_initial_and_subscribe(
+    connection: &Connection,
+) -> anyhow::Result<DesktopSettingsProxy<'static>> {
+    let proxy = DesktopSettingsProxy::new(connection).await?;
     let scheme = proxy
         .read_one("org.freedesktop.appearance", "color-scheme")
         .await?;
@@ -51,25 +62,63 @@ pub async fn init_theme_monitoring() -> anyhow::Result<()> {
         scheme = 2;
     }
     COLOR_THEME.store(scheme, Ordering::SeqCst);
-
     debug!("System color scheme: {}", scheme);
+    Ok(proxy)
+}
+
+pub async fn init_theme_monitoring() -> anyhow::Result<()> {
+    let connection = session_connection().await?.clone();
+    // First connect attempt happens up-front so the caller knows whether the
+    // portal is reachable; failures inside the spawned loop are logged and
+    // retried, never propagated.
+    let _ = fetch_initial_and_subscribe(&connection).await?;
 
     tokio::spawn(async move {
-        let mut stream = proxy.receive_setting_changed().await?;
-        while let Some(signal) = stream.next().await {
-            let args = signal.args()?;
-            if args.namespace == "org.freedesktop.appearance" && args.key == "color-scheme" {
-                let mut scheme = u32::try_from(args.value)?;
-                if scheme == 0 && is_ubuntu() {
-                    scheme = 2;
+        // Outer retry loop: any error in the inner loop logs and reconnects
+        // after a backoff. Without this the monitor task silently dies on
+        // the first transient D-Bus disconnect and live theme switching
+        // stops working until the app is restarted.
+        loop {
+            match run_monitor(&connection).await {
+                Ok(()) => {
+                    // Stream ended cleanly — restart after short delay.
+                    debug!("theme monitor stream ended, reconnecting");
                 }
-                debug!("New system color scheme: {}", scheme);
-                COLOR_THEME.store(scheme, Ordering::SeqCst);
+                Err(e) => {
+                    warn!(error = %e, "theme monitor disconnected, retrying in 5s");
+                }
             }
+            tokio::time::sleep(Duration::from_secs(5)).await;
         }
-        Ok::<_, anyhow::Error>(())
     });
 
+    Ok(())
+}
+
+async fn run_monitor(connection: &Connection) -> anyhow::Result<()> {
+    let proxy = fetch_initial_and_subscribe(connection).await?;
+    let mut stream = proxy.receive_setting_changed().await?;
+    while let Some(signal) = stream.next().await {
+        let args = match signal.args() {
+            Ok(a) => a,
+            Err(e) => {
+                warn!(error = %e, "failed to decode SettingChanged signal");
+                continue;
+            }
+        };
+        if args.namespace == "org.freedesktop.appearance" && args.key == "color-scheme" {
+            match u32::try_from(args.value) {
+                Ok(mut scheme) => {
+                    if scheme == 0 && is_ubuntu() {
+                        scheme = 2;
+                    }
+                    debug!("New system color scheme: {}", scheme);
+                    COLOR_THEME.store(scheme, Ordering::SeqCst);
+                }
+                Err(e) => warn!(error = %e, "failed to decode color-scheme value"),
+            }
+        }
+    }
     Ok(())
 }
 
