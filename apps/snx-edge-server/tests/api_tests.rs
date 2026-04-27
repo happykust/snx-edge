@@ -425,6 +425,36 @@ async fn test_profiles_crud() {
 }
 
 #[tokio::test]
+async fn test_create_profile_rejects_no_cert_check_by_default() {
+    let (app, token, _dir) = setup().await;
+
+    let resp = app
+        .oneshot(auth_post(
+            "/api/v1/profiles",
+            &token,
+            json!({
+                "name": "Insecure VPN",
+                "config": {
+                    "server": "vpn.test.com",
+                    "login_type": "password",
+                    "username": "u",
+                    "password": "p",
+                    "no_cert_check": true
+                }
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = resp_json(resp).await;
+    let detail = body["detail"].as_str().unwrap_or("");
+    assert!(
+        detail.contains("certificate verification"),
+        "unexpected error detail: {detail}"
+    );
+}
+
+#[tokio::test]
 async fn test_connect_with_profile() {
     let (app, token, _dir) = setup().await;
 

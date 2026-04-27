@@ -33,6 +33,9 @@ pub enum AppError {
     #[error("bad gateway: {0}")]
     BadGateway(String),
 
+    #[error("service unavailable: {0}")]
+    Unavailable(String),
+
     #[error("internal error: {0}")]
     Internal(String),
 }
@@ -46,6 +49,7 @@ impl AppError {
             Self::Forbidden(_) => StatusCode::FORBIDDEN,
             Self::Conflict(_) => StatusCode::CONFLICT,
             Self::BadGateway(_) => StatusCode::BAD_GATEWAY,
+            Self::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -66,7 +70,22 @@ impl IntoResponse for AppError {
 
 impl From<rusqlite::Error> for AppError {
     fn from(err: rusqlite::Error) -> Self {
-        tracing::error!("database error: {err}");
+        tracing::error!(error = %err, "rusqlite error");
+        if let rusqlite::Error::SqliteFailure(ref sqlite_err, ref msg) = err {
+            if matches!(
+                sqlite_err.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            ) {
+                return Self::Unavailable("database busy".to_string());
+            }
+            if matches!(sqlite_err.code, rusqlite::ErrorCode::ConstraintViolation) {
+                let detail = msg
+                    .as_deref()
+                    .map(|m| format!("constraint violation: {m}"))
+                    .unwrap_or_else(|| "constraint violation".to_string());
+                return Self::Conflict(detail);
+            }
+        }
         Self::Internal("database error".to_string())
     }
 }

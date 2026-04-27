@@ -1,3 +1,6 @@
+use std::net::SocketAddr;
+use std::str::FromStr;
+
 use axum::extract::State;
 use axum::routing::get;
 use axum::{Extension, Json, Router};
@@ -116,6 +119,59 @@ async fn update_config(
                 level,
                 VALID_LEVELS.join(", ")
             )));
+        }
+    }
+
+    // Validate logging.buffer_size (must be >= 1; 0 would cause divide-by-zero
+    // in LogBuffer::push).
+    if let Some(ref logging) = req.logging
+        && let Some(buffer_size) = logging.buffer_size
+        && buffer_size < 1
+    {
+        return Err(AppError::BadRequest(
+            "logging.buffer_size must be >= 1".to_string(),
+        ));
+    }
+
+    // Validate api.listen as a parseable SocketAddr.
+    if let Some(ref api) = req.api
+        && let Some(ref listen) = api.listen
+        && SocketAddr::from_str(listen).is_err()
+    {
+        return Err(AppError::BadRequest(format!(
+            "api.listen must be a valid socket address, got '{listen}'"
+        )));
+    }
+
+    // Validate auth section: every numeric knob must be >= 1.
+    if let Some(ref auth) = req.auth {
+        if let Some(v) = auth.max_login_attempts
+            && v < 1
+        {
+            return Err(AppError::BadRequest(
+                "auth.max_login_attempts must be >= 1".to_string(),
+            ));
+        }
+        if let Some(v) = auth.lockout_duration_minutes
+            && v < 1
+        {
+            return Err(AppError::BadRequest(
+                "auth.lockout_duration_minutes must be >= 1".to_string(),
+            ));
+        }
+        if let Some(v) = auth.access_token_ttl_minutes
+            && v < 1
+        {
+            return Err(AppError::BadRequest(
+                "auth.access_token_ttl_minutes must be >= 1".to_string(),
+            ));
+        }
+        if let Some(v) = auth.refresh_token_ttl_days
+            && v < 1
+        {
+            return Err(AppError::BadRequest(
+                "auth.refresh_token_ttl_days must be >= 1".to_string(),
+            ));
         }
     }
 

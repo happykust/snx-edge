@@ -12,6 +12,34 @@ use crate::state::{AppState, ServerEvent};
 
 const SECRET_MASK: &str = "***";
 
+/// Sanitize a string so it is safe to embed in a `Content-Disposition`
+/// `filename="..."` parameter. Keeps `[A-Za-z0-9._-]`, replaces every other
+/// character (including CRLF, quotes, semicolons, backslashes, and spaces)
+/// with `_`. Returns `"profile"` if the result would be empty.
+fn sanitize_filename(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if cleaned.is_empty() {
+        "profile".to_string()
+    } else {
+        cleaned
+    }
+}
+
+/// Returns true if `config` (parsed JSON) sets `"no_cert_check": true`.
+/// Used to gate the security-sensitive flag behind `[security].allow_no_cert_check`.
+fn config_disables_cert_check(config: &serde_json::Value) -> bool {
+    config.get("no_cert_check").and_then(|v| v.as_bool()) == Some(true)
+}
+
 /// Profile response with secrets masked.
 #[derive(Serialize)]
 struct ProfileResponse {
@@ -106,6 +134,17 @@ async fn create_profile(
         return Err(AppError::BadRequest("config must be an object".to_string()));
     }
 
+    // Enforce the no_cert_check security policy.
+    if config_disables_cert_check(&req.config)
+        && !state.config.read().await.security.allow_no_cert_check
+    {
+        return Err(AppError::BadRequest(
+            "profiles cannot disable VPN server certificate verification \
+             (security.allow_no_cert_check is disabled)"
+                .to_string(),
+        ));
+    }
+
     let profile = state.db.create_profile(&req.name, &req.config).await?;
     let _ = state.event_tx.send(ServerEvent::ConfigChanged);
     Ok((StatusCode::CREATED, Json(profile_to_response(profile))))
@@ -162,6 +201,18 @@ async fn update_profile(
     } else {
         None
     };
+
+    // Enforce the no_cert_check security policy on incoming config.
+    if let Some(ref cfg) = final_config
+        && config_disables_cert_check(cfg)
+        && !state.config.read().await.security.allow_no_cert_check
+    {
+        return Err(AppError::BadRequest(
+            "profiles cannot disable VPN server certificate verification \
+             (security.allow_no_cert_check is disabled)"
+                .to_string(),
+        ));
+    }
 
     let profile = state
         .db
@@ -293,7 +344,7 @@ async fn export_profile(
     let toml_string = toml::to_string_pretty(&toml_value)
         .map_err(|e| AppError::Internal(format!("failed to serialize TOML: {e}")))?;
 
-    let filename = format!("{}.conf", profile.name.replace(' ', "_"));
+    let filename = format!("{}.conf", sanitize_filename(&profile.name));
 
     Ok((
         [
@@ -374,4 +425,48 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/profiles/{id}/certs", post(upload_certs))
         .route("/profiles/{id}/export", get(export_profile))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sanitize_filename_strips_crlf_and_quotes() {
+        let evil = "evil\";\r\nfilename=malware";
+        let safe = sanitize_filename(evil);
+        assert!(!safe.contains('"'));
+        assert!(!safe.contains('\r'));
+        assert!(!safe.contains('\n'));
+        assert!(!safe.contains(';'));
+        // Every disallowed character is replaced by `_`, so length is preserved.
+        assert_eq!(safe.len(), evil.len());
+        // Allowed characters survive.
+        for ch in safe.chars() {
+            assert!(
+                ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'),
+                "unexpected char in sanitized output: {ch:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_sanitize_filename_keeps_safe_chars() {
+        assert_eq!(sanitize_filename("Office_VPN-1.0"), "Office_VPN-1.0");
+        assert_eq!(sanitize_filename("a b c"), "a_b_c");
+        assert_eq!(sanitize_filename(""), "profile");
+        assert_eq!(sanitize_filename("/etc/passwd"), "_etc_passwd");
+    }
+
+    #[test]
+    fn test_config_disables_cert_check_detects_true() {
+        let yes = serde_json::json!({"server": "vpn.test", "no_cert_check": true});
+        let no = serde_json::json!({"server": "vpn.test", "no_cert_check": false});
+        let absent = serde_json::json!({"server": "vpn.test"});
+        let other_type = serde_json::json!({"server": "vpn.test", "no_cert_check": "true"});
+        assert!(config_disables_cert_check(&yes));
+        assert!(!config_disables_cert_check(&no));
+        assert!(!config_disables_cert_check(&absent));
+        assert!(!config_disables_cert_check(&other_type));
+    }
 }

@@ -262,7 +262,7 @@ async fn setup_pbr(
     };
 
     // Determine container IP (our gateway in the veth network)
-    let container_ip = detect_container_ip();
+    let container_ip = detect_container_ip()?;
 
     let provisioner = Provisioner::new(&client, &routeros_config);
     provisioner.setup(&container_ip).await?;
@@ -324,18 +324,56 @@ async fn diagnostics(
     Ok(Json(result))
 }
 
-fn detect_container_ip() -> String {
-    std::process::Command::new("ip")
+/// Discover the container's IPv4 address on `eth0` by parsing
+/// `ip -4 -o addr show eth0`.
+///
+/// Returns an `Internal` error if the command fails to spawn, exits non-zero,
+/// or produces output we can't parse — the previous silent fallback to
+/// `172.19.0.2` would mask a real misconfiguration of the docker network.
+fn detect_container_ip() -> Result<String, AppError> {
+    let output = std::process::Command::new("ip")
         .args(["-4", "-o", "addr", "show", "eth0"])
         .output()
-        .ok()
-        .and_then(|o| {
-            let s = String::from_utf8_lossy(&o.stdout);
-            s.split_whitespace()
-                .nth(3)
-                .map(|cidr| cidr.split('/').next().unwrap_or("172.19.0.2").to_string())
-        })
-        .unwrap_or_else(|| "172.19.0.2".to_string())
+        .map_err(|e| {
+            tracing::error!(error = %e, "failed to spawn `ip` command");
+            AppError::Internal(format!("could not detect container IP: {e}"))
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        tracing::error!(
+            status = %output.status,
+            stderr = %stderr,
+            "`ip` command exited with non-zero status",
+        );
+        return Err(AppError::Internal(
+            "could not detect container IP from `ip` command output".to_string(),
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Format: `<idx>: <iface> inet <ip>/<prefix> ...` — column 3 (zero-indexed)
+    // is the CIDR.  Strip the prefix to leave just the address.
+    let cidr = stdout.split_whitespace().nth(3).ok_or_else(|| {
+        tracing::error!(
+            stdout = %stdout,
+            "`ip` command output did not contain a CIDR in column 3",
+        );
+        AppError::Internal("could not detect container IP from `ip` command output".to_string())
+    })?;
+
+    let ip = cidr.split('/').next().ok_or_else(|| {
+        tracing::error!(stdout = %stdout, "could not strip CIDR prefix");
+        AppError::Internal("could not detect container IP from `ip` command output".to_string())
+    })?;
+
+    // Validate it parses as an IPv4 address — guards against junk in column 3.
+    ip.parse::<std::net::Ipv4Addr>().map_err(|e| {
+        tracing::error!(stdout = %stdout, ip = %ip, error = %e, "failed to parse container IP");
+        AppError::Internal("could not detect container IP from `ip` command output".to_string())
+    })?;
+
+    Ok(ip.to_string())
 }
 
 pub fn routes() -> Router<AppState> {

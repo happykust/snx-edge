@@ -43,7 +43,10 @@ async fn user_to_response(db: &UserDb, user: &crate::db::User) -> UserResponse {
         role: user.role.clone(),
         comment: user.comment.clone(),
         enabled: user.enabled,
-        permissions: UserDb::permissions_for_role(&user.role),
+        permissions: UserDb::permissions_for_role(&user.role)
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
         created_at: user.created_at,
         updated_at: user.updated_at,
         active_sessions,
@@ -269,18 +272,21 @@ fn role_level(role: &str) -> u8 {
 
 /// Routes that require authentication (middleware applied in mod.rs).
 pub fn routes() -> Router<AppState> {
+    // Order matters: literal paths (`/users/me`, `/users/sessions`) must be
+    // registered before the `{id}` wildcard so axum's matchit router resolves
+    // them as literals rather than treating "me"/"sessions" as a user id.
     Router::new()
-        // User management (admin only via permission checks in handlers)
         .route("/users", get(list_users).post(create_user))
+        // Self-service (any authenticated user) — registered before `{id}`.
+        .route("/users/me", get(get_me))
+        .route("/users/me/password", post(change_my_password))
+        // Sessions — also literal, registered before `{id}`.
+        .route("/users/sessions", get(list_sessions))
+        .route("/users/sessions/{id}", delete(revoke_session))
+        // User management (admin only via permission checks in handlers).
         .route(
             "/users/{id}",
             get(get_user).put(update_user).delete(delete_user),
         )
         .route("/users/{id}/password", post(change_user_password))
-        // Self-service (any authenticated user)
-        .route("/users/me", get(get_me))
-        .route("/users/me/password", post(change_my_password))
-        // Sessions
-        .route("/users/sessions", get(list_sessions))
-        .route("/users/sessions/{id}", delete(revoke_session))
 }

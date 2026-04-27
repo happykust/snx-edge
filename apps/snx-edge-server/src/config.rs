@@ -9,6 +9,8 @@ pub struct AppConfig {
     pub auth: AuthConfig,
     pub routeros: RouterOsConfig,
     pub logging: LoggingConfig,
+    #[serde(default)]
+    pub security: SecurityConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -18,6 +20,27 @@ pub struct ApiConfig {
     pub tls_cert: Option<String>,
     pub tls_key: Option<String>,
     pub tls_client_ca: Option<String>,
+    /// Whitelist of CORS allowed origins. Empty list (the default) results in
+    /// a default-deny CORS policy. Each entry must be a valid HTTP `Origin`
+    /// header value, e.g. `https://gui.example.com`.
+    #[serde(default)]
+    pub cors_origins: Vec<String>,
+}
+
+/// Security policy knobs that govern how strict the server is about
+/// configuration the API accepts.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SecurityConfig {
+    /// Allow profiles to disable VPN server certificate verification via
+    /// the `no_cert_check` field. Default `false` (rejected at create/update).
+    #[serde(default)]
+    pub allow_no_cert_check: bool,
+
+    /// CIDRs whose `peer_addr` is trusted to set `X-Forwarded-For` and
+    /// `X-Real-IP`.  Empty (default) means **never** trust forwarded headers
+    /// — the request's TCP peer is used verbatim for audit logging.
+    #[serde(default)]
+    pub trusted_proxies: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

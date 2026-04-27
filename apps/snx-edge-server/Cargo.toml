@@ -34,6 +34,7 @@ rustls-webpki.workspace = true
 rustls-pemfile.workspace = true
 tokio-rustls.workspace = true
 snxcore.workspace = true
+clap.workspace = true
 
 [features]
 vendored-openssl = ["openssl/vendored"]

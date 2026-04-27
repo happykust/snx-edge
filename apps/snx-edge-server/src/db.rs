@@ -328,10 +328,13 @@ impl UserDb {
         let now = Utc::now();
 
         let conn = self.conn.lock().await;
-        conn.execute(
+        let affected = conn.execute(
             "UPDATE users SET password_hash = ?1, updated_at = ?2 WHERE id = ?3",
             params![hash, now.to_rfc3339(), id],
         )?;
+        if affected == 0 {
+            return Err(AppError::NotFound("user not found".to_string()));
+        }
         Ok(())
     }
 
@@ -429,8 +432,8 @@ impl UserDb {
                     user_id: row.get(1)?,
                     ip_address: row.get(2)?,
                     user_agent: row.get(3)?,
-                    created_at: parse_dt(row.get::<_, String>(4)?),
-                    expires_at: parse_dt(row.get::<_, String>(5)?),
+                    created_at: parse_dt(row.get::<_, String>(4)?)?,
+                    expires_at: parse_dt(row.get::<_, String>(5)?)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -490,9 +493,9 @@ impl UserDb {
     }
 
     /// Get list of permissions for a role.
-    pub fn permissions_for_role(role: &str) -> Vec<String> {
+    pub fn permissions_for_role(role: &str) -> &'static [&'static str] {
         match role {
-            "admin" => vec![
+            "admin" => &[
                 "tunnel.*",
                 "config.*",
                 "profiles.*",
@@ -502,7 +505,7 @@ impl UserDb {
                 "users.*",
                 "logs.*",
             ],
-            "operator" => vec![
+            "operator" => &[
                 "tunnel.connect",
                 "tunnel.disconnect",
                 "tunnel.status",
@@ -513,18 +516,15 @@ impl UserDb {
                 "routing.diagnostics",
                 "logs.*",
             ],
-            "viewer" => vec![
+            "viewer" => &[
                 "tunnel.status",
                 "config.read",
                 "profiles.read",
                 "routing.read",
                 "logs.read",
             ],
-            _ => vec![],
+            _ => &[],
         }
-        .into_iter()
-        .map(String::from)
-        .collect()
     }
 }
 
@@ -555,10 +555,10 @@ impl UserDb {
                 Ok(Profile {
                     id: row.get(0)?,
                     name: row.get(1)?,
-                    config: serde_json::from_str(&config_str).unwrap_or_default(),
+                    config: parse_json_config(&config_str)?,
                     enabled: row.get(3)?,
-                    created_at: parse_dt(row.get::<_, String>(4)?),
-                    updated_at: parse_dt(row.get::<_, String>(5)?),
+                    created_at: parse_dt(row.get::<_, String>(4)?)?,
+                    updated_at: parse_dt(row.get::<_, String>(5)?)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -576,14 +576,23 @@ impl UserDb {
                 Ok(Profile {
                     id: row.get(0)?,
                     name: row.get(1)?,
-                    config: serde_json::from_str(&config_str).unwrap_or_default(),
+                    config: parse_json_config(&config_str)?,
                     enabled: row.get(3)?,
-                    created_at: parse_dt(row.get::<_, String>(4)?),
-                    updated_at: parse_dt(row.get::<_, String>(5)?),
+                    created_at: parse_dt(row.get::<_, String>(4)?)?,
+                    updated_at: parse_dt(row.get::<_, String>(5)?)?,
                 })
             },
         )
-        .map_err(|_| AppError::NotFound("profile not found".to_string()))
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => {
+                AppError::NotFound("profile not found".to_string())
+            }
+            // The remaining rusqlite::Error variants are all "real" database
+            // failures (I/O, schema, type-conversion). They map uniformly to
+            // AppError::Internal via `From`, so a wildcard is appropriate here.
+            #[allow(clippy::wildcard_enum_match_arm)]
+            other => AppError::from(other),
+        })
     }
 
     /// Get the raw VPN config JSON for a profile (including secrets, for internal use).
@@ -642,14 +651,22 @@ impl UserDb {
                     Ok(Profile {
                         id: row.get(0)?,
                         name: row.get(1)?,
-                        config: serde_json::from_str(&config_str).unwrap_or_default(),
+                        config: parse_json_config(&config_str)?,
                         enabled: row.get(3)?,
-                        created_at: parse_dt(row.get::<_, String>(4)?),
-                        updated_at: parse_dt(row.get::<_, String>(5)?),
+                        created_at: parse_dt(row.get::<_, String>(4)?)?,
+                        updated_at: parse_dt(row.get::<_, String>(5)?)?,
                     })
                 },
             )
-            .map_err(|_| AppError::NotFound("profile not found".to_string()))?;
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    AppError::NotFound("profile not found".to_string())
+                }
+                // See comment above on get_profile: other variants are all
+                // genuine DB failures and collapse to AppError::Internal.
+                #[allow(clippy::wildcard_enum_match_arm)]
+                other => AppError::from(other),
+            })?;
 
         let new_name = name.unwrap_or(&existing.name);
         let new_enabled = enabled.unwrap_or(existing.enabled);
@@ -680,6 +697,7 @@ impl UserDb {
 }
 
 fn row_to_user(row: &rusqlite::Row) -> rusqlite::Result<User> {
+    let locked_until = row.get::<_, Option<String>>(7)?.map(parse_dt).transpose()?;
     Ok(User {
         id: row.get(0)?,
         username: row.get(1)?,
@@ -688,14 +706,37 @@ fn row_to_user(row: &rusqlite::Row) -> rusqlite::Result<User> {
         comment: row.get(4)?,
         enabled: row.get(5)?,
         failed_login_attempts: row.get(6)?,
-        locked_until: row.get::<_, Option<String>>(7)?.map(parse_dt),
-        created_at: parse_dt(row.get::<_, String>(8)?),
-        updated_at: parse_dt(row.get::<_, String>(9)?),
+        locked_until,
+        created_at: parse_dt(row.get::<_, String>(8)?)?,
+        updated_at: parse_dt(row.get::<_, String>(9)?)?,
     })
 }
 
-fn parse_dt(s: String) -> DateTime<Utc> {
+fn parse_dt(s: String) -> rusqlite::Result<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(&s)
         .map(|d| d.to_utc())
-        .unwrap_or_default()
+        .map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+        })
+}
+
+fn parse_json_config(s: &str) -> rusqlite::Result<serde_json::Value> {
+    serde_json::from_str(s).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_dt_returns_error_on_invalid_input() {
+        assert!(parse_dt("not-a-date".to_string()).is_err());
+    }
+
+    #[test]
+    fn parse_dt_succeeds_on_valid_rfc3339() {
+        assert!(parse_dt("2024-01-01T00:00:00Z".to_string()).is_ok());
+    }
 }

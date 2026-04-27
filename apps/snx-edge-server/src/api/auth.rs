@@ -1,5 +1,8 @@
-use axum::extract::State;
+use std::net::{IpAddr, SocketAddr};
+
+use axum::extract::{ConnectInfo, FromRequestParts, State};
 use axum::http::HeaderMap;
+use axum::http::request::Parts;
 use axum::routing::post;
 use axum::{Json, Router};
 use chrono::{Duration, Utc};
@@ -7,6 +10,7 @@ use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::config::AppConfig;
 use crate::db::UserDb;
 use crate::error::AppError;
 use crate::state::AppState;
@@ -48,8 +52,34 @@ pub struct RefreshRequest {
 
 // === Handlers ===
 
+/// Wrapper around `ConnectInfo<SocketAddr>` that yields `None` instead of
+/// rejecting the request when the extension is missing.
+///
+/// `ConnectInfo` itself does not implement `OptionalFromRequestParts`, so
+/// `Option<ConnectInfo<SocketAddr>>` does not compile. Test harnesses (e.g.
+/// `tower::ServiceExt::oneshot`) drive the router without
+/// `into_make_service_with_connect_info`, so we need to tolerate its absence.
+struct OptPeerAddr(Option<SocketAddr>);
+
+impl<S> FromRequestParts<S> for OptPeerAddr
+where
+    S: Send + Sync,
+{
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        Ok(Self(
+            parts
+                .extensions
+                .get::<ConnectInfo<SocketAddr>>()
+                .map(|ci| ci.0),
+        ))
+    }
+}
+
 async fn login(
     State(state): State<AppState>,
+    OptPeerAddr(peer_addr): OptPeerAddr,
     headers: HeaderMap,
     Json(req): Json<LoginRequest>,
 ) -> Result<Json<TokenResponse>, AppError> {
@@ -97,7 +127,10 @@ async fn login(
     // Reset failed attempts on successful login
     state.db.reset_failed_logins(&user.id).await?;
 
-    let ip = extract_client_ip(&headers);
+    let ip = {
+        let cfg = state.config.read().await;
+        extract_client_ip(&headers, peer_addr, &cfg)
+    };
     let user_agent = headers
         .get("user-agent")
         .and_then(|v| v.to_str().ok())
@@ -116,6 +149,7 @@ async fn login(
 
 async fn refresh(
     State(state): State<AppState>,
+    OptPeerAddr(peer_addr): OptPeerAddr,
     headers: HeaderMap,
     Json(req): Json<RefreshRequest>,
 ) -> Result<Json<TokenResponse>, AppError> {
@@ -139,7 +173,10 @@ async fn refresh(
         return Err(AppError::Unauthorized("account disabled".to_string()));
     }
 
-    let ip = extract_client_ip(&headers);
+    let ip = {
+        let cfg = state.config.read().await;
+        extract_client_ip(&headers, peer_addr, &cfg)
+    };
     let user_agent = headers
         .get("user-agent")
         .and_then(|v| v.to_str().ok())
@@ -170,7 +207,10 @@ async fn issue_tokens(
     let refresh_ttl_days = config.auth.refresh_token_ttl_days;
     drop(config);
 
-    let permissions = UserDb::permissions_for_role(role);
+    let permissions: Vec<String> = UserDb::permissions_for_role(role)
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
     let now = Utc::now();
 
     // Access token
@@ -272,22 +312,263 @@ pub fn has_permission(claims: &Claims, required: &str) -> bool {
     })
 }
 
-/// Extract client IP from X-Forwarded-For or X-Real-IP headers.
-fn extract_client_ip(headers: &HeaderMap) -> Option<String> {
-    headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.split(',').next().unwrap_or(s).trim().to_string())
-        .or_else(|| {
-            headers
-                .get("x-real-ip")
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_string())
-        })
+/// Extract the client IP address for audit logging.
+///
+/// `X-Forwarded-For` / `X-Real-IP` are only honoured when the request's TCP
+/// `peer_addr` matches one of `security.trusted_proxies` (CIDR strings).
+/// Otherwise the peer address is used directly — this prevents an attacker
+/// from spoofing audit-log IPs by setting their own forwarded-for header.
+///
+/// If `peer_addr` is `None` (e.g. running under a test harness that doesn't
+/// supply `ConnectInfo`) the function falls back to the headers, since there
+/// is no peer to trust against.
+fn extract_client_ip(
+    headers: &HeaderMap,
+    peer_addr: Option<SocketAddr>,
+    config: &AppConfig,
+) -> Option<String> {
+    let trust_proxy = match peer_addr {
+        Some(peer) => peer_in_trusted_proxies(peer.ip(), &config.security.trusted_proxies),
+        None => true, // tests / no ConnectInfo: best-effort header fallback
+    };
+
+    if trust_proxy {
+        if let Some(ip) = headers
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.split(',').next().unwrap_or(s).trim().to_string())
+            .filter(|s| !s.is_empty())
+        {
+            return Some(ip);
+        }
+        if let Some(ip) = headers
+            .get("x-real-ip")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty())
+        {
+            return Some(ip);
+        }
+    }
+
+    peer_addr.map(|p| p.ip().to_string())
+}
+
+/// Returns `true` if `addr` falls inside any of the `cidrs` (each `"ip/prefix"`).
+///
+/// Inline parser to avoid adding the `ipnet` crate just for this. Bad CIDR
+/// strings are silently skipped — admins should validate config before deploy
+/// and we don't want a bad config entry to fail-open.
+fn peer_in_trusted_proxies(addr: IpAddr, cidrs: &[String]) -> bool {
+    cidrs.iter().any(|cidr| cidr_contains(cidr, addr))
+}
+
+fn cidr_contains(cidr: &str, addr: IpAddr) -> bool {
+    let (net_str, prefix_str) = match cidr.split_once('/') {
+        Some(parts) => parts,
+        // No prefix: treat as a single-host match.
+        None => return cidr.parse::<IpAddr>().map(|n| n == addr).unwrap_or(false),
+    };
+
+    let Ok(network) = net_str.parse::<IpAddr>() else {
+        return false;
+    };
+    let Ok(prefix) = prefix_str.parse::<u8>() else {
+        return false;
+    };
+
+    match (network, addr) {
+        (IpAddr::V4(net), IpAddr::V4(host)) => {
+            if prefix > 32 {
+                return false;
+            }
+            let mask = if prefix == 0 {
+                0u32
+            } else {
+                u32::MAX << (32 - prefix)
+            };
+            (u32::from(net) & mask) == (u32::from(host) & mask)
+        }
+        (IpAddr::V6(net), IpAddr::V6(host)) => {
+            if prefix > 128 {
+                return false;
+            }
+            let mask = if prefix == 0 {
+                0u128
+            } else {
+                u128::MAX << (128 - prefix)
+            };
+            (u128::from(net) & mask) == (u128::from(host) & mask)
+        }
+        // Mixed-family CIDR/peer comparisons can never match.
+        (IpAddr::V4(_), IpAddr::V6(_)) | (IpAddr::V6(_), IpAddr::V4(_)) => false,
+    }
 }
 
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/auth/login", post(login))
         .route("/auth/refresh", post(refresh))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    #[test]
+    fn cidr_contains_ipv4_match() {
+        assert!(cidr_contains(
+            "10.0.0.0/8",
+            IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3))
+        ));
+        assert!(cidr_contains(
+            "192.168.1.0/24",
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 200))
+        ));
+    }
+
+    #[test]
+    fn cidr_contains_ipv4_miss() {
+        assert!(!cidr_contains(
+            "10.0.0.0/8",
+            IpAddr::V4(Ipv4Addr::new(11, 0, 0, 1))
+        ));
+        assert!(!cidr_contains(
+            "192.168.1.0/24",
+            IpAddr::V4(Ipv4Addr::new(192, 168, 2, 1))
+        ));
+    }
+
+    #[test]
+    fn cidr_contains_zero_prefix_matches_all_v4() {
+        // /0 must match everything in the same family without overshifting.
+        assert!(cidr_contains(
+            "0.0.0.0/0",
+            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))
+        ));
+    }
+
+    #[test]
+    fn cidr_contains_full_prefix_is_exact_host() {
+        assert!(cidr_contains(
+            "192.0.2.5/32",
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 5))
+        ));
+        assert!(!cidr_contains(
+            "192.0.2.5/32",
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 6))
+        ));
+    }
+
+    #[test]
+    fn cidr_contains_rejects_garbage() {
+        assert!(!cidr_contains(
+            "not-a-cidr",
+            IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))
+        ));
+        assert!(!cidr_contains(
+            "10.0.0.0/zz",
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))
+        ));
+        assert!(!cidr_contains(
+            "10.0.0.0/40",
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))
+        ));
+    }
+
+    #[test]
+    fn cidr_contains_mixed_family_is_false() {
+        let v6 = "::1".parse::<IpAddr>().unwrap();
+        assert!(!cidr_contains("10.0.0.0/8", v6));
+    }
+
+    #[test]
+    fn extract_client_ip_distrusts_untrusted_peer() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "1.2.3.4".parse().unwrap());
+
+        let cfg = test_config(&[]);
+        let peer: SocketAddr = "203.0.113.7:54321".parse().unwrap();
+        let ip = extract_client_ip(&headers, Some(peer), &cfg);
+        assert_eq!(ip.as_deref(), Some("203.0.113.7"));
+    }
+
+    #[test]
+    fn extract_client_ip_trusts_listed_proxy_for_xff() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "1.2.3.4".parse().unwrap());
+
+        let cfg = test_config(&["10.0.0.0/8"]);
+        let peer: SocketAddr = "10.5.5.5:80".parse().unwrap();
+        let ip = extract_client_ip(&headers, Some(peer), &cfg);
+        assert_eq!(ip.as_deref(), Some("1.2.3.4"));
+    }
+
+    #[test]
+    fn extract_client_ip_takes_first_xff_hop() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "1.2.3.4, 5.6.7.8".parse().unwrap());
+
+        let cfg = test_config(&["10.0.0.0/8"]);
+        let peer: SocketAddr = "10.5.5.5:80".parse().unwrap();
+        let ip = extract_client_ip(&headers, Some(peer), &cfg);
+        assert_eq!(ip.as_deref(), Some("1.2.3.4"));
+    }
+
+    #[test]
+    fn extract_client_ip_falls_back_to_x_real_ip() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-real-ip", "9.9.9.9".parse().unwrap());
+
+        let cfg = test_config(&["10.0.0.0/8"]);
+        let peer: SocketAddr = "10.5.5.5:80".parse().unwrap();
+        let ip = extract_client_ip(&headers, Some(peer), &cfg);
+        assert_eq!(ip.as_deref(), Some("9.9.9.9"));
+    }
+
+    /// Build a minimal `AppConfig` for unit tests.
+    fn test_config(trusted: &[&str]) -> AppConfig {
+        AppConfig {
+            api: crate::config::ApiConfig {
+                listen: "127.0.0.1:0".to_string(),
+                tls_cert: None,
+                tls_key: None,
+                tls_client_ca: None,
+                cors_origins: vec![],
+            },
+            auth: crate::config::AuthConfig {
+                jwt_secret_env: "TEST".to_string(),
+                user_db: ":memory:".to_string(),
+                max_login_attempts: 5,
+                lockout_duration_minutes: 15,
+                access_token_ttl_minutes: 15,
+                refresh_token_ttl_days: 7,
+            },
+            routeros: crate::config::RouterOsConfig {
+                host_env: String::new(),
+                user_env: String::new(),
+                password_env: String::new(),
+                tls_skip_verify: false,
+                comment_tag: String::new(),
+                address_list_vpn: String::new(),
+                address_list_bypass: String::new(),
+                routing_table: String::new(),
+                connection_mark: String::new(),
+                routing_mark: String::new(),
+                auto_setup: false,
+            },
+            logging: crate::config::LoggingConfig {
+                level: "info".to_string(),
+                buffer_size: 0,
+                file: None,
+                max_file_size: String::new(),
+                max_files: 0,
+            },
+            security: crate::config::SecurityConfig {
+                allow_no_cert_check: false,
+                trusted_proxies: trusted.iter().map(|s| (*s).to_string()).collect(),
+            },
+        }
+    }
 }

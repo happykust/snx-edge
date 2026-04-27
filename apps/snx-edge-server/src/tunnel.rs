@@ -1,3 +1,5 @@
+#![deny(clippy::wildcard_enum_match_arm)]
+
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -155,14 +157,38 @@ pub struct TunnelStatus {
 
 // === Conversion from snxcore types ===
 
+/// Map `snxcore::model::params::TunnelType` to a stable wire-format string.
+///
+/// Using an explicit match (rather than `format!("{:?}", ...)`) decouples the
+/// API contract from snxcore's `Debug` derive — a future rename of an enum
+/// variant upstream would otherwise silently change the public API.
+fn tunnel_type_str(t: TunnelType) -> &'static str {
+    match t {
+        TunnelType::Ipsec => "ipsec",
+        TunnelType::Ssl => "ssl",
+    }
+}
+
+/// Map `snxcore::model::params::TransportType` to a stable wire-format string.
+///
+/// See [`tunnel_type_str`] for rationale.
+fn transport_type_str(t: TransportType) -> &'static str {
+    match t {
+        TransportType::AutoDetect => "auto",
+        TransportType::Kernel => "kernel",
+        TransportType::Udp => "udp",
+        TransportType::Tcpt => "tcpt",
+    }
+}
+
 fn map_connection_info(info: &snxcore::model::ConnectionInfo, mtu: u16) -> ConnectionInfo {
     ConnectionInfo {
         since: info.since.map(|dt| dt.to_utc()),
         server_name: info.server_name.clone(),
         username: info.username.clone(),
         login_type: info.login_type.clone(),
-        tunnel_type: format!("{:?}", info.tunnel_type).to_lowercase(),
-        transport_type: format!("{:?}", info.transport_type).to_lowercase(),
+        tunnel_type: tunnel_type_str(info.tunnel_type).to_string(),
+        transport_type: transport_type_str(info.transport_type).to_string(),
         ip_address: info.ip_address.to_string(),
         dns_servers: info.dns_servers.iter().map(|d| d.to_string()).collect(),
         search_domains: info.search_domains.iter().map(|d| d.to_string()).collect(),
@@ -435,7 +461,11 @@ impl TunnelManager {
                             info.ip_address = addr.to_string();
                         }
                     }
-                    _ => {}
+                    // Forwarded above to `handle_tunnel_event`; nothing else
+                    // for us to do at the API layer.
+                    event @ TunnelEvent::RekeyCheck | event @ TunnelEvent::RemoteControlData(_) => {
+                        tracing::debug!(?event, "unhandled tunnel event");
+                    }
                 }
             }
         });
@@ -547,5 +577,42 @@ impl TunnelManager {
         let _ = self.event_tx.send(ServerEvent::ConnectionStatus {
             status: status_str.to_string(),
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! These tests guard the wire-format strings exposed by the API for
+    //! `tunnel_type` and `transport_type`.  An snxcore upgrade that renames
+    //! a `Debug`-derived variant must NOT silently change our public API —
+    //! that's exactly the bug an explicit `match` was added to prevent.
+    use super::{transport_type_str, tunnel_type_str};
+    use snxcore::model::params::{TransportType, TunnelType};
+
+    #[test]
+    fn tunnel_type_strings_are_stable() {
+        assert_eq!(tunnel_type_str(TunnelType::Ipsec), "ipsec");
+        assert_eq!(tunnel_type_str(TunnelType::Ssl), "ssl");
+    }
+
+    #[test]
+    fn transport_type_strings_are_stable() {
+        assert_eq!(transport_type_str(TransportType::AutoDetect), "auto");
+        assert_eq!(transport_type_str(TransportType::Kernel), "kernel");
+        assert_eq!(transport_type_str(TransportType::Udp), "udp");
+        assert_eq!(transport_type_str(TransportType::Tcpt), "tcpt");
+    }
+
+    #[test]
+    fn tunnel_type_default_maps_to_ipsec() {
+        // If snxcore changes the default, our API contract should also be
+        // explicitly considered — surface that via a test rather than a
+        // silent change.
+        assert_eq!(tunnel_type_str(TunnelType::default()), "ipsec");
+    }
+
+    #[test]
+    fn transport_type_default_maps_to_auto() {
+        assert_eq!(transport_type_str(TransportType::default()), "auto");
     }
 }

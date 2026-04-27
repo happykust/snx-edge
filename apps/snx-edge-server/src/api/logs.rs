@@ -35,6 +35,11 @@ pub struct LogBuffer {
 
 impl LogBuffer {
     pub fn new(capacity: usize) -> Self {
+        // `push` does `self.write_pos = (self.write_pos + 1) % self.capacity`,
+        // which panics with divide-by-zero when capacity == 0. Reject that
+        // case up-front so the panic happens at construction, not on first
+        // log entry.
+        assert!(capacity > 0, "LogBuffer capacity must be > 0");
         Self {
             entries: Vec::with_capacity(capacity),
             capacity,

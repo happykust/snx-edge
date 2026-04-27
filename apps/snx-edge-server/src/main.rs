@@ -11,6 +11,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::Context;
+use clap::Parser;
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use tracing_subscriber::EnvFilter;
@@ -19,16 +20,19 @@ use tracing_subscriber::util::SubscriberInitExt;
 
 use crate::api::logs::new_log_buffer;
 
+/// snx-edge-server — headless Check Point VPN client with management API.
+#[derive(Parser, Debug)]
+#[command(name = "snx-edge-server", version, about, long_about = None)]
+struct Cli {
+    /// Path to the TOML configuration file
+    #[arg(long, default_value = "/etc/snx-edge/config.toml")]
+    config: String,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let config_path = {
-        let args: Vec<String> = std::env::args().collect();
-        args.iter()
-            .position(|a| a == "--config")
-            .and_then(|i| args.get(i + 1))
-            .cloned()
-            .unwrap_or_else(|| "/etc/snx-edge/config.toml".to_string())
-    };
+    let cli = Cli::parse();
+    let config_path = cli.config;
 
     let config = config::AppConfig::load(&config_path)
         .with_context(|| format!("failed to load config from {config_path}"))?;
@@ -71,13 +75,20 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!("listening on {listen_addr} (TLS)");
         }
 
+        // `into_make_service_with_connect_info::<SocketAddr>()` exposes the
+        // peer address as `ConnectInfo<SocketAddr>` to handlers — required by
+        // the auth layer's trusted-proxy check (`SecurityConfig.trusted_proxies`).
         axum_server::bind_rustls(listen_addr, rustls_config)
-            .serve(router.into_make_service())
+            .serve(router.into_make_service_with_connect_info::<SocketAddr>())
             .await?;
     } else {
         tracing::info!("listening on {listen_addr} (plain HTTP)");
         let listener = TcpListener::bind(listen_addr).await?;
-        axum::serve(listener, router).await?;
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await?;
     }
 
     Ok(())

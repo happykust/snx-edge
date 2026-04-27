@@ -8,6 +8,8 @@ listen = "0.0.0.0:8080"
 # tls_cert = "/etc/snx-edge/tls/server.crt"
 # tls_key = "/etc/snx-edge/tls/server.key"
 # tls_client_ca = "/etc/snx-edge/tls/ca.crt"  # enables mTLS
+# CORS whitelist for browser callers. Empty list (the default) is default-deny.
+# cors_origins = ["https://gui.example.com"]
 
 [auth]
 jwt_secret_env = "SNX_EDGE_JWT_SECRET"
@@ -36,3 +38,12 @@ buffer_size = 10000
 # file = "/var/log/snx-edge/snx-edge.log"
 # max_file_size = "10MB"
 # max_files = 3
+
+[security]
+# Allow profiles to disable VPN server certificate verification via the
+# `no_cert_check` field. Default `false` — profiles attempting to set
+# `no_cert_check = true` are rejected at create/update with HTTP 400.
+allow_no_cert_check = false
+# CIDRs whose peer_addr is trusted to set X-Forwarded-For / X-Real-IP.
+# Empty list (the default) means forwarded headers are never trusted.
+# trusted_proxies = ["127.0.0.1/32"]

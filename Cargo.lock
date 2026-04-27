@@ -3913,6 +3913,7 @@ dependencies = [
  "axum-server",
  "bcrypt",
  "chrono",
+ "clap",
  "futures-util",
  "jsonwebtoken",
  "openssl",
