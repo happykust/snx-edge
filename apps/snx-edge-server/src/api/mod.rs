@@ -20,8 +20,11 @@ use crate::state::AppState;
 
 /// Build the complete API router.
 pub fn router(state: AppState) -> Router {
-    // Public routes (no auth required)
-    let public = Router::new().merge(health::routes()).merge(auth::routes());
+    // Public routes (no auth required). `auth::routes` carries its own
+    // per-IP rate-limit layer; `health::routes` does not.
+    let public = Router::new()
+        .merge(health::routes())
+        .merge(auth::routes(&state));
 
     // Protected routes (JWT auth required)
     let protected = Router::new()

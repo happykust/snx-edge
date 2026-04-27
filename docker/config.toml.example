@@ -7,7 +7,25 @@
 listen = "0.0.0.0:8080"
 # tls_cert = "/etc/snx-edge/tls/server.crt"
 # tls_key = "/etc/snx-edge/tls/server.key"
-# tls_client_ca = "/etc/snx-edge/tls/ca.crt"  # enables mTLS
+#
+# --- mTLS posture: pick AT MOST ONE of the two below ---
+#
+# tls_client_ca_optional: client certs are verified against this CA *if* the
+# client presents one, but a missing cert still completes the TLS handshake.
+# JWT remains the only authentication gate. Use this only if you have a
+# specific reason to inspect/log client certs without enforcing them.
+#
+# tls_client_ca_optional = "/etc/snx-edge/tls/ca.crt"
+#
+# require_client_cert: TLS handshake fails for any client that does not
+# present a valid certificate chained to this CA. Provides defence in depth
+# on top of JWT — recommended whenever the API is reachable from untrusted
+# networks. Note: callers without a cert (e.g. ad-hoc curl health checks)
+# will be rejected at the TLS layer; serve `/health` via a separate
+# listener if you need an unauthenticated probe path.
+#
+# require_client_cert = "/etc/snx-edge/tls/ca.crt"
+#
 # CORS whitelist for browser callers. Empty list (the default) is default-deny.
 # cors_origins = ["https://gui.example.com"]
 
@@ -47,6 +65,23 @@ allow_no_cert_check = false
 # CIDRs whose peer_addr is trusted to set X-Forwarded-For / X-Real-IP.
 # Empty list (the default) means forwarded headers are never trusted.
 # trusted_proxies = ["127.0.0.1/32"]
+# Per-IP rate limit on /auth/login and /auth/refresh. After `login_burst`
+# requests in quick succession, callers from the same peer IP are throttled
+# to `login_rps` requests/sec. Defaults: 1 rps with a burst of 10 — high
+# enough not to hit humans retrying typos, low enough to defang automated
+# credential-stuffing.
+# login_rps = 1
+# login_burst = 10
+# Enforce the JWT `gen` (token generation) check in require_auth. Default
+# `true` — bumping the counter (delete_user, change_password,
+# revoke-tokens, revoke-session) invalidates outstanding access tokens
+# within at most 30s. Set to `false` for emergency rollback if needed.
+# enforce_token_generation = true
+# Name of the env var holding a 32-byte ChaCha20-Poly1305 key (base64 or
+# hex) used to encrypt VPN profile passwords at rest in `users.db`. When
+# unset the server runs in legacy plaintext mode for backwards
+# compatibility — existing installs keep working.
+# profile_encryption_key_env = "SNX_EDGE_PROFILE_KEY"
 
 [shutdown]
 # On graceful shutdown (SIGTERM/SIGINT), run Provisioner::teardown to remove

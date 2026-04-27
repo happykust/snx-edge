@@ -1,6 +1,7 @@
 pub mod api;
 pub mod config;
 pub mod db;
+pub mod db_secrets;
 pub mod error;
 pub mod log_layer;
 pub mod routeros;

@@ -158,6 +158,10 @@ async fn delete_user(
     }
 
     state.db.delete_user(&id).await?;
+    // The user row is gone, so the require_auth middleware's lookup will
+    // fail and return 401. Drop any cached generation entry so a stale entry
+    // doesn't accidentally let a token through during the 30s TTL window.
+    state.refresh_token_generation_cache(&id, None).await;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
@@ -195,8 +199,13 @@ async fn change_user_password(
     // else: admin changing another user's password — no current_password needed
 
     state.db.change_password(&id, &req.new_password).await?;
-    // Invalidate all sessions for this user
+    // Invalidate all sessions for this user (revokes refresh tokens) and
+    // refresh the generation cache so already-issued access tokens fail at
+    // the next request rather than waiting out the 30s TTL.
     state.db.delete_user_sessions(&id).await?;
+    if let Ok(g) = state.db.get_token_generation(&id).await {
+        state.refresh_token_generation_cache(&id, Some(g)).await;
+    }
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
@@ -236,8 +245,16 @@ async fn change_my_password(
         .db
         .change_password(&claims.sub, &req.new_password)
         .await?;
-    // Invalidate all sessions after password change
+    // Invalidate all sessions after password change.
     state.db.delete_user_sessions(&claims.sub).await?;
+    // Refresh the generation cache so the user's outstanding access tokens
+    // (including the one used to make this very request, on its next reuse)
+    // start failing immediately rather than waiting out the cache TTL.
+    if let Ok(g) = state.db.get_token_generation(&claims.sub).await {
+        state
+            .refresh_token_generation_cache(&claims.sub, Some(g))
+            .await;
+    }
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
@@ -256,7 +273,51 @@ async fn revoke_session(
     Path(session_id): Path<String>,
 ) -> Result<axum::http::StatusCode, AppError> {
     require_permission(&claims, "users.sessions")?;
+
+    // Look up the session's owner before deletion so we can bump that
+    // user's `token_generation` — without the bump, only the refresh token
+    // dies, but their outstanding access token would still pass middleware
+    // checks for up to access_token_ttl_minutes.
+    let owner = state.db.session_owner(&session_id).await.ok().flatten();
+
     state.db.delete_session(&session_id).await?;
+
+    if let Some(user_id) = owner
+        && let Ok(Some(g)) = state.db.bump_token_generation(&user_id).await
+    {
+        state
+            .refresh_token_generation_cache(&user_id, Some(g))
+            .await;
+    }
+
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+/// POST /api/v1/users/{id}/revoke-tokens — admin-only: bump the user's
+/// `token_generation` so all outstanding JWT access tokens are rejected by
+/// the middleware. Refresh sessions are not touched here (use the existing
+/// `/users/{id}/password` if you also want to log them out of refresh).
+async fn revoke_user_tokens(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    Path(id): Path<String>,
+) -> Result<axum::http::StatusCode, AppError> {
+    if claims.role != "admin" {
+        return Err(AppError::Forbidden(
+            "only admins can revoke other users' tokens".to_string(),
+        ));
+    }
+
+    let new_gen = state
+        .db
+        .bump_token_generation(&id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("user not found".to_string()))?;
+
+    state
+        .refresh_token_generation_cache(&id, Some(new_gen))
+        .await;
+
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
@@ -289,4 +350,5 @@ pub fn routes() -> Router<AppState> {
             get(get_user).put(update_user).delete(delete_user),
         )
         .route("/users/{id}/password", post(change_user_password))
+        .route("/users/{id}/revoke-tokens", post(revoke_user_tokens))
 }

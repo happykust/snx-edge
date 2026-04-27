@@ -1,18 +1,27 @@
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 
+use axum::body::Body;
 use axum::extract::{ConnectInfo, FromRequestParts, State};
 use axum::http::HeaderMap;
+use axum::http::Request as HttpRequest;
 use axum::http::request::Parts;
+use axum::http::{Response as HttpResponse, StatusCode};
 use axum::routing::post;
 use axum::{Json, Router};
 use chrono::{Duration, Utc};
 use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
+use tower_governor::GovernorLayer;
+use tower_governor::errors::GovernorError;
+use tower_governor::governor::GovernorConfigBuilder;
+use tower_governor::key_extractor::{KeyExtractor, PeerIpKeyExtractor};
 use uuid::Uuid;
 
 use crate::config::AppConfig;
 use crate::db::UserDb;
 use crate::error::AppError;
+use crate::error::ProblemDetails;
 use crate::state::AppState;
 
 // === JWT Claims ===
@@ -27,6 +36,18 @@ pub struct Claims {
     pub jti: String,
     /// "access" or "refresh"
     pub token_type: String,
+    /// Snapshot of `users.token_generation` at the moment this token was
+    /// issued. The `require_auth` middleware compares the JWT's `gen` against
+    /// the user's current value and returns 401 when they differ — that's
+    /// how `delete_user`, `change_password`, etc., revoke outstanding access
+    /// tokens before their natural TTL.
+    ///
+    /// `default` so legacy tokens issued before the field was added (no `gen`
+    /// claim in the JWT body) decode as `gen = 0`. They will still be rejected
+    /// once the user's counter is bumped above 0, which is the desired
+    /// behaviour: a server upgrade fast-tracks tokens to the revocable scheme.
+    #[serde(default, rename = "gen")]
+    pub token_generation: i64,
 }
 
 // === Request/Response types ===
@@ -127,6 +148,14 @@ async fn login(
     // Reset failed attempts on successful login
     state.db.reset_failed_logins(&user.id).await?;
 
+    // Transparent bcrypt cost upgrade. If the stored hash was generated at a
+    // weaker cost (we shipped 12, target is now `BCRYPT_COST` = 13) re-hash
+    // the verified plaintext at the new cost in the background. We never
+    // fail the login if this fails — the user is already authenticated — and
+    // we don't bump `token_generation` because the password didn't change,
+    // only its on-disk encoding did.
+    rehash_if_outdated(&state, &user.id, &req.password, &user.password_hash).await;
+
     let ip = {
         let cfg = state.config.read().await;
         extract_client_ip(&headers, peer_addr, &cfg)
@@ -145,6 +174,51 @@ async fn login(
     )
     .await?;
     Ok(Json(tokens))
+}
+
+/// Best-effort: re-hash the user's password at `BCRYPT_COST` if the stored
+/// hash was generated at a lower cost. Logs and swallows every error.
+async fn rehash_if_outdated(state: &AppState, user_id: &str, plaintext: &str, stored_hash: &str) {
+    use bcrypt::HashParts;
+    use std::str::FromStr;
+
+    let cost = match HashParts::from_str(stored_hash) {
+        Ok(parts) => parts.get_cost(),
+        Err(e) => {
+            tracing::warn!(error = %e, "could not parse bcrypt hash for rehash decision");
+            return;
+        }
+    };
+    if cost >= crate::db::BCRYPT_COST {
+        return;
+    }
+
+    let plaintext = plaintext.to_string();
+    let new_hash =
+        match tokio::task::spawn_blocking(move || bcrypt::hash(&plaintext, crate::db::BCRYPT_COST))
+            .await
+        {
+            Ok(Ok(h)) => h,
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "bcrypt rehash failed; will retry on next login");
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "bcrypt rehash join error; will retry on next login");
+                return;
+            }
+        };
+
+    if let Err(e) = state.db.set_password_hash_silent(user_id, &new_hash).await {
+        tracing::warn!(error = %e, "bcrypt rehash persist failed; will retry on next login");
+    } else {
+        tracing::info!(
+            user_id = %user_id,
+            from_cost = cost,
+            to_cost = crate::db::BCRYPT_COST,
+            "transparent bcrypt rehash complete"
+        );
+    }
 }
 
 async fn refresh(
@@ -213,6 +287,11 @@ async fn issue_tokens(
         .collect();
     let now = Utc::now();
 
+    // Snapshot the user's current token generation so it travels in the JWT
+    // — the middleware later compares it against the live value to catch
+    // tokens issued before a revocation.
+    let token_generation = state.db.get_token_generation(user_id).await?;
+
     // Access token
     let access_exp = now + Duration::minutes(access_ttl_min as i64);
     let access_jti = Uuid::new_v4().to_string();
@@ -224,6 +303,7 @@ async fn issue_tokens(
         iat: now.timestamp(),
         jti: access_jti,
         token_type: "access".to_string(),
+        token_generation,
     };
 
     // Refresh token
@@ -237,6 +317,7 @@ async fn issue_tokens(
         iat: now.timestamp(),
         jti: refresh_jti.clone(),
         token_type: "refresh".to_string(),
+        token_generation,
     };
 
     let key = EncodingKey::from_secret(state.jwt_secret.as_bytes());
@@ -265,14 +346,18 @@ pub fn decode_token(secret: &str, token: &str) -> Result<Claims, AppError> {
 
 /// Axum middleware: extract and validate JWT from Authorization header.
 ///
-/// NOTE: Access tokens are stateless JWTs -- they are NOT checked against
-/// the database on every request.  This means an access token remains
-/// valid for up to `access_token_ttl_minutes` (default 15 min) after the
-/// owning user is deleted or has all sessions revoked.  This is an
-/// intentional tradeoff: it avoids a DB round-trip on every authenticated
-/// request while keeping the exposure window short.  Refresh tokens *are*
-/// validated against stored sessions, so revocation takes full effect once
-/// the current access token expires.
+/// Access tokens are JWTs but are no longer purely stateless: the middleware
+/// also validates the JWT's `gen` (token generation) claim against the
+/// owner's current value via a 30s TTL cache (see `state::TokenGenCache`).
+/// Bumping the counter — by `delete_user`, `change_password`,
+/// `revoke-all-sessions`, or the explicit `/users/{id}/revoke-tokens`
+/// endpoint — therefore invalidates every outstanding access token within
+/// at most 30 seconds, without forcing a DB round-trip on every request.
+///
+/// The check is gated by `[security].enforce_token_generation` (default
+/// `true`). Setting it to `false` falls back to the pre-5.3 behaviour where
+/// access tokens live their full natural TTL after revocation — useful as
+/// an emergency rollback if the cache or DB lookup misbehaves.
 pub async fn require_auth(
     State(state): State<AppState>,
     mut request: axum::extract::Request,
@@ -294,8 +379,52 @@ pub async fn require_auth(
         return Err(AppError::Unauthorized("not an access token".to_string()));
     }
 
+    // Token-generation revocation check.
+    let enforce = state.config.read().await.security.enforce_token_generation;
+    if enforce {
+        let current = lookup_token_generation(&state, &claims.sub).await?;
+        if current != claims.token_generation {
+            return Err(AppError::Unauthorized("token revoked".to_string()));
+        }
+    }
+
     request.extensions_mut().insert(claims);
     Ok(next.run(request).await)
+}
+
+/// Token-generation lookup with a 30s TTL cache. The cache is per-user-id;
+/// counter-bump call sites (in `users.rs` and elsewhere) refresh the entry
+/// directly so the next request sees the new value without the TTL race.
+///
+/// A user that no longer exists in the database (deleted) returns 401 — we
+/// treat the missing row as "revoked" rather than "not found" to honour the
+/// `delete_user` revocation semantics.
+async fn lookup_token_generation(state: &AppState, user_id: &str) -> Result<i64, AppError> {
+    const CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+    {
+        let cache = state.token_gen_cache.read().await;
+        if let Some(entry) = cache.get(user_id)
+            && entry.fetched_at.elapsed() < CACHE_TTL
+        {
+            return Ok(entry.generation);
+        }
+    }
+
+    // Miss or expired — refresh from DB. Treat a deleted user as "token
+    // revoked" rather than "not found" so we don't leak existence info on
+    // the hot auth path.
+    let gen_ = state
+        .db
+        .get_token_generation(user_id)
+        .await
+        .map_err(|_| AppError::Unauthorized("token revoked".to_string()))?;
+
+    state
+        .refresh_token_generation_cache(user_id, Some(gen_))
+        .await;
+
+    Ok(gen_)
 }
 
 /// Check if the current user has a specific permission.
@@ -405,10 +534,127 @@ fn cidr_contains(cidr: &str, addr: IpAddr) -> bool {
     }
 }
 
-pub fn routes() -> Router<AppState> {
+/// `KeyExtractor` that prefers the request's TCP peer IP and falls back to
+/// a synthetic key when peer info is unavailable.
+///
+/// `PeerIpKeyExtractor` (the upstream default) requires a `ConnectInfo<SocketAddr>`
+/// extension on the request. In production we install
+/// `into_make_service_with_connect_info::<SocketAddr>()` so that's present.
+/// In test harnesses (`tower::ServiceExt::oneshot`) the extension is missing
+/// and the extractor would otherwise return `UnableToExtractKey` — which
+/// `tower-governor` translates into `BadRequest` and fails the request.
+///
+/// We deliberately fail-open here: rate-limiting infrastructure must not be
+/// the thing that breaks legitimate requests when peer info is missing for
+/// any reason (test runs, exotic transports, etc.). Real attackers will
+/// always have a peer IP, so the synthetic-key bucket only ever sees noise.
+#[derive(Debug, Clone)]
+struct PeerIpOrSynthetic;
+
+impl KeyExtractor for PeerIpOrSynthetic {
+    type Key = IpAddr;
+
+    fn extract<B>(&self, req: &HttpRequest<B>) -> Result<Self::Key, GovernorError> {
+        match PeerIpKeyExtractor.extract(req) {
+            Ok(ip) => Ok(ip),
+            Err(_) => Ok(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+        }
+    }
+}
+
+/// Custom `tower-governor` error handler that returns a 429 with an RFC 7807
+/// problem-details body so rate-limit responses match the rest of the API's
+/// error envelope.
+fn rate_limit_error_response(error: GovernorError) -> HttpResponse<Body> {
+    match error {
+        GovernorError::TooManyRequests { headers, .. } => {
+            let body = ProblemDetails {
+                r#type: "about:blank".to_string(),
+                title: "rate limited".to_string(),
+                status: StatusCode::TOO_MANY_REQUESTS.as_u16(),
+                detail: Some("too many login attempts; retry later".to_string()),
+            };
+            let json = serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string());
+            let mut response = HttpResponse::new(Body::from(json));
+            *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
+            response
+                .headers_mut()
+                .insert("content-type", "application/problem+json".parse().unwrap());
+            if let Some(headers_map) = headers {
+                response.headers_mut().extend(headers_map);
+            }
+            response
+        }
+        GovernorError::UnableToExtractKey => {
+            // PeerIpOrSynthetic never returns this, but keep a safe default.
+            let body = ProblemDetails {
+                r#type: "about:blank".to_string(),
+                title: "bad request".to_string(),
+                status: StatusCode::BAD_REQUEST.as_u16(),
+                detail: Some("could not identify caller for rate-limiting".to_string()),
+            };
+            let json = serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string());
+            let mut response = HttpResponse::new(Body::from(json));
+            *response.status_mut() = StatusCode::BAD_REQUEST;
+            response
+                .headers_mut()
+                .insert("content-type", "application/problem+json".parse().unwrap());
+            response
+        }
+        GovernorError::Other { code, msg, headers } => {
+            let body = ProblemDetails {
+                r#type: "about:blank".to_string(),
+                title: "rate limiter error".to_string(),
+                status: code.as_u16(),
+                detail: msg,
+            };
+            let json = serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string());
+            let mut response = HttpResponse::new(Body::from(json));
+            *response.status_mut() = code;
+            response
+                .headers_mut()
+                .insert("content-type", "application/problem+json".parse().unwrap());
+            if let Some(headers_map) = headers {
+                response.headers_mut().extend(headers_map);
+            }
+            response
+        }
+    }
+}
+
+/// Build the auth router with a per-IP rate-limit layer applied only to the
+/// auth endpoints (so the rest of the API is not throttled).
+///
+/// The limiter's bucket is sized from `[security].login_rps` (steady-state)
+/// and `[security].login_burst` (burst capacity). Each test fixture builds
+/// a fresh `Router` and therefore a fresh `GovernorConfig`, so test runs
+/// don't share state.
+pub fn routes(state: &AppState) -> Router<AppState> {
+    // Snapshot rate-limit knobs at router-build time. Subsequent config
+    // edits via the management API don't reshape the live limiter — that
+    // would require rebuilding the router, which only happens at startup.
+    let (login_rps, login_burst) = match state.config.try_read() {
+        Ok(cfg) => (cfg.security.login_rps, cfg.security.login_burst),
+        Err(_) => (1, 10),
+    };
+
+    // `key_extractor()` returns a new builder by value, so do that first;
+    // afterwards `&mut Self`-returning helpers can be chained.
+    let mut builder = GovernorConfigBuilder::default().key_extractor(PeerIpOrSynthetic);
+    builder
+        .per_second(login_rps.max(1))
+        .burst_size(login_burst.max(1))
+        .error_handler(rate_limit_error_response);
+    let governor_conf = Arc::new(builder.finish().expect("valid GovernorConfig"));
+
+    let governor_layer = GovernorLayer {
+        config: governor_conf,
+    };
+
     Router::new()
         .route("/auth/login", post(login))
         .route("/auth/refresh", post(refresh))
+        .layer(governor_layer)
 }
 
 #[cfg(test)]
@@ -534,7 +780,8 @@ mod tests {
                 listen: "127.0.0.1:0".to_string(),
                 tls_cert: None,
                 tls_key: None,
-                tls_client_ca: None,
+                tls_client_ca_optional: None,
+                require_client_cert: None,
                 cors_origins: vec![],
             },
             auth: crate::config::AuthConfig {
@@ -568,6 +815,10 @@ mod tests {
             security: crate::config::SecurityConfig {
                 allow_no_cert_check: false,
                 trusted_proxies: trusted.iter().map(|s| (*s).to_string()).collect(),
+                login_rps: 1,
+                login_burst: 10,
+                enforce_token_generation: true,
+                profile_encryption_key_env: "SNX_EDGE_PROFILE_KEY".to_string(),
             },
             shutdown: crate::config::ShutdownConfig::default(),
         }

@@ -1,6 +1,7 @@
 mod api;
 mod config;
 mod db;
+mod db_secrets;
 mod error;
 mod log_layer;
 mod routeros;
@@ -67,7 +68,8 @@ async fn main() -> anyhow::Result<()> {
     // Capture TLS paths before `config` is moved into AppState.
     let tls_cert = config.api.tls_cert.clone();
     let tls_key = config.api.tls_key.clone();
-    let tls_client_ca = config.api.tls_client_ca.clone();
+    let tls_client_ca_optional = config.api.tls_client_ca_optional.clone();
+    let tls_require_client_cert = config.api.require_client_cert.clone();
 
     // Single CancellationToken drives both the server's graceful-shutdown
     // future AND any background tasks (db cleanup, etc) that need to know
@@ -85,15 +87,43 @@ async fn main() -> anyhow::Result<()> {
     let router = api::router(app_state.clone());
 
     if let (Some(cert_path), Some(key_path)) = (&tls_cert, &tls_key) {
-        let tls_config = build_tls_config(cert_path, key_path, tls_client_ca.as_deref())?;
+        // mTLS mode resolution: `require_client_cert` wins over the optional
+        // form when both are set (operators who want strict mTLS shouldn't
+        // be silently downgraded). Loud-warn when only the optional form is
+        // configured so it's not mistaken for real defence-in-depth.
+        let tls_mode = if let Some(ca) = tls_require_client_cert.as_deref() {
+            if tls_client_ca_optional.is_some() {
+                tracing::warn!(
+                    "both api.require_client_cert and api.tls_client_ca_optional are set; \
+                     using require_client_cert (strict mTLS)"
+                );
+            }
+            ClientAuthMode::Required(ca)
+        } else if let Some(ca) = tls_client_ca_optional.as_deref() {
+            tracing::warn!(
+                "mTLS configured as optional — JWT is the only authentication gate. \
+                 To require client certs, use api.require_client_cert instead."
+            );
+            ClientAuthMode::Optional(ca)
+        } else {
+            ClientAuthMode::None
+        };
+
+        let tls_config = build_tls_config(cert_path, key_path, tls_mode)?;
 
         let rustls_config =
             axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(tls_config));
 
-        if tls_client_ca.is_some() {
-            tracing::info!("listening on {listen_addr} (TLS + mTLS)");
-        } else {
-            tracing::info!("listening on {listen_addr} (TLS)");
+        match tls_mode {
+            ClientAuthMode::Required(_) => {
+                tracing::info!("listening on {listen_addr} (TLS + mTLS, client cert required)");
+            }
+            ClientAuthMode::Optional(_) => {
+                tracing::info!("listening on {listen_addr} (TLS + optional mTLS)");
+            }
+            ClientAuthMode::None => {
+                tracing::info!("listening on {listen_addr} (TLS)");
+            }
         }
 
         let handle = axum_server::Handle::new();
@@ -210,15 +240,28 @@ async fn teardown_routeros_pbr(state: &AppState) -> anyhow::Result<usize> {
     Ok(removed)
 }
 
+/// Client-cert verification mode for the TLS layer.
+#[derive(Clone, Copy)]
+enum ClientAuthMode<'a> {
+    /// No mTLS — client certs are not verified.
+    None,
+    /// Verify presented client certs against the CA but do not require one.
+    /// JWT is still the sole authentication gate. Useful only as a transport-
+    /// level filter, not as defence-in-depth.
+    Optional(&'a str),
+    /// Require a valid client cert chained to the CA at handshake time.
+    /// Provides defence-in-depth on top of JWT.
+    Required(&'a str),
+}
+
 /// Build a [`rustls::ServerConfig`] from PEM files.
 ///
 /// * Always loads the server certificate chain + private key.
-/// * When `client_ca_path` is `Some`, a [`WebPkiClientVerifier`] is attached
-///   so the server requires and verifies client certificates (mTLS).
+/// * `client_auth` selects the mTLS posture; see [`ClientAuthMode`].
 fn build_tls_config(
     cert_path: &str,
     key_path: &str,
-    client_ca_path: Option<&str>,
+    client_auth: ClientAuthMode<'_>,
 ) -> anyhow::Result<rustls::ServerConfig> {
     use rustls_pemfile::{certs, pkcs8_private_keys};
     use std::io::BufReader;
@@ -240,46 +283,74 @@ fn build_tls_config(
 
     let builder = rustls::ServerConfig::builder();
 
-    let server_config = if let Some(ca_path) = client_ca_path {
-        // --- mTLS: load CA for client-cert verification ---
-        let ca_file =
-            std::fs::File::open(ca_path).with_context(|| format!("open client CA {ca_path}"))?;
-        let ca_certs: Vec<_> = certs(&mut BufReader::new(ca_file))
-            .collect::<Result<_, _>>()
-            .with_context(|| format!("parse client CA certs from {ca_path}"))?;
-
-        let mut root_store = rustls::RootCertStore::empty();
-        for cert in ca_certs {
-            root_store
-                .add(cert)
-                .with_context(|| "add client CA cert to root store")?;
-        }
-
-        // allow_unauthenticated: client certs are verified if provided but not required.
-        // This lets health checks work without a cert while still validating real clients.
-        let client_verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store))
-            .allow_unauthenticated()
-            .build()
-            .with_context(|| "build WebPkiClientVerifier")?;
-
-        builder
-            .with_client_cert_verifier(client_verifier)
-            .with_single_cert(
-                server_certs,
-                rustls::pki_types::PrivateKeyDer::Pkcs8(server_key),
-            )
-            .with_context(|| "build TLS ServerConfig with mTLS")?
-    } else {
-        builder
+    let server_config = match client_auth {
+        ClientAuthMode::None => builder
             .with_no_client_auth()
             .with_single_cert(
                 server_certs,
                 rustls::pki_types::PrivateKeyDer::Pkcs8(server_key),
             )
-            .with_context(|| "build TLS ServerConfig")?
+            .with_context(|| "build TLS ServerConfig")?,
+        ClientAuthMode::Optional(ca_path) => {
+            let root_store = load_client_ca_store(ca_path)?;
+
+            // allow_unauthenticated: presented client certs are verified, but
+            // a missing cert still completes the handshake. JWT is the gate.
+            let client_verifier =
+                rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store))
+                    .allow_unauthenticated()
+                    .build()
+                    .with_context(|| "build WebPkiClientVerifier (optional)")?;
+
+            builder
+                .with_client_cert_verifier(client_verifier)
+                .with_single_cert(
+                    server_certs,
+                    rustls::pki_types::PrivateKeyDer::Pkcs8(server_key),
+                )
+                .with_context(|| "build TLS ServerConfig with optional mTLS")?
+        }
+        ClientAuthMode::Required(ca_path) => {
+            let root_store = load_client_ca_store(ca_path)?;
+
+            // No `allow_unauthenticated`: handshake fails when no client cert
+            // is presented. Operator must serve `/health` via a separate
+            // listener (or accept that it's behind the cert too).
+            let client_verifier =
+                rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store))
+                    .build()
+                    .with_context(|| "build WebPkiClientVerifier (required)")?;
+
+            builder
+                .with_client_cert_verifier(client_verifier)
+                .with_single_cert(
+                    server_certs,
+                    rustls::pki_types::PrivateKeyDer::Pkcs8(server_key),
+                )
+                .with_context(|| "build TLS ServerConfig with required mTLS")?
+        }
     };
 
     Ok(server_config)
+}
+
+/// Load a CA bundle from `path` into a [`rustls::RootCertStore`].
+fn load_client_ca_store(path: &str) -> anyhow::Result<rustls::RootCertStore> {
+    use rustls_pemfile::certs;
+    use std::io::BufReader;
+
+    let ca_file = std::fs::File::open(path).with_context(|| format!("open client CA {path}"))?;
+    let ca_certs: Vec<_> = certs(&mut BufReader::new(ca_file))
+        .collect::<Result<_, _>>()
+        .with_context(|| format!("parse client CA certs from {path}"))?;
+
+    let mut root_store = rustls::RootCertStore::empty();
+    for cert in ca_certs {
+        root_store
+            .add(cert)
+            .with_context(|| "add client CA cert to root store")?;
+    }
+    Ok(root_store)
 }
 
 /// Enable IPv4 forwarding and set up NAT masquerade for tun→eth0.

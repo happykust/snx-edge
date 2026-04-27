@@ -1,4 +1,6 @@
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use tokio::sync::{RwLock, broadcast};
 use tokio_util::sync::CancellationToken;
@@ -8,6 +10,21 @@ use crate::config::AppConfig;
 use crate::db::UserDb;
 use crate::routeros::client::RouterOsClient;
 use crate::tunnel::TunnelManager;
+
+/// In-memory cache of `users.id -> (token_generation, fetched_at)`. Backs the
+/// `require_auth` middleware's per-request generation lookup so the hot auth
+/// path doesn't hit SQLite for every authenticated request. Entries expire 30s
+/// after `fetched_at`; the middleware always refreshes from DB after a miss
+/// or expiry. Counter-bumping helpers (`bump_token_generation`,
+/// `delete_user`, `change_password`, etc.) write the new value through here so
+/// the next request sees the bump immediately, without waiting for the TTL.
+pub type TokenGenCache = Arc<RwLock<HashMap<String, TokenGenEntry>>>;
+
+#[derive(Debug, Clone, Copy)]
+pub struct TokenGenEntry {
+    pub generation: i64,
+    pub fetched_at: Instant,
+}
 
 /// SSE event broadcast to all connected clients.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -39,6 +56,9 @@ pub struct AppState {
     /// variables require a process restart — re-reading env on every request
     /// would defeat the purpose of caching.
     pub routeros_client: Arc<RwLock<Option<RouterOsClient>>>,
+    /// In-memory generation cache used by the require_auth middleware. See
+    /// `TokenGenCache` doc for details.
+    pub token_gen_cache: TokenGenCache,
 }
 
 impl AppState {
@@ -62,7 +82,23 @@ impl AppState {
             );
         }
 
-        let db = UserDb::new(&config.auth.user_db).await?;
+        // Decode the optional profile-encryption key from the env. We read
+        // it once at startup; rotating the key requires a restart (which is
+        // operationally fine — secrets need re-encrypting anyway).
+        let profile_key = config.profile_key()?;
+
+        if profile_key.is_none() {
+            // Soft warning: legacy plaintext mode is fine for backwards
+            // compatibility, but operators should know they're in it.
+            tracing::warn!(
+                env = %config.security.profile_encryption_key_env,
+                "profile encryption key not set; storing VPN profile passwords as plaintext \
+                 in the SQLite database (set the env var with a 32-byte base64/hex value to \
+                 enable at-rest encryption)"
+            );
+        }
+
+        let db = UserDb::new_with_key(&config.auth.user_db, profile_key).await?;
 
         // Initialize admin user from env if database is empty
         db.ensure_admin_exists().await?;
@@ -83,7 +119,30 @@ impl AppState {
             tunnel,
             shutdown,
             routeros_client: Arc::new(RwLock::new(None)),
+            token_gen_cache: Arc::new(RwLock::new(HashMap::new())),
         })
+    }
+
+    /// Update the cached token-generation entry for `user_id`. Called by
+    /// every code path that bumps the on-disk counter so the next request
+    /// observes the new value immediately rather than waiting out the 30s
+    /// TTL. Pass `None` to evict the entry instead (e.g. after `delete_user`).
+    pub async fn refresh_token_generation_cache(&self, user_id: &str, generation: Option<i64>) {
+        let mut cache = self.token_gen_cache.write().await;
+        match generation {
+            Some(g) => {
+                cache.insert(
+                    user_id.to_string(),
+                    TokenGenEntry {
+                        generation: g,
+                        fetched_at: Instant::now(),
+                    },
+                );
+            }
+            None => {
+                cache.remove(user_id);
+            }
+        }
     }
 
     /// Return a `RouterOsClient`, building and caching it on first call.

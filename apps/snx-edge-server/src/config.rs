@@ -32,7 +32,18 @@ pub struct ApiConfig {
     pub listen: String,
     pub tls_cert: Option<String>,
     pub tls_key: Option<String>,
-    pub tls_client_ca: Option<String>,
+    /// Optional client-cert verification: when set, presented client certs
+    /// are verified against this CA, but a cert is **not** required. JWT
+    /// remains the sole authentication gate. Accepts the legacy
+    /// `tls_client_ca` key as an alias for backwards compatibility.
+    #[serde(default, alias = "tls_client_ca")]
+    pub tls_client_ca_optional: Option<String>,
+    /// Path to a CA bundle used to *require* a valid client certificate at
+    /// the TLS layer. When set, the TLS handshake fails for any client that
+    /// does not present a cert chained to this CA. Provides defence-in-depth
+    /// on top of JWT.
+    #[serde(default)]
+    pub require_client_cert: Option<String>,
     /// Whitelist of CORS allowed origins. Empty list (the default) results in
     /// a default-deny CORS policy. Each entry must be a valid HTTP `Origin`
     /// header value, e.g. `https://gui.example.com`.
@@ -42,7 +53,7 @@ pub struct ApiConfig {
 
 /// Security policy knobs that govern how strict the server is about
 /// configuration the API accepts.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SecurityConfig {
     /// Allow profiles to disable VPN server certificate verification via
     /// the `no_cert_check` field. Default `false` (rejected at create/update).
@@ -54,6 +65,51 @@ pub struct SecurityConfig {
     /// — the request's TCP peer is used verbatim for audit logging.
     #[serde(default)]
     pub trusted_proxies: Vec<String>,
+
+    /// Steady-state request budget per peer-IP for `/auth/login` and
+    /// `/auth/refresh`, expressed in requests per second. Default `1` —
+    /// after the burst is consumed, the bucket replenishes one slot every
+    /// second.
+    #[serde(default = "default_login_rps")]
+    pub login_rps: u64,
+
+    /// Burst capacity per peer-IP for the auth endpoints. The first
+    /// `login_burst` requests in a quick succession are served before the
+    /// `login_rps` cap kicks in. Default `10` — high enough that humans
+    /// retrying typos are not throttled but low enough to defang automated
+    /// credential-stuffing.
+    #[serde(default = "default_login_burst")]
+    pub login_burst: u32,
+
+    /// Enforce the JWT `gen` (token generation) check in `require_auth`.
+    /// Default `true` — the middleware compares the JWT's embedded
+    /// `token_generation` against the user's current value in SQLite and
+    /// returns 401 when they differ. Set to `false` for emergency rollback
+    /// if the cache or DB lookup misbehaves; tokens then live their full
+    /// natural TTL, matching the pre-5.3 behaviour.
+    #[serde(default = "default_enforce_token_generation")]
+    pub enforce_token_generation: bool,
+
+    /// Name of the env var holding the 32-byte ChaCha20-Poly1305 key used
+    /// to encrypt VPN profile secrets at rest. The env value can be either
+    /// base64- or hex-encoded. When the env var is unset the server runs
+    /// in legacy plaintext mode — backwards compatible, but logs a warning
+    /// at startup if any profiles already exist.
+    #[serde(default = "default_profile_key_env")]
+    pub profile_encryption_key_env: String,
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self {
+            allow_no_cert_check: false,
+            trusted_proxies: Vec::new(),
+            login_rps: default_login_rps(),
+            login_burst: default_login_burst(),
+            enforce_token_generation: default_enforce_token_generation(),
+            profile_encryption_key_env: default_profile_key_env(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -116,6 +172,29 @@ impl AppConfig {
     pub fn load(path: &str) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path)?;
         let config: Self = toml::from_str(&content)?;
+
+        // Legacy-key migration warning. We accept `tls_client_ca` as an
+        // alias for `tls_client_ca_optional` via `#[serde(alias = ...)]`,
+        // but operators should migrate the on-disk name. Detect the legacy
+        // form by parsing the file as a raw TOML document and checking for
+        // the old key under `[api]` — `serde` does not expose which alias
+        // matched.
+        if let Ok(doc) = content.parse::<toml_edit::DocumentMut>() {
+            let has_legacy = doc
+                .get("api")
+                .and_then(|i| i.as_table())
+                .map(|t| t.contains_key("tls_client_ca"))
+                .unwrap_or(false);
+            if has_legacy {
+                tracing::warn!(
+                    "config uses legacy `api.tls_client_ca`; rename to \
+                     `api.tls_client_ca_optional` (or use `api.require_client_cert` \
+                     for mandatory mTLS). The legacy key is still accepted but will \
+                     be rewritten on the next config save."
+                );
+            }
+        }
+
         Ok(config)
     }
 
@@ -158,11 +237,25 @@ impl AppConfig {
         set_str(doc, "api", "listen", &self.api.listen);
         set_opt_str(doc, "api", "tls_cert", self.api.tls_cert.as_deref());
         set_opt_str(doc, "api", "tls_key", self.api.tls_key.as_deref());
+        // Persist using the new key name. Note: if the on-disk file was loaded
+        // via the legacy `tls_client_ca` alias, this rewrite migrates it to
+        // `tls_client_ca_optional` (the loaded value survives, the key name
+        // changes). We also clear any stale legacy key so the file ends up
+        // with a single canonical entry.
+        if let Some(tbl) = doc.get_mut("api").and_then(|i| i.as_table_mut()) {
+            tbl.remove("tls_client_ca");
+        }
         set_opt_str(
             doc,
             "api",
-            "tls_client_ca",
-            self.api.tls_client_ca.as_deref(),
+            "tls_client_ca_optional",
+            self.api.tls_client_ca_optional.as_deref(),
+        );
+        set_opt_str(
+            doc,
+            "api",
+            "require_client_cert",
+            self.api.require_client_cert.as_deref(),
         );
         set_str_array(doc, "api", "cors_origins", &self.api.cors_origins);
 
@@ -262,6 +355,25 @@ impl AppConfig {
             "trusted_proxies",
             &self.security.trusted_proxies,
         );
+        set_int(doc, "security", "login_rps", self.security.login_rps as i64);
+        set_int(
+            doc,
+            "security",
+            "login_burst",
+            i64::from(self.security.login_burst),
+        );
+        set_bool(
+            doc,
+            "security",
+            "enforce_token_generation",
+            self.security.enforce_token_generation,
+        );
+        set_str(
+            doc,
+            "security",
+            "profile_encryption_key_env",
+            &self.security.profile_encryption_key_env,
+        );
 
         // [shutdown]
         set_bool(
@@ -275,6 +387,26 @@ impl AppConfig {
     pub fn jwt_secret(&self) -> anyhow::Result<String> {
         std::env::var(&self.auth.jwt_secret_env)
             .map_err(|_| anyhow::anyhow!("env {} not set", self.auth.jwt_secret_env))
+    }
+
+    /// Read and decode the profile encryption key from the configured env
+    /// var. Returns:
+    ///
+    /// * `Ok(Some(key))` when the env var is set and decodes cleanly
+    ///   (base64 first, then hex).
+    /// * `Ok(None)` when the env var is unset — legacy plaintext mode.
+    /// * `Err(_)` when the env var is set but unparseable. We fail loud here
+    ///   rather than silently falling back to plaintext: a misconfigured key
+    ///   would corrupt newly-written profiles otherwise.
+    pub fn profile_key(&self) -> anyhow::Result<Option<[u8; 32]>> {
+        let raw = match std::env::var(&self.security.profile_encryption_key_env) {
+            Ok(v) if !v.trim().is_empty() => v,
+            _ => return Ok(None),
+        };
+
+        crate::db_secrets::decode_key(&raw)
+            .map(Some)
+            .map_err(|e| anyhow::anyhow!("invalid profile encryption key: {e}"))
     }
 }
 
@@ -339,6 +471,18 @@ fn default_max_file_size() -> String {
 }
 fn default_max_files() -> u32 {
     3
+}
+fn default_login_rps() -> u64 {
+    1
+}
+fn default_login_burst() -> u32 {
+    10
+}
+fn default_enforce_token_generation() -> bool {
+    true
+}
+fn default_profile_key_env() -> String {
+    "SNX_EDGE_PROFILE_KEY".to_string()
 }
 
 // --- toml_edit helpers ---
@@ -467,7 +611,8 @@ buffer_size = 100
                 listen: "0.0.0.0:8080".to_string(),
                 tls_cert: None,
                 tls_key: None,
-                tls_client_ca: None,
+                tls_client_ca_optional: None,
+                require_client_cert: None,
                 cors_origins: vec![],
             },
             auth: AuthConfig {
@@ -505,5 +650,124 @@ buffer_size = 100
         cfg.save(path.to_str().unwrap()).unwrap();
         // Should now be parseable.
         AppConfig::load(path.to_str().unwrap()).unwrap();
+    }
+
+    /// The legacy `tls_client_ca` key must continue to deserialize into
+    /// the renamed `tls_client_ca_optional` field. Operators upgrading
+    /// without touching their on-disk config see no behavioural change.
+    #[test]
+    fn legacy_tls_client_ca_alias_loads_into_optional_field() {
+        let toml = r#"
+[api]
+listen = "0.0.0.0:8080"
+tls_client_ca = "/etc/ca.crt"
+
+[auth]
+jwt_secret_env = "X"
+user_db = "/tmp/x.db"
+max_login_attempts = 5
+lockout_duration_minutes = 15
+access_token_ttl_minutes = 15
+refresh_token_ttl_days = 7
+
+[routeros]
+host_env = "X"
+user_env = "X"
+password_env = "X"
+
+[logging]
+level = "info"
+buffer_size = 100
+"#;
+
+        let cfg: AppConfig = toml::from_str(toml).expect("parse with legacy alias");
+        assert_eq!(
+            cfg.api.tls_client_ca_optional.as_deref(),
+            Some("/etc/ca.crt"),
+            "legacy `tls_client_ca` should populate `tls_client_ca_optional`"
+        );
+        assert_eq!(cfg.api.require_client_cert, None);
+    }
+
+    /// Three mTLS postures must parse cleanly: none, optional, required.
+    /// This is the smoke test mandated by task 5.2's done-criteria.
+    #[test]
+    fn mtls_posture_combinations_parse_cleanly() {
+        let common = r#"
+[auth]
+jwt_secret_env = "X"
+user_db = "/tmp/x.db"
+max_login_attempts = 5
+lockout_duration_minutes = 15
+access_token_ttl_minutes = 15
+refresh_token_ttl_days = 7
+
+[routeros]
+host_env = "X"
+user_env = "X"
+password_env = "X"
+
+[logging]
+level = "info"
+buffer_size = 100
+"#;
+
+        // 1) No mTLS at all.
+        let cfg: AppConfig = toml::from_str(&format!("[api]\nlisten = \"0.0.0.0:8080\"\n{common}"))
+            .expect("parse no-mtls config");
+        assert_eq!(cfg.api.tls_client_ca_optional, None);
+        assert_eq!(cfg.api.require_client_cert, None);
+
+        // 2) Optional mTLS only.
+        let cfg: AppConfig = toml::from_str(&format!(
+            "[api]\nlisten = \"0.0.0.0:8080\"\ntls_client_ca_optional = \"/ca.crt\"\n{common}"
+        ))
+        .expect("parse optional-mtls config");
+        assert_eq!(cfg.api.tls_client_ca_optional.as_deref(), Some("/ca.crt"));
+        assert_eq!(cfg.api.require_client_cert, None);
+
+        // 3) Required mTLS only.
+        let cfg: AppConfig = toml::from_str(&format!(
+            "[api]\nlisten = \"0.0.0.0:8080\"\nrequire_client_cert = \"/ca.crt\"\n{common}"
+        ))
+        .expect("parse required-mtls config");
+        assert_eq!(cfg.api.tls_client_ca_optional, None);
+        assert_eq!(cfg.api.require_client_cert.as_deref(), Some("/ca.crt"));
+    }
+
+    /// New `[security].login_rps` / `login_burst` keys must round-trip
+    /// through the loader and pick up sane defaults when absent.
+    #[test]
+    fn login_rate_limit_defaults_and_overrides() {
+        let toml_default = r#"
+[api]
+listen = "0.0.0.0:8080"
+
+[auth]
+jwt_secret_env = "X"
+user_db = "/tmp/x.db"
+max_login_attempts = 5
+lockout_duration_minutes = 15
+access_token_ttl_minutes = 15
+refresh_token_ttl_days = 7
+
+[routeros]
+host_env = "X"
+user_env = "X"
+password_env = "X"
+
+[logging]
+level = "info"
+buffer_size = 100
+"#;
+        let cfg: AppConfig = toml::from_str(toml_default).unwrap();
+        assert_eq!(cfg.security.login_rps, 1);
+        assert_eq!(cfg.security.login_burst, 10);
+
+        let toml_override =
+            format!("{toml_default}\n[security]\nlogin_rps = 5\nlogin_burst = 100\n");
+        let cfg: AppConfig = toml::from_str(&toml_override).unwrap();
+        assert_eq!(cfg.security.login_rps, 5);
+        assert_eq!(cfg.security.login_burst, 100);
     }
 }
