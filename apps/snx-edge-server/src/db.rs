@@ -4,6 +4,7 @@ use chrono::{DateTime, Utc};
 use rusqlite::params;
 use serde::Serialize;
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::error::AppError;
@@ -472,20 +473,32 @@ impl UserDb {
     // === Cleanup ===
 
     /// Spawns a background task that cleans up expired sessions every hour.
-    pub fn start_cleanup_task(&self) {
-        let db = self.clone();
+    ///
+    /// Takes ownership of `self` (cheap — `UserDb` is just an `Arc<Mutex<…>>` +
+    /// clone) and exits cleanly when `cancel` is cancelled by the shutdown
+    /// handler.
+    pub fn start_cleanup_task(self, cancel: CancellationToken) {
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+            // Skip the immediate first tick so we don't run cleanup at startup.
+            interval.tick().await;
             loop {
-                interval.tick().await;
-                match db.cleanup_expired_sessions().await {
-                    Ok(count) => {
-                        if count > 0 {
-                            tracing::info!("cleaned up {count} expired sessions");
+                tokio::select! {
+                    _ = interval.tick() => {
+                        match self.cleanup_expired_sessions().await {
+                            Ok(count) => {
+                                if count > 0 {
+                                    tracing::info!("cleaned up {count} expired sessions");
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("session cleanup failed: {e}");
+                            }
                         }
                     }
-                    Err(e) => {
-                        tracing::warn!("session cleanup failed: {e}");
+                    _ = cancel.cancelled() => {
+                        tracing::info!("db cleanup task: shutdown signal received");
+                        break;
                     }
                 }
             }

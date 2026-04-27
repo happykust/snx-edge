@@ -51,11 +51,13 @@ buffer_size = 100
     let config = snx_edge_server::config::AppConfig::load(&config_path.to_string_lossy()).unwrap();
     let log_buffer = snx_edge_server::api::logs::new_log_buffer(100);
     let (event_tx, _) = tokio::sync::broadcast::channel(64);
+    let shutdown = tokio_util::sync::CancellationToken::new();
     let state = snx_edge_server::state::AppState::with_shared(
         config,
         config_path.to_string_lossy().to_string(),
         log_buffer,
         event_tx,
+        shutdown,
     )
     .await
     .unwrap();

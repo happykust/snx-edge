@@ -8,7 +8,6 @@ use serde::Deserialize;
 
 use crate::api::auth::{Claims, has_permission};
 use crate::error::AppError;
-use crate::routeros::client::RouterOsClient;
 use crate::routeros::models::{AddressListEntry, DiagnosticsResult};
 use crate::routeros::provisioner::Provisioner;
 use crate::state::{AppState, ServerEvent};
@@ -59,16 +58,6 @@ fn validate_address(address: &str) -> Result<(), AppError> {
     )))
 }
 
-// NOTE: RouterOsClient is re-created per request. This is intentional — the env var
-// reads (ROUTEROS_HOST, ROUTEROS_USER, ROUTEROS_PASSWORD) are microsecond-cheap
-// compared to the HTTP calls that follow, and re-creating allows picking up rotated
-// credentials without a server restart. Caching the client in AppState would save
-// negligible time while complicating credential rotation and config reload.
-async fn make_client(state: &AppState) -> Result<RouterOsClient, AppError> {
-    let config = state.config.read().await;
-    RouterOsClient::new(&config.routeros)
-}
-
 #[derive(Deserialize)]
 pub struct AddClientRequest {
     pub address: String,
@@ -90,7 +79,7 @@ async fn list_clients(
         return Err(AppError::Forbidden("permission required".to_string()));
     }
 
-    let client = make_client(&state).await?;
+    let client = state.routeros_client().await?;
     let address_list_vpn = {
         let config = state.config.read().await;
         config.routeros.address_list_vpn.clone()
@@ -111,7 +100,7 @@ async fn add_client(
 
     validate_address(&req.address)?;
 
-    let client = make_client(&state).await?;
+    let client = state.routeros_client().await?;
     let address_list_vpn = {
         let config = state.config.read().await;
         config.routeros.address_list_vpn.clone()
@@ -139,7 +128,7 @@ async fn remove_client(
         return Err(AppError::Forbidden("permission required".to_string()));
     }
 
-    let client = make_client(&state).await?;
+    let client = state.routeros_client().await?;
     client.remove_address(&id).await?;
 
     let _ = state.event_tx.send(ServerEvent::RoutingChanged);
@@ -157,7 +146,7 @@ async fn list_bypass(
         return Err(AppError::Forbidden("permission required".to_string()));
     }
 
-    let client = make_client(&state).await?;
+    let client = state.routeros_client().await?;
     let address_list_bypass = {
         let config = state.config.read().await;
         config.routeros.address_list_bypass.clone()
@@ -178,7 +167,7 @@ async fn add_bypass(
 
     validate_address(&req.address)?;
 
-    let client = make_client(&state).await?;
+    let client = state.routeros_client().await?;
     let address_list_bypass = {
         let config = state.config.read().await;
         config.routeros.address_list_bypass.clone()
@@ -206,7 +195,7 @@ async fn remove_bypass(
         return Err(AppError::Forbidden("permission required".to_string()));
     }
 
-    let client = make_client(&state).await?;
+    let client = state.routeros_client().await?;
     client.remove_address(&id).await?;
 
     let _ = state.event_tx.send(ServerEvent::RoutingChanged);
@@ -224,7 +213,7 @@ async fn routing_status(
         return Err(AppError::Forbidden("permission required".to_string()));
     }
 
-    let client = make_client(&state).await?;
+    let client = state.routeros_client().await?;
     let routing_table = {
         let config = state.config.read().await;
         config.routeros.routing_table.clone()
@@ -255,7 +244,7 @@ async fn setup_pbr(
         ));
     }
 
-    let client = make_client(&state).await?;
+    let client = state.routeros_client().await?;
     let routeros_config = {
         let config = state.config.read().await;
         config.routeros.clone()
@@ -286,7 +275,7 @@ async fn teardown_pbr(
         ));
     }
 
-    let client = make_client(&state).await?;
+    let client = state.routeros_client().await?;
     let routeros_config = {
         let config = state.config.read().await;
         config.routeros.clone()
@@ -312,7 +301,7 @@ async fn diagnostics(
         return Err(AppError::Forbidden("permission required".to_string()));
     }
 
-    let client = make_client(&state).await?;
+    let client = state.routeros_client().await?;
     let routeros_config = {
         let config = state.config.read().await;
         config.routeros.clone()

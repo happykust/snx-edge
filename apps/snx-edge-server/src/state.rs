@@ -1,10 +1,12 @@
 use std::sync::Arc;
 
 use tokio::sync::{RwLock, broadcast};
+use tokio_util::sync::CancellationToken;
 
 use crate::api::logs::SharedLogBuffer;
 use crate::config::AppConfig;
 use crate::db::UserDb;
+use crate::routeros::client::RouterOsClient;
 use crate::tunnel::TunnelManager;
 
 /// SSE event broadcast to all connected clients.
@@ -27,6 +29,16 @@ pub struct AppState {
     pub jwt_secret: Arc<String>,
     pub log_buffer: SharedLogBuffer,
     pub tunnel: Arc<TunnelManager>,
+    /// Cancelled when the process receives a shutdown signal. Background tasks
+    /// (e.g. `db::start_cleanup_task`) subscribe via `.cancelled()` so they
+    /// can exit promptly instead of being aborted mid-iteration.
+    pub shutdown: CancellationToken,
+    /// Cached RouterOS REST client. Built lazily on first use; invalidated
+    /// (set back to `None`) when `[routeros]` configuration changes via the
+    /// management API. Credential changes that come from environment
+    /// variables require a process restart — re-reading env on every request
+    /// would defeat the purpose of caching.
+    pub routeros_client: Arc<RwLock<Option<RouterOsClient>>>,
 }
 
 impl AppState {
@@ -37,6 +49,7 @@ impl AppState {
         config_path: String,
         log_buffer: SharedLogBuffer,
         event_tx: broadcast::Sender<ServerEvent>,
+        shutdown: CancellationToken,
     ) -> anyhow::Result<Self> {
         let jwt_secret = config.jwt_secret()?;
 
@@ -54,8 +67,9 @@ impl AppState {
         // Initialize admin user from env if database is empty
         db.ensure_admin_exists().await?;
 
-        // Start background session cleanup (hourly)
-        db.start_cleanup_task();
+        // Start background session cleanup (hourly) — exits when `shutdown`
+        // is cancelled.
+        db.clone().start_cleanup_task(shutdown.clone());
 
         let tunnel = Arc::new(TunnelManager::new(event_tx.clone()));
 
@@ -67,6 +81,32 @@ impl AppState {
             jwt_secret: Arc::new(jwt_secret),
             log_buffer,
             tunnel,
+            shutdown,
+            routeros_client: Arc::new(RwLock::new(None)),
         })
+    }
+
+    /// Return a `RouterOsClient`, building and caching it on first call.
+    ///
+    /// Rebuild is forced after `invalidate_routeros_client()` is called
+    /// (e.g. on config update). Two callers that race the cold path may both
+    /// build a client — that's harmless: the second `write()` simply
+    /// overwrites the first cached value.
+    pub async fn routeros_client(&self) -> Result<RouterOsClient, crate::error::AppError> {
+        if let Some(client) = self.routeros_client.read().await.clone() {
+            return Ok(client);
+        }
+        let config = self.config.read().await;
+        let client = RouterOsClient::new(&config.routeros)?;
+        drop(config);
+        *self.routeros_client.write().await = Some(client.clone());
+        Ok(client)
+    }
+
+    /// Drop the cached RouterOS client. Call this after mutating
+    /// `[routeros]` configuration so the next request rebuilds with the new
+    /// settings.
+    pub async fn invalidate_routeros_client(&self) {
+        *self.routeros_client.write().await = None;
     }
 }

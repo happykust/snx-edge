@@ -1,6 +1,7 @@
 #![deny(clippy::wildcard_enum_match_arm)]
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use chrono::{DateTime, Utc};
 use secrecy::SecretString;
@@ -11,6 +12,7 @@ use snxcore::tunnel::{
     CheckPointTunnelConnectorFactory, TunnelConnector, TunnelConnectorFactory, TunnelEvent,
 };
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
+use tokio::task::JoinHandle;
 
 use crate::state::ServerEvent;
 
@@ -287,7 +289,11 @@ pub struct TunnelManager {
     factory: CheckPointTunnelConnectorFactory,
     connector: Arc<Mutex<Option<Box<dyn TunnelConnector + Send + Sync>>>>,
     session: Arc<Mutex<Option<Arc<snxcore::model::VpnSession>>>>,
-    status: Arc<RwLock<ConnectionStatus>>,
+    /// Connection status. Held in a `std::sync::Mutex` because the lock is
+    /// only ever taken for trivial reads/writes and we need a synchronous
+    /// reset path from `connect()` on the cold/error branch (see the
+    /// `with_status_reset_on_err` helper below).
+    status: Arc<std::sync::Mutex<ConnectionStatus>>,
     event_tx: broadcast::Sender<ServerEvent>,
     tx_bytes: Arc<Mutex<u64>>,
     rx_bytes: Arc<Mutex<u64>>,
@@ -296,6 +302,14 @@ pub struct TunnelManager {
     last_server: Arc<RwLock<Option<String>>>,
     /// MTU from the last connect config (snxcore doesn't expose it in ConnectionInfo).
     last_mtu: Arc<RwLock<u16>>,
+    /// Tunnel + event-handler `JoinHandle`s spawned during `start_tunnel`.
+    /// Aborted on `disconnect` so we don't leak tasks across reconnects.
+    tasks: Arc<std::sync::Mutex<Vec<JoinHandle<()>>>>,
+    /// Set by `disconnect()` so the spawned event handler knows the
+    /// shutdown is operator-initiated and skips writing to `status`
+    /// (which `disconnect()` is about to reset directly). Cleared at the
+    /// start of every `connect()`.
+    disconnect_initiated: Arc<AtomicBool>,
 }
 
 impl TunnelManager {
@@ -304,17 +318,23 @@ impl TunnelManager {
             factory: CheckPointTunnelConnectorFactory,
             connector: Arc::new(Mutex::new(None)),
             session: Arc::new(Mutex::new(None)),
-            status: Arc::new(RwLock::new(ConnectionStatus::Disconnected)),
+            status: Arc::new(std::sync::Mutex::new(ConnectionStatus::Disconnected)),
             event_tx,
             tx_bytes: Arc::new(Mutex::new(0)),
             rx_bytes: Arc::new(Mutex::new(0)),
             last_server: Arc::new(RwLock::new(None)),
             last_mtu: Arc::new(RwLock::new(default_mtu())),
+            tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
+            disconnect_initiated: Arc::new(AtomicBool::new(false)),
         }
     }
 
+    fn read_status(&self) -> ConnectionStatus {
+        self.status.lock().expect("status mutex poisoned").clone()
+    }
+
     pub async fn status(&self) -> TunnelStatus {
-        let connection = self.status.read().await.clone();
+        let connection = self.read_status();
         let uptime_seconds = if let ConnectionStatus::Connected(ref info) = connection {
             info.since
                 .map(|s| (Utc::now() - s).num_seconds().max(0) as u64)
@@ -332,7 +352,7 @@ impl TunnelManager {
 
     pub async fn connect(&self, vpn_config: &VpnConfig) -> anyhow::Result<ConnectionStatus> {
         {
-            let mut status = self.status.write().await;
+            let mut status = self.status.lock().expect("status mutex poisoned");
             if matches!(
                 *status,
                 ConnectionStatus::Connected(_) | ConnectionStatus::Connecting
@@ -341,7 +361,28 @@ impl TunnelManager {
             }
             *status = ConnectionStatus::Connecting;
         }
+        // Fresh attempt — clear any leftover disconnect flag from a previous
+        // session.
+        self.disconnect_initiated.store(false, Ordering::SeqCst);
 
+        // Wrap the rest of the body so any early exit (`?`) resets `status`
+        // back to `Disconnected` instead of leaving it stuck on `Connecting`
+        // — that bug previously locked out every subsequent connect attempt
+        // until the process restarted.
+        //
+        // NOTE: chose the `async-block + post-match` pattern over a `Drop`
+        // guard because `Drop` interacts poorly with our mix of sync and
+        // async locks; a plain async block is much easier to follow.
+        let result = self.connect_inner(vpn_config).await;
+        if let Err(ref e) = result {
+            self.set_status(ConnectionStatus::Error {
+                message: e.to_string(),
+            });
+        }
+        result
+    }
+
+    async fn connect_inner(&self, vpn_config: &VpnConfig) -> anyhow::Result<ConnectionStatus> {
         // Remember the server for GET /server/info when disconnected.
         if !vpn_config.server.is_empty() {
             *self.last_server.write().await = Some(vpn_config.server.clone());
@@ -350,16 +391,7 @@ impl TunnelManager {
 
         let params = Arc::new(build_tunnel_params(vpn_config));
 
-        let mut connector = match self.factory.create(params.clone()).await {
-            Ok(c) => c,
-            Err(e) => {
-                self.set_status(ConnectionStatus::Error {
-                    message: e.to_string(),
-                })
-                .await;
-                return Err(e);
-            }
-        };
+        let mut connector = self.factory.create(params.clone()).await?;
 
         let session = if params.ike_persist {
             match connector.restore_session().await {
@@ -378,7 +410,7 @@ impl TunnelManager {
                 mfa_type: format!("{:?}", challenge.mfa_type),
                 prompt: challenge.prompt.clone(),
             });
-            self.set_status(mfa.clone()).await;
+            self.set_status(mfa.clone());
             return Ok(mfa);
         }
 
@@ -406,7 +438,7 @@ impl TunnelManager {
         };
 
         // Spawn tunnel task
-        tokio::spawn(async move {
+        let tunnel_handle = tokio::spawn(async move {
             if let Err(e) = tunnel.run(cmd_rx, evt_tx).await {
                 tracing::warn!("tunnel exited: {e}");
             }
@@ -417,10 +449,17 @@ impl TunnelManager {
         let connector = self.connector.clone();
         let broadcast_tx = self.event_tx.clone();
         let session_ref = self.session.clone();
+        let disconnect_flag = self.disconnect_initiated.clone();
         let mtu = *self.last_mtu.read().await;
 
-        tokio::spawn(async move {
+        let event_handle = tokio::spawn(async move {
             while let Some(event) = evt_rx.recv().await {
+                // If `disconnect()` is already running, it owns the status
+                // transition; we must not race it. Drop the event and exit.
+                if disconnect_flag.load(Ordering::SeqCst) {
+                    break;
+                }
+
                 // Forward to connector for internal handling (rekey etc.)
                 {
                     let mut guard = connector.lock().await;
@@ -428,26 +467,33 @@ impl TunnelManager {
                         && let Err(e) = c.handle_tunnel_event(event.clone()).await
                     {
                         tracing::warn!("tunnel event handler error: {e}");
-                        *status.write().await = ConnectionStatus::Error {
-                            message: e.to_string(),
-                        };
-                        let _ = broadcast_tx.send(ServerEvent::ConnectionStatus {
-                            status: "error".to_string(),
-                        });
+                        if !disconnect_flag.load(Ordering::SeqCst) {
+                            *status.lock().expect("status mutex poisoned") =
+                                ConnectionStatus::Error {
+                                    message: e.to_string(),
+                                };
+                            let _ = broadcast_tx.send(ServerEvent::ConnectionStatus {
+                                status: "error".to_string(),
+                            });
+                        }
                         break;
                     }
                 }
 
                 match event {
                     TunnelEvent::Connected(info) => {
-                        *status.write().await =
+                        *status.lock().expect("status mutex poisoned") =
                             ConnectionStatus::Connected(map_connection_info(&info, mtu));
                         let _ = broadcast_tx.send(ServerEvent::ConnectionStatus {
                             status: "connected".to_string(),
                         });
                     }
                     TunnelEvent::Disconnected => {
-                        *status.write().await = ConnectionStatus::Disconnected;
+                        // Spontaneous disconnect (server-initiated, network
+                        // failure, etc.). Owner of the transition because
+                        // `disconnect()` is not running.
+                        *status.lock().expect("status mutex poisoned") =
+                            ConnectionStatus::Disconnected;
                         *connector.lock().await = None;
                         *session_ref.lock().await = None;
                         let _ = broadcast_tx.send(ServerEvent::ConnectionStatus {
@@ -456,7 +502,7 @@ impl TunnelManager {
                         break;
                     }
                     TunnelEvent::Rekeyed(addr) => {
-                        let mut guard = status.write().await;
+                        let mut guard = status.lock().expect("status mutex poisoned");
                         if let ConnectionStatus::Connected(ref mut info) = *guard {
                             info.ip_address = addr.to_string();
                         }
@@ -470,15 +516,26 @@ impl TunnelManager {
             }
         });
 
-        self.set_status(ConnectionStatus::Connecting).await;
+        // Track handles so disconnect() can abort them.
+        {
+            let mut tasks = self.tasks.lock().expect("tasks mutex poisoned");
+            tasks.push(tunnel_handle);
+            tasks.push(event_handle);
+        }
+
+        self.set_status(ConnectionStatus::Connecting);
         Ok(ConnectionStatus::Connecting)
     }
 
     pub async fn disconnect(&self) -> anyhow::Result<()> {
-        let current = self.status.read().await.clone();
+        let current = self.read_status();
         if matches!(current, ConnectionStatus::Disconnected) {
             anyhow::bail!("not connected");
         }
+
+        // Claim the status transition so the spawned event handler stops
+        // touching `status` once it observes this flag.
+        self.disconnect_initiated.store(true, Ordering::SeqCst);
 
         if let Some(connector) = self.connector.lock().await.as_mut() {
             let _ = connector.delete_session().await;
@@ -487,7 +544,19 @@ impl TunnelManager {
 
         *self.connector.lock().await = None;
         *self.session.lock().await = None;
-        self.set_status(ConnectionStatus::Disconnected).await;
+
+        // Abort any spawned tasks. We don't await them — the event handler
+        // typically exits on its own once the channel closes, and abort is
+        // cheap insurance against the rare case where it doesn't.
+        let drained: Vec<JoinHandle<()>> = {
+            let mut tasks = self.tasks.lock().expect("tasks mutex poisoned");
+            std::mem::take(&mut *tasks)
+        };
+        for handle in drained {
+            handle.abort();
+        }
+
+        self.set_status(ConnectionStatus::Disconnected);
 
         Ok(())
     }
@@ -524,7 +593,7 @@ impl TunnelManager {
                 mfa_type: format!("{:?}", challenge.mfa_type),
                 prompt: challenge.prompt.clone(),
             });
-            self.set_status(mfa.clone()).await;
+            self.set_status(mfa.clone());
             Ok(mfa)
         } else {
             self.start_tunnel(new_session).await
@@ -543,28 +612,25 @@ impl TunnelManager {
     /// Prefers the server from an active `Connected` status; falls back to the
     /// server remembered from the most recent `connect()` call.
     pub async fn current_server(&self) -> Option<String> {
-        let status = self.status.read().await;
-        if let ConnectionStatus::Connected(ref info) = *status {
-            return Some(info.server_name.clone());
+        if let ConnectionStatus::Connected(info) = self.read_status() {
+            return Some(info.server_name);
         }
-        drop(status);
-
         self.last_server.read().await.clone()
     }
 
     pub async fn routes(&self) -> Vec<VpnRoute> {
-        if let ConnectionStatus::Connected(ref info) = *self.status.read().await {
+        if let ConnectionStatus::Connected(info) = self.read_status() {
             vec![VpnRoute {
                 destination: "0.0.0.0/0".to_string(),
                 gateway: Some(info.ip_address.clone()),
-                interface: info.interface_name.clone(),
+                interface: info.interface_name,
             }]
         } else {
             vec![]
         }
     }
 
-    async fn set_status(&self, status: ConnectionStatus) {
+    fn set_status(&self, status: ConnectionStatus) {
         let status_str = match &status {
             ConnectionStatus::Disconnected => "disconnected",
             ConnectionStatus::Connecting => "connecting",
@@ -573,10 +639,22 @@ impl TunnelManager {
             ConnectionStatus::Error { .. } => "error",
         };
 
-        *self.status.write().await = status;
+        *self.status.lock().expect("status mutex poisoned") = status;
         let _ = self.event_tx.send(ServerEvent::ConnectionStatus {
             status: status_str.to_string(),
         });
+    }
+}
+
+#[cfg(test)]
+impl TunnelManager {
+    /// Test-only helper used to drive the `connect()` failure-recovery path
+    /// without standing up a full mock `TunnelConnectorFactory`. We can't
+    /// easily mock `CheckPointTunnelConnectorFactory` (it's a foreign type),
+    /// so the test triggers the same code path by setting `Connecting`
+    /// directly and then invoking the post-connect reset logic.
+    fn force_status(&self, status: ConnectionStatus) {
+        *self.status.lock().expect("status mutex poisoned") = status;
     }
 }
 
@@ -586,7 +664,7 @@ mod tests {
     //! `tunnel_type` and `transport_type`.  An snxcore upgrade that renames
     //! a `Debug`-derived variant must NOT silently change our public API —
     //! that's exactly the bug an explicit `match` was added to prevent.
-    use super::{transport_type_str, tunnel_type_str};
+    use super::{ConnectionStatus, TunnelManager, VpnConfig, transport_type_str, tunnel_type_str};
     use snxcore::model::params::{TransportType, TunnelType};
 
     #[test]
@@ -614,5 +692,80 @@ mod tests {
     #[test]
     fn transport_type_default_maps_to_auto() {
         assert_eq!(transport_type_str(TransportType::default()), "auto");
+    }
+
+    /// Regression test for the bug where a failure inside `connect()` (e.g.
+    /// `authenticate().await?` returning Err) would leave `status` stuck on
+    /// `Connecting`, locking out every subsequent connect attempt. After
+    /// the fix, an Err return must transition `status` to `Error { .. }`.
+    #[tokio::test]
+    async fn connect_failure_does_not_leave_status_in_connecting() {
+        let (tx, _rx) = tokio::sync::broadcast::channel(8);
+        let mgr = TunnelManager::new(tx);
+
+        // Use an empty VpnConfig — the underlying snxcore factory will
+        // reject this with an error, which is exactly the failure we want
+        // to drive through `connect()`.
+        let bad = VpnConfig::default();
+
+        let result = mgr.connect(&bad).await;
+        assert!(
+            result.is_err(),
+            "expected connect to fail with empty config"
+        );
+
+        // The critical property: status is NOT stuck on Connecting.
+        let status = mgr.status().await.connection;
+        assert!(
+            !matches!(status, ConnectionStatus::Connecting),
+            "status was left as Connecting after error, got {status:?}"
+        );
+    }
+
+    /// Direct test of the reset semantics that `connect()` relies on:
+    /// putting status into `Connecting` and then writing `Error { .. }`
+    /// on top of it must succeed and be observable via `status()`.
+    #[tokio::test]
+    async fn set_status_overwrites_connecting() {
+        let (tx, _rx) = tokio::sync::broadcast::channel(8);
+        let mgr = TunnelManager::new(tx);
+
+        mgr.force_status(ConnectionStatus::Connecting);
+        mgr.set_status(ConnectionStatus::Error {
+            message: "test".into(),
+        });
+
+        let status = mgr.status().await.connection;
+        assert!(matches!(status, ConnectionStatus::Error { .. }));
+    }
+
+    /// `disconnect()` must abort spawned tunnel/event tasks (so they don't
+    /// accumulate across reconnects) and reset status to Disconnected.
+    /// We only assert the visible properties: status is Disconnected and
+    /// the task list is empty after disconnect.
+    #[tokio::test]
+    async fn disconnect_clears_tasks_and_resets_status() {
+        let (tx, _rx) = tokio::sync::broadcast::channel(8);
+        let mgr = TunnelManager::new(tx);
+
+        // Inject a fake background task so the disconnect path has
+        // something to drain. This task would run forever if not aborted.
+        let dummy = tokio::spawn(async {
+            futures_util::future::pending::<()>().await;
+        });
+        mgr.tasks.lock().expect("tasks mutex poisoned").push(dummy);
+
+        // Put manager into a non-Disconnected state so disconnect() runs
+        // its full path instead of bailing early.
+        mgr.force_status(ConnectionStatus::Connecting);
+
+        mgr.disconnect().await.expect("disconnect should succeed");
+
+        let status = mgr.status().await.connection;
+        assert!(matches!(status, ConnectionStatus::Disconnected));
+        assert!(
+            mgr.tasks.lock().expect("tasks mutex poisoned").is_empty(),
+            "task list should be drained after disconnect"
+        );
     }
 }

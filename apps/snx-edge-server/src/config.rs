@@ -11,6 +11,19 @@ pub struct AppConfig {
     pub logging: LoggingConfig,
     #[serde(default)]
     pub security: SecurityConfig,
+    #[serde(default)]
+    pub shutdown: ShutdownConfig,
+}
+
+/// Behavior of the graceful shutdown sequence.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ShutdownConfig {
+    /// On graceful shutdown, run `Provisioner::teardown` to remove RouterOS
+    /// PBR rules. Default `false` — operators usually want the kill-switch
+    /// preserved across container restarts so client traffic stays
+    /// black-holed instead of leaking to the public internet.
+    #[serde(default)]
+    pub teardown_routeros: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

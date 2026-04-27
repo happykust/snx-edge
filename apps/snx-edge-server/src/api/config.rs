@@ -175,6 +175,8 @@ async fn update_config(
         }
     }
 
+    let routeros_changed = req.routeros.is_some();
+
     {
         let mut config = state.config.write().await;
 
@@ -234,6 +236,13 @@ async fn update_config(
         config
             .save(&state.config_path)
             .map_err(|e| AppError::Internal(format!("failed to save config: {e}")))?;
+    }
+
+    // If [routeros] settings changed, drop the cached client so the next
+    // request rebuilds it with the new config (e.g. tls_skip_verify toggle
+    // requires a fresh `reqwest::Client`).
+    if routeros_changed {
+        state.invalidate_routeros_client().await;
     }
 
     // Broadcast change event (outside write lock)

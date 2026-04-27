@@ -47,3 +47,11 @@ allow_no_cert_check = false
 # CIDRs whose peer_addr is trusted to set X-Forwarded-For / X-Real-IP.
 # Empty list (the default) means forwarded headers are never trusted.
 # trusted_proxies = ["127.0.0.1/32"]
+
+[shutdown]
+# On graceful shutdown (SIGTERM/SIGINT), run Provisioner::teardown to remove
+# the RouterOS PBR rules (kill-switch, mangle, routes, dst-nat, etc.).
+# Default `false` — operators usually want the kill-switch preserved across
+# container restarts so client traffic stays black-holed instead of leaking
+# to the public internet during the maintenance window.
+teardown_routeros = false

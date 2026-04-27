@@ -9,6 +9,11 @@ use crate::error::AppError;
 ///
 /// RouterOS 7.1+ exposes REST at `https://<host>/rest/`.
 /// Authentication is HTTP Basic Auth.
+///
+/// Cloning is cheap — `reqwest::Client` is internally `Arc`-based and the
+/// remaining fields are short strings. The cache in `AppState` clones the
+/// stored value on every lookup.
+#[derive(Clone)]
 pub struct RouterOsClient {
     client: Client,
     base_url: String,

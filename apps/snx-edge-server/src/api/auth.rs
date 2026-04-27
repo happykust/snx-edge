@@ -569,6 +569,7 @@ mod tests {
                 allow_no_cert_check: false,
                 trusted_proxies: trusted.iter().map(|s| (*s).to_string()).collect(),
             },
+            shutdown: crate::config::ShutdownConfig::default(),
         }
     }
 }
