@@ -1,0 +1,65 @@
+# cargo-deny configuration. Run `cargo deny check` to enforce.
+# Project license: AGPL-3.0.
+
+[advisories]
+# Refuse yanked crates outright.
+yanked = "deny"
+# Whether to check unmaintained crates: "all", "workspace", "transitive", "none".
+unmaintained = "transitive"
+# Per-advisory ignores.
+ignore = [
+    # rustls-pemfile is unmaintained but still required by axum-server until
+    # upstream migrates. Track and remove the ignore once axum-server moves
+    # to rustls-pki-types.
+    "RUSTSEC-2025-0134",
+    # paste is unmaintained but pulled transitively via snxcore → netlink
+    # stack. No drop-in replacement; track upstream.
+    "RUSTSEC-2024-0436",
+]
+
+[licenses]
+# Permissive licenses compatible with AGPL-3.0 distribution.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "Zlib",
+    "MPL-2.0",
+    "AGPL-3.0",
+    "AGPL-3.0-or-later",
+    "BSL-1.0",
+    "CC0-1.0",
+    "0BSD",
+    # ksni — Linux system tray client.
+    "Unlicense",
+    # tun — userspace TUN/TAP wrapper used by snxcore.
+    "WTFPL",
+    # webpki-roots — Mozilla CA bundle redistributed for rustls.
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.93
+
+[[licenses.exceptions]]
+# `ring` exposes a non-standard composite license; widely accepted in the Rust ecosystem.
+allow = ["OpenSSL", "ISC", "MIT"]
+name = "ring"
+
+[bans]
+multiple-versions = "warn"
+wildcards = "warn"
+deny = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-git = [
+    # snxcore — Check Point VPN library. Pinned to a specific rev in Cargo.toml.
+    "https://github.com/ancwrd1/snx-rs.git",
+    # isakmp — IKE/IPsec implementation pulled by snxcore.
+    "https://github.com/ancwrd1/isakmp.git",
+]

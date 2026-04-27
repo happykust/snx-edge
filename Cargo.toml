@@ -51,6 +51,10 @@ keyring = { version = "3", features = ["sync-secret-service"] }
 # TLS / mTLS
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 rustls = "0.23"
+# Pinned to >=0.103.13 to address RUSTSEC-2026-0098/0099/0104 (name constraint
+# bypass and reachable panic in CRL parsing). Forced via direct workspace dep
+# because the transitive `rustls 0.23` did not pull a fixed version.
+rustls-webpki = "0.103.13"
 rustls-pemfile = "2"
 tokio-rustls = "0.26"
 
@@ -68,8 +72,9 @@ clap = { version = "4", features = ["derive"] }
 tabled = "0.20"
 rpassword = "7"
 
-# VPN core
-snxcore = { git = "https://github.com/ancwrd1/snx-rs.git" }
+# VPN core. Pinned to a specific commit — supply-chain integrity requires that
+# `cargo update` cannot silently advance to upstream HEAD.
+snxcore = { git = "https://github.com/ancwrd1/snx-rs.git", rev = "265265148485f1631116753c1aa9d83053bc3ae9" }
 
 [profile.release]
 opt-level = 'z'
