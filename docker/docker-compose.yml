@@ -1,5 +1,14 @@
-# WARNING: This file contains development secrets.
-# Do NOT use these values in production. Override via .env or environment variables.
+# Local development compose file.
+#
+# Secrets are read from `docker/.env` (see `.env.example` for the template).
+# The `:?` suffix on each variable causes compose to abort if the variable is
+# unset, preventing accidental boots with an empty JWT secret.
+#
+# Required capabilities:
+#   - NET_ADMIN: iptables (MASQUERADE), TUN device control, sysctl ip_forward
+#   - NET_RAW:   raw socket access for TUN device packet inspection
+# All other capabilities are dropped. `no-new-privileges` blocks any further
+# privilege escalation via setuid binaries inside the container.
 services:
   snx-edge-server:
     build:
@@ -8,18 +17,27 @@ services:
     ports:
       - "8080:8080"
     environment:
-      - SNX_EDGE_JWT_SECRET=dev-secret-at-least-32-characters-long!!
-      - SNX_EDGE_ADMIN_USER=admin
-      - SNX_EDGE_ADMIN_PASSWORD=admin123456
-      - ROUTEROS_HOST=172.19.0.1
-      - ROUTEROS_USER=snx-edge
-      - ROUTEROS_PASSWORD=routeros-dev
+      SNX_EDGE_JWT_SECRET: "${SNX_EDGE_JWT_SECRET:?SNX_EDGE_JWT_SECRET must be set in docker/.env}"
+      SNX_EDGE_ADMIN_USER: "${SNX_EDGE_ADMIN_USER:?SNX_EDGE_ADMIN_USER must be set in docker/.env}"
+      SNX_EDGE_ADMIN_PASSWORD: "${SNX_EDGE_ADMIN_PASSWORD:?SNX_EDGE_ADMIN_PASSWORD must be set in docker/.env}"
+      ROUTEROS_HOST: "${ROUTEROS_HOST:?ROUTEROS_HOST must be set in docker/.env}"
+      ROUTEROS_USER: "${ROUTEROS_USER:?ROUTEROS_USER must be set in docker/.env}"
+      ROUTEROS_PASSWORD: "${ROUTEROS_PASSWORD:?ROUTEROS_PASSWORD must be set in docker/.env}"
+      # Optional: enables on-disk encryption for VPN profile credentials.
+      SNX_EDGE_PROFILE_KEY: "${SNX_EDGE_PROFILE_KEY:-}"
     volumes:
       - snx-config:/etc/snx-edge
       - snx-data:/var/lib/snx-edge
       - snx-logs:/var/log/snx-edge
+    cap_drop:
+      - ALL
     cap_add:
+      # Minimum capabilities required: NET_ADMIN (iptables, TUN, ip_forward),
+      # NET_RAW (TUN device packet inspection).
       - NET_ADMIN
+      - NET_RAW
+    security_opt:
+      - no-new-privileges:true
     devices:
       - /dev/net/tun:/dev/net/tun
     sysctls:

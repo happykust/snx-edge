@@ -55,9 +55,20 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
-      - uses: rustsec/audit-check@v2
+
+      # rustsec/audit-check fails the job on any advisory not present in the
+      # ignore list of deny.toml. The previous configuration left the step in
+      # non-failing mode; this version is a hard gate.
+      - name: cargo audit
+        uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@cargo-deny
+
+      - name: cargo deny check
+        run: cargo deny check
 
   build-server:
     name: Build Server (${{ matrix.arch }})
@@ -87,3 +98,41 @@ jobs:
         with:
           name: snx-edge-server-${{ matrix.arch }}
           path: target/${{ matrix.target }}/release/snx-edge-server
+
+  docker-build:
+    # Catches Dockerfile bugs at PR time instead of release time. Builds both
+    # the dev image (native arch) and the release image (multi-arch via
+    # buildx) without pushing.
+    name: Docker build (PR)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    needs: build-server
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download amd64 artifact (for release Dockerfile context)
+        uses: actions/download-artifact@v4
+        with:
+          name: snx-edge-server-amd64
+          path: ./
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build dev image
+        run: docker build -f docker/Dockerfile -t snx-edge:pr-test .
+
+      - name: Build release image (no push, multi-arch)
+        # Release image expects `snx-edge-server` and `THIRD-PARTY-LICENSES.html`
+        # next to the Dockerfile context root. Stub the license file so PR
+        # builds don't require a full cargo-about run.
+        run: |
+          chmod +x snx-edge-server
+          echo "<!-- placeholder for PR build only -->" > THIRD-PARTY-LICENSES.html
+          docker buildx build \
+            -f docker/Dockerfile.release \
+            --platform linux/amd64,linux/arm64 \
+            .

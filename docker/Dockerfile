@@ -19,13 +19,15 @@ RUN cargo build --release -p snx-edge-server
 # ---- Runtime ----
 FROM alpine:${ALPINE_VERSION}
 
+# curl is used for the HEALTHCHECK; libcap is required for setcap on the binary.
 RUN apk add --no-cache \
     ca-certificates \
+    curl \
     iproute2 \
     iptables \
     ip6tables \
-    openrc \
-    wget
+    libcap \
+    openrc
 
 # iptables-legacy (nftables does not work in MikroTik containers)
 RUN rm -f /usr/sbin/iptables && ln -s /usr/sbin/iptables-legacy /usr/sbin/iptables && \
@@ -51,22 +53,32 @@ RUN sed -i 's/^\(tty\d\:\:\)/#\1/' /etc/inittab && \
 RUN sed -i 's/cmd sysctl -q \(.*\?\)=\(.*\)/[[ "$(sysctl -n \1)" != "\2" ]] \&\& \0/' \
     /usr/libexec/rc/sh/init.sh 2>/dev/null || true
 
-# Install binary
+# Create dedicated unprivileged user. PID 1 stays root (OpenRC requirement);
+# OpenRC drops to this user via `command_user` in /etc/init.d/snx-edge.
+RUN addgroup -S snxedge && adduser -S snxedge -G snxedge
+
+# Install binary, then grant the network capabilities the server needs to
+# perform iptables/TUN operations as a non-root user.
 COPY --from=builder /app/target/release/snx-edge-server /usr/local/bin/
+RUN setcap cap_net_admin,cap_net_raw=eip /usr/local/bin/snx-edge-server
 
 # Install OpenRC init script
 COPY docker/snx-edge.initd /etc/init.d/snx-edge
 RUN chmod +x /etc/init.d/snx-edge && rc-update add snx-edge default
 
-# Create required directories
-RUN mkdir -p /etc/snx-edge/profiles /var/lib/snx-edge /var/log/snx-edge
+# Create required directories owned by snxedge
+RUN mkdir -p /etc/snx-edge/profiles /var/lib/snx-edge /var/log/snx-edge && \
+    chown -R snxedge:snxedge /etc/snx-edge /var/lib/snx-edge /var/log/snx-edge
 
 # Example config (copy to config.toml and customize)
 COPY docker/config.toml.example /etc/snx-edge/config.toml.example
+RUN chown snxedge:snxedge /etc/snx-edge/config.toml.example
 
 EXPOSE 8080
 
-HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
-  CMD wget -qO- http://localhost:8080/api/v1/health || exit 1
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD curl -fsS http://localhost:8080/api/v1/health || exit 1
 
+# PID 1 must be root for OpenRC; the server process itself runs as `snxedge`
+# via `command_user` in the init script.
 ENTRYPOINT ["/sbin/init"]

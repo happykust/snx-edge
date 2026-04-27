@@ -2,7 +2,16 @@ ARG ALPINE_VERSION=3.23
 FROM alpine:${ALPINE_VERSION}
 
 ARG TARGETARCH
-RUN apk add --no-cache ca-certificates iproute2 iptables iptables-legacy openrc wget
+
+# curl is used for HEALTHCHECK; libcap provides setcap for capability grants.
+RUN apk add --no-cache \
+    ca-certificates \
+    curl \
+    iproute2 \
+    iptables \
+    iptables-legacy \
+    libcap \
+    openrc
 
 RUN rm -f /usr/sbin/iptables && ln -s /usr/sbin/iptables-legacy /usr/sbin/iptables && \
     rm -f /usr/sbin/ip6tables && ln -s /usr/sbin/ip6tables-legacy /usr/sbin/ip6tables
@@ -19,14 +28,28 @@ RUN sed -i 's/^\(tty\d\:\:\)/#\1/' /etc/inittab && \
 RUN sed -i 's/cmd sysctl -q \(.*\?\)=\(.*\)/[[ "$(sysctl -n \1)" != "\2" ]] \&\& \0/' \
     /usr/libexec/rc/sh/init.sh 2>/dev/null || true
 
+# Dedicated unprivileged user; OpenRC keeps PID 1 as root and drops to this
+# user for the actual server process via `command_user` in the init script.
+RUN addgroup -S snxedge && adduser -S snxedge -G snxedge
+
 COPY snx-edge-server /usr/local/bin/snx-edge-server
+RUN setcap cap_net_admin,cap_net_raw=eip /usr/local/bin/snx-edge-server
+
 COPY docker/snx-edge.initd /etc/init.d/snx-edge
 RUN chmod +x /etc/init.d/snx-edge && rc-update add snx-edge default
-RUN mkdir -p /etc/snx-edge/profiles /var/lib/snx-edge /var/log/snx-edge
+RUN mkdir -p /etc/snx-edge/profiles /var/lib/snx-edge /var/log/snx-edge && \
+    chown -R snxedge:snxedge /etc/snx-edge /var/lib/snx-edge /var/log/snx-edge
 COPY docker/config.toml.example /etc/snx-edge/config.toml.example
+RUN chown snxedge:snxedge /etc/snx-edge/config.toml.example
 
-HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
-  CMD wget -qO- http://localhost:8080/api/v1/health || exit 1
+# Bundled third-party license report. Generated in CI by `cargo about` and
+# downloaded as an artifact before docker build (see release.yml).
+# TODO(7.12): automate license regeneration in CI; the COPY below assumes
+# THIRD-PARTY-LICENSES.html sits next to the staged binary.
+COPY THIRD-PARTY-LICENSES.html /usr/local/share/doc/snx-edge/THIRD-PARTY-LICENSES.html
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD curl -fsS http://localhost:8080/api/v1/health || exit 1
 
 EXPOSE 8080
 ENTRYPOINT ["/sbin/init"]

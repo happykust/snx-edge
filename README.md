@@ -33,13 +33,26 @@ Headless Check Point VPN client running inside a MikroTik container with a remot
 | **snx-edge-server** | Headless VPN client + Management API | Docker on MikroTik (Alpine, ARM64) |
 | **snx-edge-client** | Tray app for remote management | Linux desktop (x86_64, GTK4/libadwaita) |
 
+## Hardware Requirements
+
+| Resource | Minimum | Recommended |
+|---|---|---|
+| CPU | ARMv8 (ARM64) or x86_64 | ARMv8 / x86_64 |
+| RAM | 256 MB free | 512 MB+ |
+| RouterOS | 7.4 with container support | 7.10+ |
+| Storage | ~50 MB for image + config | 200 MB |
+
+ARMv7 is **not supported** — `snxcore`'s OpenSSL/SQLite stack requires a 64-bit toolchain. The server itself uses around 50 MB of RAM at idle; the rest is Alpine OS overhead, plus headroom for active VPN sessions.
+
+Recommended MikroTik models: **hAP ax²**, **hAP ax³**, **RB4011** series, **CCR** series, and **CHR** virtual instances. Enable the `container` package and reboot before deploying.
+
 ## Quick Start (Docker)
 
 ### Prerequisites
 
-- MikroTik router with RouterOS 7.4+ and container support
+- MikroTik router with RouterOS 7.4+ and container support enabled
 - Check Point VPN gateway credentials
-- Docker (for local testing) or MikroTik container package
+- Docker (for local testing) or MikroTik's container runtime
 
 ### 1. Clone the repository
 
@@ -57,12 +70,14 @@ cp docker/config.toml.example docker/config.toml
 
 ### 3. Set environment variables
 
+Copy the template and fill in real values:
+
 ```bash
-export SNX_EDGE_JWT_SECRET="your-secret-at-least-32-characters-long"
-export ROUTEROS_HOST="172.19.0.1"
-export ROUTEROS_USER="snx-edge"
-export ROUTEROS_PASSWORD="changeme"
+cp docker/.env.example docker/.env
+$EDITOR docker/.env
 ```
+
+`docker/.env` is gitignored; never commit real secrets. Compose will refuse to start if `SNX_EDGE_JWT_SECRET`, `ROUTEROS_HOST`, `ROUTEROS_USER`, or `ROUTEROS_PASSWORD` are missing.
 
 ### 4. Run
 
@@ -71,7 +86,20 @@ cd docker
 docker compose up -d
 ```
 
-The server will be available at `http://localhost:8080`. The default admin account is created from `SNX_EDGE_ADMIN_USER` / `SNX_EDGE_ADMIN_PASSWORD` environment variables.
+The server will be available at `http://localhost:8080`. The default admin account is created from `SNX_EDGE_ADMIN_USER` / `SNX_EDGE_ADMIN_PASSWORD` on first start.
+
+### Required container capabilities
+
+The container runs with the minimum capability set:
+
+| Capability | Why |
+|---|---|
+| `NET_ADMIN` | iptables MASQUERADE, TUN device control, `net.ipv4.ip_forward` |
+| `NET_RAW` | TUN device packet inspection |
+
+All other Linux capabilities are dropped (`cap_drop: ALL`), and `no-new-privileges:true` blocks setuid escalation. The compose file deliberately avoids `privileged: true`.
+
+> **MikroTik note:** RouterOS's container runtime exposes its own `mounts` / `cap-add` syntax in `/container/config`. The capability set is the same (`NET_ADMIN`, `NET_RAW`), but the wire format differs from Docker Compose. See the RouterOS container documentation for the equivalent fields.
 
 ## Building from Source
 
@@ -198,13 +226,34 @@ snx-edge/
 └── Cargo.toml                 # Workspace root
 ```
 
-## Contributing
+## Troubleshooting
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and guidelines.
+| Symptom | Likely cause / fix |
+|---|---|
+| Container does not start on RouterOS | Container support is not enabled. Install the `container` package, set `/container/config set registry-url=https://registry-1.docker.io tmpdir=disk1/pull`, reboot, then retry. |
+| `iptables-legacy: not found` in logs | Old base image. Pull `latest` (Alpine 3.23+); pre-3.23 images shipped only `iptables-nft`, which does not work in MikroTik containers. |
+| DNS does not resolve after connect | The DNS dst-NAT rule did not apply. Check the provisioner ran successfully (`/api/v1/routing/diagnostics`) and that `dns-dst-nat` is enabled. Verify your VPN clients are in the `vpn-clients` address list. |
+| TLS handshake fails against the Check Point gateway | Corporate CA missing, time skew, or self-signed gateway. Check the system clock first. As a last resort, set `[security].allow_no_cert_check = true` in `config.toml` and `no_cert_check = true` on the profile — only on networks where you trust the path to the gateway. |
+| Server exits immediately with "JWT secret missing" | Env var name configured in `[auth].jwt_secret_env` does not match the actual environment variable. Default is `SNX_EDGE_JWT_SECRET`. |
+| `MASQUERADE: command not found` or `permission denied` from iptables | Container started without `NET_ADMIN`. Re-check `cap_add` in compose, or the equivalent on RouterOS. |
+| Healthcheck reports unhealthy but API works | Healthcheck uses `curl http://localhost:8080/api/v1/health`. If you enabled TLS on the management port, the healthcheck needs to be updated to use `https://` and the `--cacert` flag, or change `[api].listen` to bind plain HTTP on `127.0.0.1` for the healthcheck. |
 
 ## Security
 
-For responsible disclosure of security vulnerabilities, see [SECURITY.md](SECURITY.md).
+snx-edge handles VPN credentials, JWT signing material, and RouterOS admin credentials. For responsible disclosure of security vulnerabilities, see [SECURITY.md](SECURITY.md).
+
+Production hardening checklist (see `docker/config.toml.example` for full details):
+
+- `[security].allow_no_cert_check = false` — refuse profiles that disable certificate verification of the Check Point gateway.
+- `[security].profile_encryption_key_env = "SNX_EDGE_PROFILE_KEY"` — encrypt VPN credentials at rest in SQLite.
+- `[api].tls_cert` / `[api].tls_key` — terminate TLS on the management API.
+- `[api].tls_client_ca` — require client certificates (mTLS) when exposing the API beyond the local subnet.
+- Set strong `SNX_EDGE_JWT_SECRET` (>= 32 random bytes; generate with `openssl rand -base64 32`).
+- Restrict the RouterOS user to only the routing/firewall trees the provisioner needs.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and guidelines.
 
 ## Acknowledgments
 

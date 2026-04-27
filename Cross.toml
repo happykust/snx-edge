@@ -1,5 +1,20 @@
+# cross-rs configuration.
+#
+# Pinning the base image digest (sha256) prevents future cross-rs base image
+# updates from silently changing reproducibility of release builds. The tag
+# `0.2.5` is mutable on GHCR and may be re-pushed; the digest is immutable.
+#
+# Digests below were resolved against ghcr.io/cross-rs/* on 2026-04-27 (see
+# `docker manifest inspect` or the `docker-content-digest` header on the
+# manifests endpoint). Update them when bumping the cross-rs version.
+#
+# `pre-build` injects perl + make for OpenSSL's vendored build (required by
+# the `vendored-openssl` feature on snx-edge-server).
+
 [target.x86_64-unknown-linux-musl]
+image = "ghcr.io/cross-rs/x86_64-unknown-linux-musl:0.2.5@sha256:77db671d8356a64ae72a3e1415e63f547f26d374fbe3c4762c1cd36c7eac7b99"
 pre-build = ["DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends perl make"]
 
 [target.aarch64-unknown-linux-musl]
+image = "ghcr.io/cross-rs/aarch64-unknown-linux-musl:0.2.5@sha256:702154f52b2d8091671aa2c84d5582d849f949977228c735ff8462f93cc0e1e4"
 pre-build = ["DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends perl make"]
