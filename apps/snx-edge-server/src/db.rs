@@ -1,3 +1,11 @@
+// Schema migrations are forward-only and applied in-order at startup.
+// To change the schema, add a new entry to `migrations()` with a strictly
+// increasing `version` and a SQL body that is idempotent on first run for
+// pre-existing installations (use `CREATE TABLE IF NOT EXISTS`,
+// `ALTER TABLE ...` is acceptable on later versions). Never edit an existing
+// migration: applied versions are recorded in `_schema_migrations` and a
+// retroactive change would be silently skipped on already-bootstrapped DBs.
+
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -8,6 +16,99 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::error::AppError;
+
+/// A single forward-only schema migration.
+pub struct Migration {
+    pub version: u32,
+    pub sql: &'static str,
+}
+
+/// Ordered list of all schema migrations. Append-only; never edit existing
+/// entries (see top-of-file comment).
+pub fn migrations() -> &'static [Migration] {
+    // v1 replicates the original inline schema. `IF NOT EXISTS` keeps it
+    // idempotent for installations that pre-date the migration framework —
+    // the DDL is a no-op there but still records version=1 in
+    // `_schema_migrations`, so subsequent migrations behave the same on
+    // legacy and new databases.
+    const MIGRATIONS: &[Migration] = &[Migration {
+        version: 1,
+        sql: "CREATE TABLE IF NOT EXISTS users (
+                id              TEXT PRIMARY KEY,
+                username        TEXT UNIQUE NOT NULL,
+                password_hash   TEXT NOT NULL,
+                role            TEXT NOT NULL DEFAULT 'viewer',
+                comment         TEXT NOT NULL DEFAULT '',
+                enabled         INTEGER NOT NULL DEFAULT 1,
+                failed_login_attempts INTEGER NOT NULL DEFAULT 0,
+                locked_until    TEXT,
+                created_at      TEXT NOT NULL,
+                updated_at      TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS sessions (
+                id          TEXT PRIMARY KEY,
+                user_id     TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                ip_address  TEXT,
+                user_agent  TEXT,
+                created_at  TEXT NOT NULL,
+                expires_at  TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS profiles (
+                id          TEXT PRIMARY KEY,
+                name        TEXT NOT NULL,
+                config      TEXT NOT NULL,
+                enabled     INTEGER NOT NULL DEFAULT 1,
+                created_at  TEXT NOT NULL,
+                updated_at  TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id);
+            CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions(expires_at);",
+    }];
+    MIGRATIONS
+}
+
+/// Apply all migrations whose version is greater than the database's current
+/// `PRAGMA user_version`. Each migration runs inside its own transaction, the
+/// version pragma is bumped, and a row is written to `_schema_migrations`.
+fn apply_migrations(conn: &mut rusqlite::Connection, migs: &[Migration]) -> rusqlite::Result<()> {
+    // Bookkeeping table for human-readable history. PRAGMA user_version is
+    // the source of truth for "what's applied"; this table is just an audit
+    // trail.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS _schema_migrations (
+             version    INTEGER PRIMARY KEY,
+             applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+         );",
+    )?;
+
+    let current: u32 =
+        conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))? as u32;
+
+    for m in migs {
+        if m.version <= current {
+            continue;
+        }
+
+        let tx = conn.transaction()?;
+        tx.execute_batch(m.sql)?;
+        tx.execute(
+            "INSERT OR IGNORE INTO _schema_migrations (version) VALUES (?1)",
+            params![m.version],
+        )?;
+        // PRAGMA user_version doesn't support bound params, hence the
+        // formatted string. `version: u32` is not user-controlled, so this
+        // is safe.
+        tx.execute_batch(&format!("PRAGMA user_version = {}", m.version))?;
+        tx.commit()?;
+
+        tracing::info!("applied schema migration v{}", m.version);
+    }
+
+    Ok(())
+}
 
 /// User record from the database.
 #[derive(Debug, Clone, Serialize)]
@@ -63,53 +164,21 @@ impl UserDb {
             std::fs::create_dir_all(parent)?;
         }
 
-        let conn = rusqlite::Connection::open(path)?;
+        let mut conn = rusqlite::Connection::open(path)?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+        apply_migrations(&mut conn, migrations())?;
 
-        let db = Self {
+        Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
-        };
-        db.migrate().await?;
-        Ok(db)
+        })
     }
 
-    async fn migrate(&self) -> anyhow::Result<()> {
+    /// Cheap liveness probe for the readiness endpoint. Runs a trivial query
+    /// so we exercise the actual SQLite handle. Errors propagate so the
+    /// health endpoint can classify them.
+    pub async fn health_check(&self) -> Result<(), AppError> {
         let conn = self.conn.lock().await;
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS users (
-                id              TEXT PRIMARY KEY,
-                username        TEXT UNIQUE NOT NULL,
-                password_hash   TEXT NOT NULL,
-                role            TEXT NOT NULL DEFAULT 'viewer',
-                comment         TEXT NOT NULL DEFAULT '',
-                enabled         INTEGER NOT NULL DEFAULT 1,
-                failed_login_attempts INTEGER NOT NULL DEFAULT 0,
-                locked_until    TEXT,
-                created_at      TEXT NOT NULL,
-                updated_at      TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS sessions (
-                id          TEXT PRIMARY KEY,
-                user_id     TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                ip_address  TEXT,
-                user_agent  TEXT,
-                created_at  TEXT NOT NULL,
-                expires_at  TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS profiles (
-                id          TEXT PRIMARY KEY,
-                name        TEXT NOT NULL,
-                config      TEXT NOT NULL,
-                enabled     INTEGER NOT NULL DEFAULT 1,
-                created_at  TEXT NOT NULL,
-                updated_at  TEXT NOT NULL
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id);
-            CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions(expires_at);",
-        )?;
+        let _: u32 = conn.query_row("SELECT 1", [], |row| row.get(0))?;
         Ok(())
     }
 
@@ -751,5 +820,70 @@ mod tests {
     #[test]
     fn parse_dt_succeeds_on_valid_rfc3339() {
         assert!(parse_dt("2024-01-01T00:00:00Z".to_string()).is_ok());
+    }
+
+    /// Latest version derived from the static `migrations()` table — the
+    /// expected `PRAGMA user_version` after a successful bootstrap.
+    fn latest_version() -> u32 {
+        migrations()
+            .iter()
+            .map(|m| m.version)
+            .max()
+            .expect("at least one migration must exist")
+    }
+
+    #[test]
+    fn migrations_apply_to_empty_db_idempotently() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        apply_migrations(&mut conn, migrations()).expect("first apply");
+
+        let v1: u32 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .map(|v| v as u32)
+            .unwrap();
+        assert_eq!(v1, latest_version());
+
+        // Second apply is a no-op — version unchanged, no errors.
+        apply_migrations(&mut conn, migrations()).expect("second apply");
+        let v2: u32 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .map(|v| v as u32)
+            .unwrap();
+        assert_eq!(v2, latest_version());
+
+        // _schema_migrations should have exactly one row per migration.
+        let count: u32 = conn
+            .query_row("SELECT COUNT(*) FROM _schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, migrations().len() as u32);
+    }
+
+    #[tokio::test]
+    async fn migrations_preserve_existing_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let path_str = path.to_string_lossy().to_string();
+
+        // First open: bootstraps the schema.
+        let db = UserDb::new(&path_str).await.unwrap();
+        let now = Utc::now().to_rfc3339();
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "INSERT INTO users (id, username, password_hash, role, comment,
+                                    enabled, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, 'admin', '', 1, ?4, ?4)",
+                params!["uid-1", "alice", "hash", now],
+            )
+            .unwrap();
+        }
+        drop(db);
+
+        // Second open: must not error and must preserve the inserted row.
+        let db = UserDb::new(&path_str).await.unwrap();
+        let user = db.get_user_by_username("alice").await.unwrap();
+        assert_eq!(user.id, "uid-1");
     }
 }

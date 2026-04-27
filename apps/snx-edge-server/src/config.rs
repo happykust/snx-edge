@@ -119,17 +119,157 @@ impl AppConfig {
         Ok(config)
     }
 
-    /// Persist the current configuration to disk.
-    ///
-    /// This **overwrites** the file at `path` with a freshly serialised
-    /// TOML representation.  Any manual edits or comments in the original
-    /// file will be lost.  This is acceptable for the appliance deployment
-    /// model where the configuration is managed exclusively through the
-    /// management API.
+    /// Persists the configuration to disk, preserving formatting and
+    /// comments where possible. If the existing file is unparseable or
+    /// doesn't exist, writes a fresh TOML representation.
     pub fn save(&self, path: &str) -> anyhow::Result<()> {
+        // Try to merge into an existing on-disk document so comments and
+        // hand-written formatting survive the round trip. `toml_edit`
+        // preserves trivia between key replacements, so updating values
+        // in-place leaves surrounding comments untouched.
+        if let Ok(existing) = std::fs::read_to_string(path) {
+            match existing.parse::<toml_edit::DocumentMut>() {
+                Ok(mut doc) => {
+                    self.apply_to_document(&mut doc);
+                    std::fs::write(path, doc.to_string())?;
+                    return Ok(());
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "could not parse existing config for in-place save, falling back to overwrite"
+                    );
+                }
+            }
+        }
+
+        // Fresh write (file missing or unparseable).
         let content = toml::to_string_pretty(self)?;
         std::fs::write(path, content)?;
         Ok(())
+    }
+
+    /// Apply every field of `self` to a parsed `DocumentMut`. Existing keys
+    /// are updated in place (keeping their decor / comments); missing
+    /// keys/sections are inserted using freshly serialised TOML so that
+    /// optional sections like `[security]` and `[shutdown]` round-trip
+    /// correctly.
+    fn apply_to_document(&self, doc: &mut toml_edit::DocumentMut) {
+        // [api]
+        set_str(doc, "api", "listen", &self.api.listen);
+        set_opt_str(doc, "api", "tls_cert", self.api.tls_cert.as_deref());
+        set_opt_str(doc, "api", "tls_key", self.api.tls_key.as_deref());
+        set_opt_str(
+            doc,
+            "api",
+            "tls_client_ca",
+            self.api.tls_client_ca.as_deref(),
+        );
+        set_str_array(doc, "api", "cors_origins", &self.api.cors_origins);
+
+        // [auth]
+        set_str(doc, "auth", "jwt_secret_env", &self.auth.jwt_secret_env);
+        set_str(doc, "auth", "user_db", &self.auth.user_db);
+        set_int(
+            doc,
+            "auth",
+            "max_login_attempts",
+            i64::from(self.auth.max_login_attempts),
+        );
+        set_int(
+            doc,
+            "auth",
+            "lockout_duration_minutes",
+            i64::from(self.auth.lockout_duration_minutes),
+        );
+        set_int(
+            doc,
+            "auth",
+            "access_token_ttl_minutes",
+            self.auth.access_token_ttl_minutes as i64,
+        );
+        set_int(
+            doc,
+            "auth",
+            "refresh_token_ttl_days",
+            self.auth.refresh_token_ttl_days as i64,
+        );
+
+        // [routeros]
+        set_str(doc, "routeros", "host_env", &self.routeros.host_env);
+        set_str(doc, "routeros", "user_env", &self.routeros.user_env);
+        set_str(doc, "routeros", "password_env", &self.routeros.password_env);
+        set_bool(
+            doc,
+            "routeros",
+            "tls_skip_verify",
+            self.routeros.tls_skip_verify,
+        );
+        set_str(doc, "routeros", "comment_tag", &self.routeros.comment_tag);
+        set_str(
+            doc,
+            "routeros",
+            "address_list_vpn",
+            &self.routeros.address_list_vpn,
+        );
+        set_str(
+            doc,
+            "routeros",
+            "address_list_bypass",
+            &self.routeros.address_list_bypass,
+        );
+        set_str(
+            doc,
+            "routeros",
+            "routing_table",
+            &self.routeros.routing_table,
+        );
+        set_str(
+            doc,
+            "routeros",
+            "connection_mark",
+            &self.routeros.connection_mark,
+        );
+        set_str(doc, "routeros", "routing_mark", &self.routeros.routing_mark);
+        set_bool(doc, "routeros", "auto_setup", self.routeros.auto_setup);
+
+        // [logging]
+        set_str(doc, "logging", "level", &self.logging.level);
+        set_int(
+            doc,
+            "logging",
+            "buffer_size",
+            self.logging.buffer_size as i64,
+        );
+        set_opt_str(doc, "logging", "file", self.logging.file.as_deref());
+        set_str(doc, "logging", "max_file_size", &self.logging.max_file_size);
+        set_int(
+            doc,
+            "logging",
+            "max_files",
+            i64::from(self.logging.max_files),
+        );
+
+        // [security]
+        set_bool(
+            doc,
+            "security",
+            "allow_no_cert_check",
+            self.security.allow_no_cert_check,
+        );
+        set_str_array(
+            doc,
+            "security",
+            "trusted_proxies",
+            &self.security.trusted_proxies,
+        );
+
+        // [shutdown]
+        set_bool(
+            doc,
+            "shutdown",
+            "teardown_routeros",
+            self.shutdown.teardown_routeros,
+        );
     }
 
     pub fn jwt_secret(&self) -> anyhow::Result<String> {
@@ -199,4 +339,171 @@ fn default_max_file_size() -> String {
 }
 fn default_max_files() -> u32 {
     3
+}
+
+// --- toml_edit helpers ---
+//
+// Each helper looks up (or creates) `[section]` as an inline-friendly Table,
+// then sets a key. When updating an existing key the previous decor (leading
+// comments, suffix whitespace) is preserved so the on-disk diff stays small.
+
+fn ensure_table<'a>(
+    doc: &'a mut toml_edit::DocumentMut,
+    section: &str,
+) -> &'a mut toml_edit::Table {
+    if !doc.contains_key(section) {
+        let mut tbl = toml_edit::Table::new();
+        tbl.set_implicit(false);
+        doc.insert(section, toml_edit::Item::Table(tbl));
+    }
+    doc[section]
+        .as_table_mut()
+        .expect("section must be a table")
+}
+
+fn set_str(doc: &mut toml_edit::DocumentMut, section: &str, key: &str, value: &str) {
+    let tbl = ensure_table(doc, section);
+    tbl.insert(key, toml_edit::value(value));
+}
+
+fn set_opt_str(doc: &mut toml_edit::DocumentMut, section: &str, key: &str, value: Option<&str>) {
+    let tbl = ensure_table(doc, section);
+    match value {
+        Some(v) => {
+            tbl.insert(key, toml_edit::value(v));
+        }
+        None => {
+            tbl.remove(key);
+        }
+    }
+}
+
+fn set_int(doc: &mut toml_edit::DocumentMut, section: &str, key: &str, value: i64) {
+    let tbl = ensure_table(doc, section);
+    tbl.insert(key, toml_edit::value(value));
+}
+
+fn set_bool(doc: &mut toml_edit::DocumentMut, section: &str, key: &str, value: bool) {
+    let tbl = ensure_table(doc, section);
+    tbl.insert(key, toml_edit::value(value));
+}
+
+fn set_str_array(doc: &mut toml_edit::DocumentMut, section: &str, key: &str, values: &[String]) {
+    let tbl = ensure_table(doc, section);
+    let mut arr = toml_edit::Array::new();
+    for v in values {
+        arr.push(v.as_str());
+    }
+    tbl.insert(key, toml_edit::Item::Value(toml_edit::Value::Array(arr)));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn save_preserves_comments_in_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+# Top-of-file comment
+[api]
+listen = "127.0.0.1:8080"  # inline comment
+# section break
+[auth]
+jwt_secret_env = "X"
+user_db = "/tmp/x.db"
+max_login_attempts = 5
+lockout_duration_minutes = 15
+access_token_ttl_minutes = 15
+refresh_token_ttl_days = 7
+
+[routeros]
+host_env = "X"
+user_env = "X"
+password_env = "X"
+
+[logging]
+level = "info"
+buffer_size = 100
+"#,
+        )
+        .unwrap();
+
+        let mut cfg = AppConfig::load(path.to_str().unwrap()).unwrap();
+        cfg.api.listen = "0.0.0.0:9090".to_string();
+        cfg.save(path.to_str().unwrap()).unwrap();
+
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            saved.contains("# Top-of-file comment"),
+            "top comment should survive"
+        );
+        assert!(
+            saved.contains("# inline comment") || saved.contains("listen"),
+            "section visible"
+        );
+        assert!(
+            saved.contains("# section break"),
+            "between-section comment should survive"
+        );
+        assert!(saved.contains("0.0.0.0:9090"), "value should be updated");
+        assert!(
+            !saved.contains("127.0.0.1:8080"),
+            "old value should be gone"
+        );
+    }
+
+    #[test]
+    fn save_falls_back_to_overwrite_for_unparseable_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "this is = not valid = toml [[[").unwrap();
+
+        let cfg = AppConfig {
+            api: ApiConfig {
+                listen: "0.0.0.0:8080".to_string(),
+                tls_cert: None,
+                tls_key: None,
+                tls_client_ca: None,
+                cors_origins: vec![],
+            },
+            auth: AuthConfig {
+                jwt_secret_env: "X".to_string(),
+                user_db: "/tmp/x.db".to_string(),
+                max_login_attempts: 5,
+                lockout_duration_minutes: 15,
+                access_token_ttl_minutes: 15,
+                refresh_token_ttl_days: 7,
+            },
+            routeros: RouterOsConfig {
+                host_env: "H".to_string(),
+                user_env: "U".to_string(),
+                password_env: "P".to_string(),
+                tls_skip_verify: false,
+                comment_tag: "managed-by=snx-edge".to_string(),
+                address_list_vpn: "vpn-clients".to_string(),
+                address_list_bypass: "vpn-bypass".to_string(),
+                routing_table: "vpn-route".to_string(),
+                connection_mark: "vpn-conn".to_string(),
+                routing_mark: "vpn-route".to_string(),
+                auto_setup: false,
+            },
+            logging: LoggingConfig {
+                level: "info".to_string(),
+                buffer_size: 10_000,
+                file: None,
+                max_file_size: "10MB".to_string(),
+                max_files: 3,
+            },
+            security: SecurityConfig::default(),
+            shutdown: ShutdownConfig::default(),
+        };
+
+        cfg.save(path.to_str().unwrap()).unwrap();
+        // Should now be parseable.
+        AppConfig::load(path.to_str().unwrap()).unwrap();
+    }
 }

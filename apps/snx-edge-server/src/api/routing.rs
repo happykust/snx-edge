@@ -2,6 +2,7 @@ use std::net::IpAddr;
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Extension, Json, Router};
 use serde::Deserialize;
@@ -214,9 +215,9 @@ async fn routing_status(
     }
 
     let client = state.routeros_client().await?;
-    let routing_table = {
+    let routeros_config = {
         let config = state.config.read().await;
-        config.routeros.routing_table.clone()
+        config.routeros.clone()
     };
 
     let mangles: Vec<crate::routeros::models::MangleRule> =
@@ -225,19 +226,41 @@ async fn routing_status(
     let nats: Vec<crate::routeros::models::NatRule> =
         client.list_managed("/ip/firewall/nat").await?;
 
+    let provisioner = Provisioner::new(&client, &routeros_config);
+    let presence = provisioner.presence_snapshot().await?;
+
     Ok(Json(serde_json::json!({
         "mangle_rules": mangles,
         "routes": routes,
         "nat_rules": nats,
-        "routing_table": routing_table,
+        "routing_table": routeros_config.routing_table,
+        "state": presence.state(),
+        "presence": {
+            "routing_table":       presence.routing_table,
+            "mangle_conn_mark":    presence.mangle_conn_mark,
+            "mangle_routing_mark": presence.mangle_routing_mark,
+            "default_route":       presence.default_route,
+            "kill_switch":         presence.kill_switch,
+            "dns_dst_nat":         presence.dns_dst_nat,
+            "dot_block":           presence.dot_block,
+            "fasttrack_bypass":    presence.fasttrack_bypass,
+            "rfc1918_bypass":      presence.rfc1918_bypass,
+        },
     })))
 }
 
 /// POST /api/v1/routing/setup
+///
+/// Returns:
+///   - `200 OK` with `{status: "ok", applied: [...]}` on full success.
+///   - `207 Multi-Status` with `{status: "partial", applied: [...],
+///     failed: {step, error}}` if any step failed; the steps before the
+///     failure were committed on RouterOS and re-running `setup` is safe
+///     (each `ensure_*` is idempotent on the new structured comment).
 async fn setup_pbr(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<Response, AppError> {
     if !has_permission(&claims, "routing.setup") {
         return Err(AppError::Forbidden(
             "permission 'routing.setup' required".to_string(),
@@ -254,14 +277,33 @@ async fn setup_pbr(
     let container_ip = detect_container_ip()?;
 
     let provisioner = Provisioner::new(&client, &routeros_config);
-    provisioner.setup(&container_ip).await?;
+    let report = provisioner.setup(&container_ip).await;
 
+    // Always emit the routing-changed event — even a partial setup
+    // mutated state on the router.
     let _ = state.event_tx.send(ServerEvent::RoutingChanged);
 
-    Ok(Json(serde_json::json!({
-        "status": "ok",
-        "message": "PBR setup completed"
-    })))
+    let body = match &report.failed {
+        None => serde_json::json!({
+            "status": "ok",
+            "applied": report.applied,
+        }),
+        Some((step, err)) => serde_json::json!({
+            "status": "partial",
+            "applied": report.applied,
+            "failed": {
+                "step": step,
+                "error": err.to_string(),
+            },
+        }),
+    };
+
+    let status = if report.failed.is_some() {
+        StatusCode::MULTI_STATUS
+    } else {
+        StatusCode::OK
+    };
+    Ok((status, Json(body)).into_response())
 }
 
 /// DELETE /api/v1/routing/setup

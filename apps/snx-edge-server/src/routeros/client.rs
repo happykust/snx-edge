@@ -180,7 +180,7 @@ impl RouterOsClient {
             .into_iter()
             .filter(|e| {
                 e.comment()
-                    .map(|c| c.contains(&self.comment_tag))
+                    .map(|c| comment_matches_tag(c, &self.comment_tag))
                     .unwrap_or(false)
             })
             .collect())
@@ -202,7 +202,7 @@ impl RouterOsClient {
             .filter(|e| {
                 e.comment
                     .as_ref()
-                    .map(|c| c.contains(&self.comment_tag))
+                    .map(|c| comment_matches_tag(c, &self.comment_tag))
                     .unwrap_or(false)
             })
             .collect();
@@ -214,6 +214,77 @@ impl RouterOsClient {
 
         Ok(count)
     }
+
+    /// List all entries with a legacy (untagged-kind) managed comment.
+    ///
+    /// Used by the migration pass in [`Provisioner::setup`] to detect objects
+    /// from the pre-`kind=` era so they can be removed and recreated with the
+    /// new structured comment.
+    pub async fn list_legacy_managed(&self, path: &str) -> Result<Vec<String>, AppError> {
+        #[derive(serde::Deserialize)]
+        struct IdEntry {
+            #[serde(rename = ".id")]
+            id: String,
+            #[serde(default)]
+            comment: Option<String>,
+        }
+
+        let all: Vec<IdEntry> = self.list(path).await?;
+        Ok(all
+            .into_iter()
+            .filter(|e| {
+                e.comment
+                    .as_ref()
+                    .map(|c| comment_is_legacy(c, &self.comment_tag))
+                    .unwrap_or(false)
+            })
+            .map(|e| e.id)
+            .collect())
+    }
+}
+
+/// Match a RouterOS object's comment against our managed `tag_prefix`.
+///
+/// We require either:
+///   - The exact `tag_prefix` to be a `;`-separated key=value field
+///     (e.g. `managed-by=snx-edge;kind=routing-table` matches `managed-by=snx-edge`), or
+///   - The comment to start with `tag_prefix` (covers legacy comments that were
+///     just the bare `managed-by=snx-edge` string with no `;kind=`).
+///
+/// Rationale: `comment.contains(tag_prefix)` from the prior implementation
+/// false-matches any user-authored comment that mentions `managed-by=snx-edge`
+/// in arbitrary positions (e.g. `"see managed-by=snx-edge docs"`).  Since
+/// `Provisioner` always emits the prefix as the *first* segment, anchoring the
+/// match avoids those false positives without changing semantics for the
+/// objects we own.
+pub(crate) fn comment_matches_tag(comment: &str, tag_prefix: &str) -> bool {
+    if let Some(rest) = comment.strip_prefix(tag_prefix) {
+        // Either bare prefix, or prefix immediately followed by `;`
+        // (structured form).
+        if rest.is_empty() || rest.starts_with(';') {
+            return true;
+        }
+    }
+    comment.split(';').any(|kv| kv.trim() == tag_prefix)
+}
+
+/// Check whether `comment` is a legacy managed tag — i.e. matches our
+/// `tag_prefix` but does **not** carry the new `kind=` field.
+pub(crate) fn comment_is_legacy(comment: &str, tag_prefix: &str) -> bool {
+    comment_matches_tag(comment, tag_prefix)
+        && !comment.split(';').any(|kv| kv.trim().starts_with("kind="))
+}
+
+/// Match an object's comment against `tag_prefix` *and* a specific `kind`.
+///
+/// Used by the per-step `ensure_*` idempotency checks so two managed rules
+/// with the same `kind` but different specs can be distinguished.
+pub(crate) fn comment_matches_kind(comment: &str, tag_prefix: &str, kind: &str) -> bool {
+    if !comment_matches_tag(comment, tag_prefix) {
+        return false;
+    }
+    let needle = format!("kind={kind}");
+    comment.split(';').any(|kv| kv.trim() == needle)
 }
 
 /// Trait for types that have an optional comment field.
@@ -242,3 +313,68 @@ impl_has_comment!(
     super::models::FilterRule,
     super::models::RoutingTable
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PREFIX: &str = "managed-by=snx-edge";
+
+    #[test]
+    fn tag_prefix_matches_structured_comment() {
+        assert!(comment_matches_tag(
+            "managed-by=snx-edge;kind=routing-table",
+            PREFIX
+        ));
+        assert!(comment_matches_tag(
+            "managed-by=snx-edge;kind=mangle-conn-mark;profile=p1",
+            PREFIX
+        ));
+        // Bare legacy prefix still matches (backwards compat for teardown).
+        assert!(comment_matches_tag("managed-by=snx-edge", PREFIX));
+    }
+
+    #[test]
+    fn tag_prefix_does_not_match_user_comment_containing_tag() {
+        // The old `comment.contains(tag)` would match these — we must not.
+        assert!(!comment_matches_tag("see managed-by=snx-edge docs", PREFIX));
+        assert!(!comment_matches_tag("X managed-by=snx-edge Y", PREFIX));
+        // A user key whose value happens to embed our prefix as a substring.
+        assert!(!comment_matches_tag(
+            "owner=team-managed-by=snx-edge-ops",
+            PREFIX
+        ));
+        // Empty / unrelated.
+        assert!(!comment_matches_tag("", PREFIX));
+        assert!(!comment_matches_tag("kind=routing-table", PREFIX));
+    }
+
+    #[test]
+    fn kind_specific_match_distinguishes_kinds() {
+        let c = "managed-by=snx-edge;kind=routing-table";
+        assert!(comment_matches_kind(c, PREFIX, "routing-table"));
+        assert!(!comment_matches_kind(c, PREFIX, "mangle-conn-mark"));
+        // Legacy comments (no kind=) never match a specific kind.
+        assert!(!comment_matches_kind(
+            "managed-by=snx-edge",
+            PREFIX,
+            "routing-table"
+        ));
+        // User comment that happens to mention the prefix is still rejected.
+        assert!(!comment_matches_kind(
+            "see managed-by=snx-edge;kind=routing-table in wiki",
+            PREFIX,
+            "routing-table"
+        ));
+    }
+
+    #[test]
+    fn legacy_detection() {
+        assert!(comment_is_legacy("managed-by=snx-edge", PREFIX));
+        assert!(!comment_is_legacy(
+            "managed-by=snx-edge;kind=routing-table",
+            PREFIX
+        ));
+        assert!(!comment_is_legacy("user note", PREFIX));
+    }
+}

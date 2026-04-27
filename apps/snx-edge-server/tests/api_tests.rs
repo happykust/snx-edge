@@ -152,6 +152,31 @@ async fn test_health() {
 }
 
 #[tokio::test]
+async fn test_health_ready_returns_components() {
+    let (app, _, _dir) = setup().await;
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/health/ready")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    // RouterOS env vars are set by the test fixture but the host is unreachable;
+    // expect 200 (db is fine — RouterOS down is acceptable).
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp_json(resp).await;
+    assert_eq!(body["components"]["db"]["status"], "up");
+    let routeros_status = body["components"]["routeros"]["status"].as_str().unwrap();
+    assert!(
+        routeros_status == "down" || routeros_status == "not_configured",
+        "unexpected routeros status: {routeros_status}"
+    );
+    assert!(body["components"]["tunnel"]["state"].is_string());
+}
+
+#[tokio::test]
 async fn test_auth_login_success() {
     let (_, token, _dir) = setup().await;
     assert!(!token.is_empty());
@@ -494,4 +519,82 @@ async fn test_connect_with_profile() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     let body = resp_json(resp).await;
     assert!(body["detail"].as_str().unwrap().contains("error"));
+}
+
+// === SSE wire-format tests ===
+
+/// Pull just the first chunk off a streaming response body.
+///
+/// SSE responses stay open indefinitely, so `to_bytes` would hang. We poll
+/// the data stream once via `tokio_stream::StreamExt::next`.
+async fn first_sse_chunk(body: Body) -> String {
+    use tokio_stream::StreamExt;
+
+    let mut stream = body.into_data_stream();
+    let chunk = stream
+        .next()
+        .await
+        .expect("expected at least one body chunk")
+        .expect("stream error");
+    String::from_utf8(chunk.to_vec()).expect("utf-8 SSE frame")
+}
+
+/// The SSE stream must announce its wire-schema version as the very first
+/// frame so clients can fail loud on incompatible upgrades.
+#[tokio::test]
+async fn test_sse_events_first_frame_is_schema_version() {
+    let (app, token, _dir) = setup().await;
+    let resp = app
+        .oneshot(auth_get("/api/v1/events", &token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let text = first_sse_chunk(resp.into_body()).await;
+    assert!(
+        text.contains("event: schema"),
+        "first SSE frame must announce schema, got: {text}"
+    );
+    assert!(
+        text.contains(r#""version":1"#),
+        "schema frame must carry version=1, got: {text}"
+    );
+}
+
+/// Same handshake on the dedicated log SSE endpoint.
+#[tokio::test]
+async fn test_sse_logs_first_frame_is_schema_version() {
+    let (app, token, _dir) = setup().await;
+    let resp = app.oneshot(auth_get("/api/v1/logs", &token)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let text = first_sse_chunk(resp.into_body()).await;
+    assert!(
+        text.contains("event: schema"),
+        "first SSE frame must announce schema, got: {text}"
+    );
+    assert!(
+        text.contains(r#""version":1"#),
+        "schema frame must carry version=1, got: {text}"
+    );
+}
+
+/// Asserting that a slow SSE consumer receives a `lag` frame requires
+/// publishing >channel_capacity events strictly between the consumer's
+/// subscribe and the consumer's first poll. With axum's response body
+/// machinery polling eagerly and only the `event_tx` clone available
+/// externally, we cannot reliably stuff the channel before axum drains it.
+/// The unit-level mechanics are covered in `log_layer::tests` and the
+/// lag-frame construction lives in `api::events::lag_event`. End-to-end
+/// repro is best done manually:
+///
+///   1. Lower the broadcast capacity in main.rs to 4.
+///   2. `curl -N` /api/v1/events with a `Bearer` token.
+///   3. Stop reading (Ctrl-Z the curl) while triggering >4 logs server-side.
+///   4. Resume curl — the next frame should be `event: lag` with `missed > 0`.
+#[tokio::test]
+#[ignore = "non-deterministic; see comment for manual repro"]
+async fn test_sse_logs_emits_lag_event_when_consumer_falls_behind() {
+    // Intentionally empty — kept as a marker so future contributors can find
+    // and unfreeze this once a deterministic harness exists.
 }

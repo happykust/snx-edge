@@ -6,13 +6,15 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::get;
 use axum::{Extension, Json, Router};
 use chrono::{DateTime, Utc};
-use futures_util::stream::Stream;
+use futures_util::stream::{self, Stream};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 
 use crate::api::auth::{Claims, has_permission};
+use crate::api::events::{lag_event, schema_event};
 use crate::error::AppError;
 use crate::state::{AppState, ServerEvent};
 
@@ -97,7 +99,7 @@ async fn logs_stream(
     }
 
     let rx = state.event_tx.subscribe();
-    let stream = BroadcastStream::new(rx).filter_map(|result| match result {
+    let body = BroadcastStream::new(rx).filter_map(|result| match result {
         Ok(ServerEvent::LogEntry { level, message }) => {
             let entry = serde_json::json!({
                 "timestamp": Utc::now().to_rfc3339(),
@@ -106,8 +108,13 @@ async fn logs_stream(
             });
             Some(Ok(Event::default().event("log").data(entry.to_string())))
         }
-        _ => None,
+        Ok(_) => None,
+        Err(BroadcastStreamRecvError::Lagged(n)) => Some(Ok(lag_event(n))),
     });
+
+    // Prepend the schema-handshake frame (see SSE_SCHEMA_VERSION docs).
+    let head = stream::once(async { Ok::<_, Infallible>(schema_event()) });
+    let stream = head.chain(body);
 
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
