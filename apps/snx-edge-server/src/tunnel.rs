@@ -426,11 +426,21 @@ impl TunnelManager {
                 && let Some(s) =
                     terminal_status_on_channel_close(disconnect_flag.load(Ordering::SeqCst))
             {
+                // Derive the SSE label from the actual terminal status variant
+                // rather than hardcoding "error", so the broadcast label can't
+                // desync from the status we store. Mirrors `set_status()`.
+                let label = match &s {
+                    ConnectionStatus::Error { .. } => "error",
+                    ConnectionStatus::Disconnected => "disconnected",
+                    ConnectionStatus::Connecting => "connecting",
+                    ConnectionStatus::Connected(_) => "connected",
+                    ConnectionStatus::Mfa(_) => "mfa",
+                };
                 *status.lock().expect("status mutex poisoned") = s;
                 *connector.lock().await = None;
                 *session_ref.lock().await = None;
                 let _ = broadcast_tx.send(ServerEvent::ConnectionStatus {
-                    status: "error".to_string(),
+                    status: label.to_string(),
                 });
             }
         });

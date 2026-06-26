@@ -187,9 +187,7 @@ pub async fn run(state: AppState) {
                     let status = state.tunnel.status().await.connection;
                     // A genuine `Connected` un-suspends: a session that actually
                     // came up means future unexpected drops should retry again.
-                    if let ConnectionStatus::Connected(_) = status
-                        && decide(&status, true) == SupervisorAction::Hold
-                    {
+                    if let ConnectionStatus::Connected(_) = status {
                         state.reconnect_suspended.store(false, Ordering::SeqCst);
                     }
                     if let Some(p) = desired_profile(&state).await
