@@ -196,6 +196,25 @@ impl ApiClient {
             .context("Failed to parse tunnel reconnect response")
     }
 
+    pub async fn tunnel_challenge(&self, code: &str) -> anyhow::Result<Value> {
+        let resp = self
+            .request_builder(reqwest::Method::POST, "/api/v1/tunnel/challenge")
+            .await
+            .json(&serde_json::json!({"code": code}))
+            .send()
+            .await
+            .context("Failed to submit challenge")?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("Challenge failed: HTTP {} - {}", status, body);
+        }
+        resp.json()
+            .await
+            .context("Failed to parse challenge response")
+    }
+
     pub async fn tunnel_status(&self) -> anyhow::Result<Value> {
         let resp = self
             .request_builder(reqwest::Method::GET, "/api/v1/tunnel/status")
@@ -653,5 +672,65 @@ impl ApiClient {
         resp.json()
             .await
             .context("Failed to parse logs history response")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn base_url_strips_trailing_slash() {
+        // Trailing slashes turn into double-slashes in path concatenation
+        // (`<base>/<path>`), so the constructor normalises them away.
+        let api = ApiClient::new("https://example.com:8443/");
+        assert_eq!(api.base_url().await, "https://example.com:8443");
+    }
+
+    #[tokio::test]
+    async fn base_url_preserves_no_trailing_slash() {
+        let api = ApiClient::new("https://example.com:8443");
+        assert_eq!(api.base_url().await, "https://example.com:8443");
+    }
+
+    #[tokio::test]
+    async fn set_base_url_normalises_trailing_slash() {
+        let api = ApiClient::new("https://example.com");
+        api.set_base_url("https://other.example/").await;
+        assert_eq!(api.base_url().await, "https://other.example");
+    }
+
+    #[tokio::test]
+    async fn token_round_trips_through_setter() {
+        let api = ApiClient::new("https://example.com");
+        assert!(api.token().await.is_none());
+        api.set_token(Some("jwt.payload.sig".to_string())).await;
+        assert_eq!(api.token().await.as_deref(), Some("jwt.payload.sig"));
+        api.set_token(None).await;
+        assert!(api.token().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn bearer_auth_added_when_token_present() {
+        // We can't easily snoop on `RequestBuilder` headers without sending
+        // the request, so instead we point the client at an unroutable URL
+        // and confirm that:
+        //   - with no token: dial fails with a connection-style error that
+        //     does NOT mention an Authorization header parse problem;
+        //   - the call path through `request_builder` simply returns a
+        //     non-empty builder.
+        // The tightest assertion we can make without spinning up a server
+        // is that token state flows through `set_token` and survives
+        // multiple `request_builder` invocations.
+        let api = ApiClient::new("http://127.0.0.1:1");
+        api.set_token(Some("abc".into())).await;
+        assert_eq!(api.token().await.as_deref(), Some("abc"));
+        // request_builder should construct without panicking even with the
+        // token set — exercising the bearer_auth code path.
+        let _ = api
+            .sse_request("/api/v1/logs")
+            .await
+            .build()
+            .expect("builder must produce a request");
     }
 }

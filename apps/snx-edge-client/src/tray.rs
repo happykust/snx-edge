@@ -73,9 +73,14 @@ impl FromStr for TrayEvent {
 /// Status representation for the tray, parsed from server JSON.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConnectionState {
-    Connected { info: String },
+    Connected {
+        info: String,
+    },
     Disconnected,
     Connecting,
+    /// Server is awaiting a multi-factor challenge response. Holds the
+    /// server-supplied prompt (e.g. "Enter OTP") to show the user.
+    Mfa(String),
     Error(String),
 }
 
@@ -85,6 +90,7 @@ impl std::fmt::Display for ConnectionState {
             ConnectionState::Connected { info } => write!(f, "Connected: {}", info),
             ConnectionState::Disconnected => write!(f, "Disconnected"),
             ConnectionState::Connecting => write!(f, "Connecting..."),
+            ConnectionState::Mfa(prompt) => write!(f, "MFA required: {}", prompt),
             ConnectionState::Error(e) => write!(f, "Error: {}", e),
         }
     }
@@ -110,6 +116,17 @@ impl ConnectionState {
                 }
             }
             "Connecting" => ConnectionState::Connecting,
+            "Mfa" => {
+                // The server serializes `MfaChallenge { mfa_type, prompt }`
+                // flattened under the tagged `state`, so the prompt sits as a
+                // sibling of `state` on the `connection` object.
+                let prompt = connection
+                    .and_then(|c| c.get("prompt"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Enter OTP")
+                    .to_string();
+                ConnectionState::Mfa(prompt)
+            }
             "Disconnected" => ConnectionState::Disconnected,
             "Error" => {
                 let msg = connection
@@ -219,6 +236,9 @@ impl AppTray {
             ConnectionState::Connected { .. } => theme.connected.clone(),
             ConnectionState::Disconnected => theme.disconnected.clone(),
             ConnectionState::Connecting => theme.acquiring.clone(),
+            // MFA is mid-connection (awaiting a challenge): reuse the
+            // acquiring/attention icon to signal "in progress".
+            ConnectionState::Mfa(_) => theme.acquiring.clone(),
             ConnectionState::Error(_) => theme.error.clone(),
         };
 
@@ -234,6 +254,7 @@ impl AppTray {
             ConnectionState::Connected { .. } => "network-vpn-symbolic",
             ConnectionState::Disconnected => "network-vpn-disconnected-symbolic",
             ConnectionState::Connecting => "network-vpn-acquiring-symbolic",
+            ConnectionState::Mfa(_) => "network-vpn-acquiring-symbolic",
             ConnectionState::Error(_) => "network-vpn-disabled-symbolic",
         }
     }
