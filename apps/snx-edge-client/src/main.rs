@@ -480,6 +480,12 @@ fn start_status_polling(
                 let entering_mfa = matches!(new_state, ConnectionState::Mfa(_))
                     && !matches!(old_state, ConnectionState::Mfa(_));
 
+                // Detect a *fresh* drop into the error state (the previous state
+                // was not already Error) so we notify exactly once per
+                // transition, mirroring the `entering_mfa` edge above.
+                let entering_error = matches!(new_state, ConnectionState::Error(_))
+                    && !matches!(old_state, ConnectionState::Error(_));
+
                 old_state = new_state.clone();
                 let arc = Arc::new(old_state.clone());
                 let _ = cmd_sender
@@ -497,6 +503,13 @@ fn start_status_polling(
                     let api = api.clone();
                     let prompt = prompt.clone();
                     tokio::spawn(async move { handle_mfa_challenge(api, prompt).await });
+                }
+
+                if entering_error {
+                    // Surface a one-shot desktop notification on a fresh
+                    // connection drop. Fired once per transition (not on every
+                    // 2s poll) thanks to the edge-check above.
+                    show_feedback("VPN", "Connection lost — reconnecting").await;
                 }
             }
 
