@@ -286,12 +286,18 @@ impl<'a> Provisioner<'a> {
         // Check mangle rules
         let mangles: Vec<MangleRule> = self.client.list_managed("/ip/firewall/mangle").await?;
         let mangle_rules_count = mangles.len();
-        let mangle_rules_present = mangle_rules_count >= 2;
+        let mangle_rules_present = mangle_rules_count >= 3;
         if !mangle_rules_present {
             warnings.push(format!(
-                "expected 2 mangle rules, found {mangle_rules_count}"
+                "expected 3 mangle rules, found {mangle_rules_count}"
             ));
         }
+        let mss_clamp = mangles.iter().any(|m| {
+            m.comment
+                .as_deref()
+                .map(|c| comment_matches_kind(c, &self.config.comment_tag, KIND_MSS_CLAMP))
+                .unwrap_or(false)
+        });
 
         // Check routes
         let routes: Vec<RouteEntry> = self.client.list_managed("/ip/route").await?;
@@ -343,6 +349,7 @@ impl<'a> Provisioner<'a> {
                 routing_table_exists,
                 mangle_rules_present,
                 mangle_rules_count,
+                mss_clamp,
                 vpn_route_active,
                 killswitch_present,
                 dns_redirect_active,
@@ -391,6 +398,12 @@ impl<'a> Provisioner<'a> {
                 .map(|c| comment_matches_kind(c, tag, KIND_MANGLE_ROUTING_MARK))
                 .unwrap_or(false)
         });
+        let mss_clamp = mangles.iter().any(|m| {
+            m.comment
+                .as_deref()
+                .map(|c| comment_matches_kind(c, tag, KIND_MSS_CLAMP))
+                .unwrap_or(false)
+        });
         let default_route = routes.iter().any(|r| {
             r.comment
                 .as_deref()
@@ -432,6 +445,7 @@ impl<'a> Provisioner<'a> {
             routing_table,
             mangle_conn_mark,
             mangle_routing_mark,
+            mss_clamp,
             default_route,
             kill_switch,
             dns_dst_nat,
@@ -744,6 +758,7 @@ pub struct PresenceSnapshot {
     pub routing_table: bool,
     pub mangle_conn_mark: bool,
     pub mangle_routing_mark: bool,
+    pub mss_clamp: bool,
     pub default_route: bool,
     pub kill_switch: bool,
     pub dns_dst_nat: bool,
@@ -754,7 +769,7 @@ pub struct PresenceSnapshot {
 
 impl PresenceSnapshot {
     /// Total expected managed-object kinds.
-    pub const EXPECTED: usize = 9;
+    pub const EXPECTED: usize = 10;
 
     /// Number of expected kinds currently present.
     pub fn present_count(&self) -> usize {
@@ -762,6 +777,7 @@ impl PresenceSnapshot {
             self.routing_table,
             self.mangle_conn_mark,
             self.mangle_routing_mark,
+            self.mss_clamp,
             self.default_route,
             self.kill_switch,
             self.dns_dst_nat,

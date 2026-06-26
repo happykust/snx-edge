@@ -18,7 +18,7 @@ use snx_edge_server::routeros::client::RouterOsClient;
 use snx_edge_server::routeros::provisioner::{
     KIND_DEFAULT_ROUTE, KIND_DNS_DST_NAT, KIND_DOT_BLOCK, KIND_FASTTRACK_BYPASS, KIND_KILL_SWITCH,
     KIND_MANGLE_CONN_MARK, KIND_MANGLE_ROUTING_MARK, KIND_MSS_CLAMP, KIND_RFC1918_BYPASS,
-    KIND_ROUTING_TABLE, Provisioner,
+    KIND_ROUTING_TABLE, PresenceSnapshot, Provisioner,
 };
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -88,6 +88,116 @@ async fn mount_accept_all_creates(server: &MockServer) {
             .mount(server)
             .await;
     }
+}
+
+/// Mount GET list responses describing a router that already carries the full
+/// managed PBR layout — every `kind=` present, including the three mangle rules
+/// (conn-mark, routing-mark, mss-clamp). Used by the diagnostics / presence
+/// observability test.
+async fn mount_full_managed_state(server: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path("/rest/routing/table"))
+        .respond_with(ResponseTemplate::new(200).set_body_json::<Value>(json!([{
+            ".id": "*1",
+            "name": "vpn-route",
+            "comment": format!("{TAG};kind={KIND_ROUTING_TABLE}"),
+        }])))
+        .mount(server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/rest/ip/firewall/mangle"))
+        .respond_with(ResponseTemplate::new(200).set_body_json::<Value>(json!([
+            {".id": "*1", "chain": "prerouting", "comment": format!("{TAG};kind={KIND_MANGLE_CONN_MARK}")},
+            {".id": "*2", "chain": "prerouting", "comment": format!("{TAG};kind={KIND_MANGLE_ROUTING_MARK}")},
+            {".id": "*3", "chain": "forward", "action": "change-mss", "comment": format!("{TAG};kind={KIND_MSS_CLAMP}")},
+        ])))
+        .mount(server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/rest/ip/route"))
+        .respond_with(ResponseTemplate::new(200).set_body_json::<Value>(json!([
+            {".id": "*1", "routing-table": "vpn-route", "comment": format!("{TAG};kind={KIND_DEFAULT_ROUTE}")},
+            {".id": "*2", "type": "blackhole", "comment": format!("{TAG};kind={KIND_KILL_SWITCH}")},
+        ])))
+        .mount(server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/rest/ip/firewall/nat"))
+        .respond_with(ResponseTemplate::new(200).set_body_json::<Value>(json!([
+            {".id": "*1", "protocol": "udp", "dst-port": "53", "comment": format!("{TAG};kind={KIND_DNS_DST_NAT}")},
+            {".id": "*2", "protocol": "tcp", "dst-port": "53", "comment": format!("{TAG};kind={KIND_DNS_DST_NAT}")},
+        ])))
+        .mount(server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/rest/ip/firewall/filter"))
+        .respond_with(ResponseTemplate::new(200).set_body_json::<Value>(json!([
+            {".id": "*1", "chain": "forward", "action": "drop", "protocol": "tcp", "dst-port": "853", "comment": format!("{TAG};kind={KIND_DOT_BLOCK}")},
+            {".id": "*2", "chain": "forward", "action": "drop", "protocol": "udp", "dst-port": "853", "comment": format!("{TAG};kind={KIND_DOT_BLOCK}")},
+            {".id": "*3", "chain": "forward", "action": "fasttrack-connection", "comment": format!("{TAG};kind={KIND_FASTTRACK_BYPASS}")},
+        ])))
+        .mount(server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/rest/ip/firewall/address-list"))
+        .respond_with(ResponseTemplate::new(200).set_body_json::<Value>(json!([
+            {".id": "*1", "list": "vpn-bypass", "address": "192.168.0.0/16", "comment": format!("{TAG};kind={KIND_RFC1918_BYPASS}")},
+            {".id": "*2", "list": "vpn-bypass", "address": "172.16.0.0/12",  "comment": format!("{TAG};kind={KIND_RFC1918_BYPASS}")},
+            {".id": "*3", "list": "vpn-bypass", "address": "10.0.0.0/8",     "comment": format!("{TAG};kind={KIND_RFC1918_BYPASS}")},
+        ])))
+        .mount(server)
+        .await;
+}
+
+/// Phase-1 observability follow-up: a full setup installs the mss-clamp mangle
+/// rule, so both `diagnostics()` and `presence_snapshot()` must account for it —
+/// three mangle rules, `mss_clamp: true`, and a complete presence snapshot with
+/// every EXPECTED kind present.
+#[tokio::test]
+async fn diagnostics_and_presence_track_mss_clamp() {
+    let server = MockServer::start().await;
+    mount_full_managed_state(&server).await;
+
+    let client = client_for(&server);
+    let cfg = config();
+    let prov = Provisioner::new(&client, &cfg);
+
+    let diag = prov.diagnostics().await.expect("diagnostics succeeds");
+    assert!(
+        diag.checks.mss_clamp,
+        "diagnostics must report the mss-clamp mangle rule as present, checks={:?}",
+        diag.checks,
+    );
+    assert!(
+        diag.checks.mangle_rules_count >= 3,
+        "a full setup installs 3 mangle rules (conn-mark, routing-mark, mss-clamp), got {}",
+        diag.checks.mangle_rules_count,
+    );
+    assert!(
+        diag.checks.mangle_rules_present,
+        "mangle_rules_present must hold once all 3 mangle rules exist, checks={:?}",
+        diag.checks,
+    );
+
+    let snap = prov
+        .presence_snapshot()
+        .await
+        .expect("presence snapshot succeeds");
+    assert!(
+        snap.mss_clamp,
+        "presence snapshot must track the mss-clamp mangle rule, snap={snap:?}",
+    );
+    assert_eq!(
+        snap.present_count(),
+        PresenceSnapshot::EXPECTED,
+        "all EXPECTED managed kinds (including mss-clamp) are present, snap={snap:?}",
+    );
+    assert_eq!(snap.state(), "configured", "snap={snap:?}");
 }
 
 #[tokio::test]

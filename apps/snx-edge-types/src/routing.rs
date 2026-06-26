@@ -143,6 +143,7 @@ pub struct DiagnosticsChecks {
     pub routing_table_exists: bool,
     pub mangle_rules_present: bool,
     pub mangle_rules_count: usize,
+    pub mss_clamp: bool,
     pub vpn_route_active: bool,
     pub killswitch_present: bool,
     pub dns_redirect_active: bool,
