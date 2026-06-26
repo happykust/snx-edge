@@ -474,6 +474,12 @@ fn start_status_polling(
             };
 
             if !status::same_status(&new_state, &old_state) {
+                // Detect a *fresh* transition into Mfa (previous state was not
+                // already Mfa) so we prompt exactly once, not on every 2s poll
+                // while the server keeps reporting the same challenge.
+                let entering_mfa = matches!(new_state, ConnectionState::Mfa(_))
+                    && !matches!(old_state, ConnectionState::Mfa(_));
+
                 old_state = new_state.clone();
                 let arc = Arc::new(old_state.clone());
                 let _ = cmd_sender
@@ -482,11 +488,37 @@ fn start_status_polling(
                 // send_replace overrides regardless of receiver count, which
                 // matches our "always reflect latest" semantic.
                 status_tx.send_replace(arc);
+
+                if entering_mfa && let ConnectionState::Mfa(prompt) = &new_state {
+                    // Spawn the prompt as a detached task so the poll loop
+                    // keeps running while the (modal) OTP dialog is open. The
+                    // dialog's own single-instance guard plus this
+                    // transition-edge check together prevent stacking.
+                    let api = api.clone();
+                    let prompt = prompt.clone();
+                    tokio::spawn(async move { handle_mfa_challenge(api, prompt).await });
+                }
             }
 
             tokio::time::sleep(POLL_INTERVAL).await;
         }
     });
+}
+
+/// Surface a desktop notification, prompt the user for the OTP, and submit it.
+///
+/// Runs as a detached task (see `start_status_polling`). The challenge result
+/// is logged and otherwise ignored — the next status poll reflects whether the
+/// reconnect succeeded.
+async fn handle_mfa_challenge(api: ApiClient, prompt: String) {
+    show_feedback("VPN - action needed", "Enter OTP to reconnect").await;
+
+    if let Some(code) = crate::prompt::show_mfa_dialog(&prompt).await {
+        match api.tunnel_challenge(code.trim()).await {
+            Ok(_) => info!("submitted MFA challenge response"),
+            Err(e) => warn!("MFA challenge submission failed: {e}"),
+        }
+    }
 }
 
 // === Dialogs ===
