@@ -85,6 +85,16 @@ pub fn migrations() -> &'static [Migration] {
             version: 2,
             sql: "ALTER TABLE users ADD COLUMN token_generation INTEGER NOT NULL DEFAULT 0;",
         },
+        // v3 adds a generic key/value store for persisted application state
+        // (e.g. the reconnect supervisor's desired tunnel profile, auto-connect
+        // flag) so it survives restarts via the /var/lib/snx-edge volume.
+        Migration {
+            version: 3,
+            sql: "CREATE TABLE IF NOT EXISTS app_state (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );",
+        },
     ];
     MIGRATIONS
 }
@@ -423,6 +433,48 @@ impl UserDb {
             |row| row.get(0),
         )
         .map_err(|_| AppError::NotFound("user not found".to_string()))
+    }
+
+    // === App state (persisted key/value) ===
+
+    /// Persisted key/value app state (desired tunnel profile, auto-connect
+    /// flag). Upserts on the primary key so repeated writes overwrite.
+    #[allow(dead_code)] // consumed by the WIP reconnect supervisor
+    pub async fn set_app_state(&self, key: &str, value: &str) -> Result<(), AppError> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT INTO app_state (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    /// Read a persisted app-state value. Returns `Ok(None)` when the key is
+    /// absent; genuine DB failures map to `AppError::Internal` via `From`.
+    #[allow(dead_code)] // consumed by the WIP reconnect supervisor
+    pub async fn get_app_state(&self, key: &str) -> Result<Option<String>, AppError> {
+        let conn = self.conn.lock().await;
+        match conn.query_row(
+            "SELECT value FROM app_state WHERE key = ?1",
+            params![key],
+            |row| row.get::<_, String>(0),
+        ) {
+            Ok(v) => Ok(Some(v)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            // Other rusqlite errors are real failures (I/O, schema). Map
+            // through the generic From impl so callers see AppError::Internal.
+            #[allow(clippy::wildcard_enum_match_arm)]
+            Err(other) => Err(AppError::from(other)),
+        }
+    }
+
+    /// Delete a persisted app-state key. A no-op if the key is absent.
+    #[allow(dead_code)] // consumed by the WIP reconnect supervisor
+    pub async fn delete_app_state(&self, key: &str) -> Result<(), AppError> {
+        let conn = self.conn.lock().await;
+        conn.execute("DELETE FROM app_state WHERE key = ?1", params![key])?;
+        Ok(())
     }
 
     /// Replace `password_hash` for a user without touching `token_generation`
@@ -1042,5 +1094,39 @@ mod tests {
         let db = UserDb::new(&path_str).await.unwrap();
         let user = db.get_user_by_username("alice").await.unwrap();
         assert_eq!(user.id, "uid-1");
+    }
+
+    #[tokio::test]
+    async fn app_state_set_get_delete_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        let p = path.to_string_lossy().to_string();
+        let db = UserDb::new(&p).await.unwrap();
+        assert_eq!(db.get_app_state("desired_profile_id").await.unwrap(), None);
+        db.set_app_state("desired_profile_id", "abc").await.unwrap();
+        assert_eq!(
+            db.get_app_state("desired_profile_id").await.unwrap(),
+            Some("abc".to_string())
+        );
+        db.set_app_state("desired_profile_id", "xyz").await.unwrap(); // upsert
+        assert_eq!(
+            db.get_app_state("desired_profile_id").await.unwrap(),
+            Some("xyz".to_string())
+        );
+        db.delete_app_state("desired_profile_id").await.unwrap();
+        assert_eq!(db.get_app_state("desired_profile_id").await.unwrap(), None);
+    }
+
+    #[test]
+    fn migration_v3_adds_app_state() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        apply_migrations(&mut conn, migrations()).unwrap();
+        let v: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert!(v >= 3);
+        // table exists:
+        conn.query_row("SELECT count(*) FROM app_state", [], |r| r.get::<_, i64>(0))
+            .unwrap();
     }
 }
