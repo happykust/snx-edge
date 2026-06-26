@@ -15,6 +15,8 @@ impl ApiClient {
         Self {
             client: Client::builder()
                 .danger_accept_invalid_certs(insecure)
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .expect("Failed to build HTTP client"),
             base_url: base_url.trim_end_matches('/').to_string(),
@@ -133,6 +135,24 @@ impl ApiClient {
         resp.json()
             .await
             .context("Failed to parse tunnel connect response")
+    }
+
+    pub async fn tunnel_challenge(&self, code: &str) -> anyhow::Result<TunnelStatus> {
+        let resp = self
+            .auth_builder(reqwest::Method::POST, "/api/v1/tunnel/challenge")
+            .json(&serde_json::json!({ "code": code }))
+            .send()
+            .await
+            .context("Failed to submit MFA challenge")?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("MFA challenge failed: HTTP {} - {}", status, body);
+        }
+        resp.json()
+            .await
+            .context("Failed to parse challenge response")
     }
 
     pub async fn tunnel_disconnect(&self) -> anyhow::Result<TunnelStatus> {
