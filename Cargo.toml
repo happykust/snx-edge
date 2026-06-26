@@ -85,6 +85,15 @@ rpassword = "7"
 # `cargo update` cannot silently advance to upstream HEAD.
 snxcore = { git = "https://github.com/ancwrd1/snx-rs.git", rev = "265265148485f1631116753c1aa9d83053bc3ae9" }
 
+# Dev-only dependencies. Cargo's manifest format collapses dev/build/runtime
+# deps under a single `[workspace.dependencies]` table — crates opt in via
+# `[dev-dependencies] foo.workspace = true` so versions stay synchronized.
+wiremock = "0.6"
+proptest = "1"
+assert_cmd = "2"
+predicates = "3"
+serial_test = "3"
+
 [profile.release]
 opt-level = 'z'
 lto = true

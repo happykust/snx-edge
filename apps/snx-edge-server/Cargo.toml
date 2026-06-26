@@ -53,3 +53,5 @@ optional = true
 tempfile = "3"
 tower = { workspace = true, features = ["util"] }
 tokio-util.workspace = true
+wiremock.workspace = true
+proptest.workspace = true
