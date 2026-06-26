@@ -53,6 +53,8 @@
 /container/envs/add name=snx-env key=ROUTEROS_HOST value="172.19.0.1"
 /container/envs/add name=snx-env key=ROUTEROS_USER value="snx-edge"
 /container/envs/add name=snx-env key=ROUTEROS_PASSWORD value="CHANGE_ME"
+# RouterOS Container (user=0:0): keep server under root, disable privilege drop
+/container/envs/add name=snx-env key=SNX_EDGE_DROP_PRIVS value="0"
 
 # --- 4. Container Volumes ---
 # Persistent storage on USB for config, data, and logs

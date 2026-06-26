@@ -9,7 +9,10 @@ command_background="yes"
 # Drop privileges: PID 1 stays as root for OpenRC, but the server process
 # itself runs as the unprivileged `snxedge` user. The binary has
 # cap_net_admin,cap_net_raw set via setcap so iptables/TUN still work.
-command_user="snxedge:snxedge"
+# On RouterOS Container (user=0:0), SNX_EDGE_DROP_PRIVS=0 disables this.
+if [ "${SNX_EDGE_DROP_PRIVS:-1}" = "1" ]; then
+    command_user="snxedge:snxedge"
+fi
 pidfile="/run/${RC_SVCNAME}.pid"
 output_log="/var/log/snx-edge/stdout.log"
 error_log="/var/log/snx-edge/stderr.log"
@@ -27,10 +30,6 @@ start_pre() {
 
     # Ensure ip_forward is enabled (root-only sysctl)
     sysctl -w net.ipv4.ip_forward=1 > /dev/null 2>&1
-
-    # Setup iptables masquerade for VPN traffic (root-only iptables write)
-    iptables -t nat -C POSTROUTING -o tun+ -j MASQUERADE 2>/dev/null || \
-        iptables -t nat -A POSTROUTING -o tun+ -j MASQUERADE
 
     # Ensure required directories exist and are writable by the snxedge user.
     mkdir -p /var/log/snx-edge /etc/snx-edge/profiles /var/lib/snx-edge
