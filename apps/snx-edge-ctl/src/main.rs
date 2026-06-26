@@ -112,6 +112,11 @@ enum Commands {
         #[arg(long, short)]
         profile: Option<String>,
     },
+    /// Submit an MFA/OTP code for a pending tunnel challenge
+    Challenge {
+        /// The OTP code (omit to be prompted interactively)
+        code: Option<String>,
+    },
     /// Show VPN tunnel status
     Status,
     /// Manage VPN profiles
@@ -343,6 +348,7 @@ async fn run(cli: Cli, mode: OutputMode) -> anyhow::Result<()> {
         Commands::Connect { profile } => cmd_connect(&cli, mode, profile.as_deref()).await,
         Commands::Disconnect => cmd_disconnect(&cli, mode).await,
         Commands::Reconnect { profile } => cmd_reconnect(&cli, mode, profile.as_deref()).await,
+        Commands::Challenge { code } => cmd_challenge(&cli, mode, code.as_deref()).await,
         Commands::Status => cmd_status(&cli, mode).await,
         Commands::Info => cmd_info(&cli, mode).await,
         Commands::Profiles { action } => cmd_profiles(&cli, mode, action).await,
@@ -544,8 +550,66 @@ async fn cmd_connect(cli: &Cli, mode: OutputMode, profile: Option<&str>) -> anyh
     }
 
     let status = client.tunnel_connect(&profile_id).await?;
+
+    match &status.connection {
+        models::ConnectionStatus::Mfa(challenge) => {
+            // Without an interactive TTY (quiet/scripted) we cannot prompt for
+            // the OTP, so the connection is left pending and we exit non-zero.
+            if mode == OutputMode::Quiet {
+                output::print_item(mode, &status);
+                bail!("MFA required: {}", challenge.prompt);
+            }
+
+            let code = rpassword::prompt_password(format!("{} (OTP): ", challenge.prompt))
+                .context("Failed to read OTP")?;
+            let after = client.tunnel_challenge(code.trim()).await?;
+            output::print_item(mode, &after);
+            match &after.connection {
+                models::ConnectionStatus::Connected(_) => Ok(()),
+                models::ConnectionStatus::Error { message } => {
+                    bail!("connect failed: {message}")
+                }
+                other => bail!("connect not completed: {}", state_name(other)),
+            }
+        }
+        models::ConnectionStatus::Error { message } => {
+            output::print_item(mode, &status);
+            bail!("connect failed: {message}")
+        }
+        _ => {
+            output::print_item(mode, &status);
+            Ok(())
+        }
+    }
+}
+
+async fn cmd_challenge(cli: &Cli, mode: OutputMode, code: Option<&str>) -> anyhow::Result<()> {
+    let client = ensure_auth(cli).await?;
+
+    let code = match code {
+        Some(c) => c.to_string(),
+        None => rpassword::prompt_password("Enter OTP: ").context("Failed to read OTP")?,
+    };
+
+    let status = client.tunnel_challenge(code.trim()).await?;
     output::print_item(mode, &status);
-    Ok(())
+
+    match &status.connection {
+        models::ConnectionStatus::Connected(_) => Ok(()),
+        models::ConnectionStatus::Error { message } => bail!("challenge failed: {message}"),
+        other => bail!("not connected: {}", state_name(other)),
+    }
+}
+
+/// Human-readable name for a connection state, used in exit/error messages.
+fn state_name(s: &models::ConnectionStatus) -> &'static str {
+    match s {
+        models::ConnectionStatus::Disconnected => "Disconnected",
+        models::ConnectionStatus::Connecting => "Connecting",
+        models::ConnectionStatus::Connected(_) => "Connected",
+        models::ConnectionStatus::Mfa(_) => "Mfa",
+        models::ConnectionStatus::Error { .. } => "Error",
+    }
 }
 
 async fn cmd_disconnect(cli: &Cli, mode: OutputMode) -> anyhow::Result<()> {
