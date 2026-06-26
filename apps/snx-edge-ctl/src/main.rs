@@ -560,17 +560,9 @@ async fn cmd_connect(cli: &Cli, mode: OutputMode, profile: Option<&str>) -> anyh
                 bail!("MFA required: {}", challenge.prompt);
             }
 
-            let code = rpassword::prompt_password(format!("{} (OTP): ", challenge.prompt))
-                .context("Failed to read OTP")?;
-            let after = client.tunnel_challenge(code.trim()).await?;
-            output::print_item(mode, &after);
-            match &after.connection {
-                models::ConnectionStatus::Connected(_) => Ok(()),
-                models::ConnectionStatus::Error { message } => {
-                    bail!("connect failed: {message}")
-                }
-                other => bail!("connect not completed: {}", state_name(other)),
-            }
+            // Interactive: prompt for the OTP, re-prompting on a wrong/expired
+            // code for up to MAX_MFA_ATTEMPTS total submissions.
+            prompt_mfa_loop(&client, mode, &challenge.prompt, MAX_MFA_ATTEMPTS).await
         }
         models::ConnectionStatus::Error { message } => {
             output::print_item(mode, &status);
@@ -583,6 +575,53 @@ async fn cmd_connect(cli: &Cli, mode: OutputMode, profile: Option<&str>) -> anyh
     }
 }
 
+/// Maximum number of OTP submissions before giving up on an MFA challenge.
+const MAX_MFA_ATTEMPTS: u32 = 3;
+
+/// Interactively prompt for an OTP and submit it via `tunnel_challenge`,
+/// re-prompting ("Incorrect code, try again") whenever the server still reports
+/// `Mfa` (a wrong or expired code). Bounded to `max_attempts` prompt/submit
+/// cycles, after which it bails non-zero. `Connected` => Ok, `Error` => bail.
+///
+/// This is the interactive path only; callers handle the quiet-mode single-shot
+/// (non-zero exit, no prompting) behavior before invoking it.
+async fn prompt_mfa_loop(
+    client: &ApiClient,
+    mode: OutputMode,
+    initial_prompt: &str,
+    max_attempts: u32,
+) -> anyhow::Result<()> {
+    let mut prompt = initial_prompt.to_string();
+    for attempt in 1..=max_attempts {
+        let code = rpassword::prompt_password(format!("{prompt} (OTP): "))
+            .context("Failed to read OTP")?;
+        let after = client.tunnel_challenge(code.trim()).await?;
+        match &after.connection {
+            models::ConnectionStatus::Connected(_) => {
+                output::print_item(mode, &after);
+                return Ok(());
+            }
+            models::ConnectionStatus::Error { message } => {
+                output::print_item(mode, &after);
+                bail!("connect failed: {message}");
+            }
+            models::ConnectionStatus::Mfa(challenge) => {
+                // Wrong/expired code: re-prompt unless we've exhausted attempts
+                // (the post-loop bail below owns the give-up path).
+                if attempt < max_attempts {
+                    eprintln!("Incorrect code, try again");
+                    prompt = challenge.prompt.clone();
+                }
+            }
+            other => {
+                output::print_item(mode, &after);
+                bail!("connect not completed: {}", state_name(other));
+            }
+        }
+    }
+    bail!("MFA failed: incorrect code after {max_attempts} attempts")
+}
+
 async fn cmd_challenge(cli: &Cli, mode: OutputMode, code: Option<&str>) -> anyhow::Result<()> {
     let client = ensure_auth(cli).await?;
 
@@ -592,12 +631,32 @@ async fn cmd_challenge(cli: &Cli, mode: OutputMode, code: Option<&str>) -> anyho
     };
 
     let status = client.tunnel_challenge(code.trim()).await?;
-    output::print_item(mode, &status);
 
     match &status.connection {
-        models::ConnectionStatus::Connected(_) => Ok(()),
-        models::ConnectionStatus::Error { message } => bail!("challenge failed: {message}"),
-        other => bail!("not connected: {}", state_name(other)),
+        models::ConnectionStatus::Connected(_) => {
+            output::print_item(mode, &status);
+            Ok(())
+        }
+        models::ConnectionStatus::Error { message } => {
+            output::print_item(mode, &status);
+            bail!("challenge failed: {message}")
+        }
+        models::ConnectionStatus::Mfa(challenge) => {
+            // The submitted code was wrong/expired. In quiet/scripted mode keep
+            // the single-shot non-zero-exit behavior (no interactive prompt).
+            if mode == OutputMode::Quiet {
+                output::print_item(mode, &status);
+                bail!("not connected: {}", state_name(&status.connection));
+            }
+            // Interactive: this first submission used one attempt; re-prompt for
+            // the remaining ones.
+            eprintln!("Incorrect code, try again");
+            prompt_mfa_loop(&client, mode, &challenge.prompt, MAX_MFA_ATTEMPTS - 1).await
+        }
+        other => {
+            output::print_item(mode, &status);
+            bail!("not connected: {}", state_name(other))
+        }
     }
 }
 
