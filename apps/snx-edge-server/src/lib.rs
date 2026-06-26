@@ -4,6 +4,7 @@ pub mod db;
 pub mod db_secrets;
 pub mod error;
 pub mod log_layer;
+pub mod net;
 pub mod routeros;
 pub mod state;
 pub mod tunnel;

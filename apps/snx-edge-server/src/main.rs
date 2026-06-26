@@ -8,6 +8,8 @@ mod routeros;
 mod state;
 mod tunnel;
 
+use snx_edge_server::net;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -25,8 +27,6 @@ use crate::api::logs::new_log_buffer;
 use crate::routeros::client::RouterOsClient;
 use crate::routeros::provisioner::Provisioner;
 use crate::state::AppState;
-
-const IPTABLES_COMMENT_TAG: &str = "managed-by=snx-edge";
 
 /// snx-edge-server — headless Check Point VPN client with management API.
 #[derive(Parser, Debug)]
@@ -59,9 +59,9 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     // Enable IP forwarding for VPN traffic routing (container → tun0 → VPN).
-    // Cleanup pass first removes any stale managed rules from a prior run
-    // (e.g. with a different interface name).
-    enable_ip_forwarding();
+    if let Err(e) = net::enable_ip_forwarding() {
+        tracing::warn!(error = %e, "failed to enable ip_forward (may need CAP_NET_ADMIN)");
+    }
 
     let listen_addr: SocketAddr = config.api.listen.parse()?;
 
@@ -225,7 +225,7 @@ async fn run_shutdown_actions(state: &AppState) {
     }
 
     // 4. iptables cleanup — drop any rule we added for NAT masquerade.
-    if let Err(e) = cleanup_managed_iptables_rules() {
+    if let Err(e) = net::cleanup_managed_iptables_rules() {
         tracing::warn!(error = %e, "iptables cleanup failed");
     }
 
@@ -353,111 +353,3 @@ fn load_client_ca_store(path: &str) -> anyhow::Result<rustls::RootCertStore> {
     Ok(root_store)
 }
 
-/// Enable IPv4 forwarding and set up NAT masquerade for tun→eth0.
-/// Failures are logged but not fatal — forwarding may already be enabled
-/// or the container may lack permissions (tested on MikroTik).
-fn enable_ip_forwarding() {
-    // sysctl net.ipv4.ip_forward=1
-    match std::fs::write("/proc/sys/net/ipv4/ip_forward", "1") {
-        Ok(()) => tracing::info!("ip_forward enabled"),
-        Err(e) => tracing::warn!("failed to enable ip_forward: {e} (may need CAP_NET_ADMIN)"),
-    }
-
-    // First, drop any stale managed rules. This handles the case where a
-    // previous run added a MASQUERADE rule with a different spec (e.g.
-    // interface name change after a config update). Without the cleanup,
-    // the rule would leak.
-    if let Err(e) = cleanup_managed_iptables_rules() {
-        tracing::warn!(error = %e, "iptables pre-cleanup failed");
-    }
-
-    // iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE -m comment --comment "managed-by=snx-edge"
-    match std::process::Command::new("iptables")
-        .args([
-            "-t",
-            "nat",
-            "-A",
-            "POSTROUTING",
-            "-o",
-            "eth0",
-            "-j",
-            "MASQUERADE",
-            "-m",
-            "comment",
-            "--comment",
-            IPTABLES_COMMENT_TAG,
-        ])
-        .output()
-    {
-        Ok(output) if output.status.success() => {
-            tracing::info!("NAT masquerade configured for eth0 (tagged {IPTABLES_COMMENT_TAG})");
-        }
-        Ok(output) => {
-            tracing::warn!(
-                "failed to configure NAT masquerade: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-        Err(e) => tracing::warn!("iptables not available: {e}"),
-    }
-}
-
-/// Remove every POSTROUTING rule in the nat table that carries our
-/// `managed-by=snx-edge` comment tag. Used both at startup (to drop stale
-/// rules from a previous run) and at shutdown (to leave the host clean).
-///
-/// Strategy: list with `iptables -t nat -S POSTROUTING`, find lines that
-/// contain the comment, then re-issue each as a `-D` (delete) by swapping
-/// the `-A POSTROUTING` prefix. This is more robust than re-deriving the
-/// args ourselves because it handles any historical variation in the rule
-/// spec (interface name, ordering, etc.).
-pub fn cleanup_managed_iptables_rules() -> anyhow::Result<()> {
-    let output = std::process::Command::new("iptables")
-        .args(["-t", "nat", "-S", "POSTROUTING"])
-        .output()
-        .with_context(|| "spawn iptables -S POSTROUTING")?;
-
-    if !output.status.success() {
-        anyhow::bail!(
-            "iptables -S POSTROUTING failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut removed = 0usize;
-    for line in stdout.lines() {
-        if !line.contains(IPTABLES_COMMENT_TAG) {
-            continue;
-        }
-        // `iptables -S` prints rules in the form `-A POSTROUTING ...args`.
-        // Convert to `-D POSTROUTING ...args` for deletion. Anything that
-        // doesn't start with `-A ` is skipped defensively (chain header,
-        // policy line, etc.).
-        let Some(rest) = line.strip_prefix("-A ") else {
-            continue;
-        };
-        let mut args: Vec<&str> = vec!["-t", "nat", "-D"];
-        args.extend(rest.split_whitespace());
-        match std::process::Command::new("iptables").args(&args).output() {
-            Ok(o) if o.status.success() => {
-                removed += 1;
-                tracing::info!("removed managed iptables rule: {line}");
-            }
-            Ok(o) => {
-                tracing::warn!(
-                    "failed to delete managed iptables rule `{line}`: {}",
-                    String::from_utf8_lossy(&o.stderr)
-                );
-            }
-            Err(e) => {
-                tracing::warn!("iptables -D spawn failed for `{line}`: {e}");
-            }
-        }
-    }
-
-    if removed > 0 {
-        tracing::info!("removed {removed} managed iptables rule(s)");
-    }
-    Ok(())
-}
