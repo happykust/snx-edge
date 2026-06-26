@@ -47,6 +47,55 @@ impl RouterOsClient {
         })
     }
 
+    /// Test-only constructor that takes the base URL, credentials and
+    /// `comment_tag` directly instead of resolving them from environment
+    /// variables. Used by integration tests that point the client at a
+    /// `wiremock::MockServer` URL.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub fn for_tests(
+        base_url: impl Into<String>,
+        username: impl Into<String>,
+        password: impl Into<String>,
+        comment_tag: impl Into<String>,
+    ) -> Self {
+        Self {
+            client: Client::builder()
+                .danger_accept_invalid_certs(true)
+                .build()
+                .expect("test client build"),
+            base_url: base_url.into(),
+            username: username.into(),
+            password: password.into(),
+            comment_tag: comment_tag.into(),
+        }
+    }
+
+    /// Variant of [`for_tests`] visible to integration tests living under
+    /// `tests/`. Behaves identically; only `cfg` gating differs. The
+    /// production binary never calls this constructor — `#[allow(dead_code)]`
+    /// silences the unused-function warning that would otherwise fire when
+    /// the binary target is compiled without `cfg(test)`.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn for_integration_tests(
+        base_url: impl Into<String>,
+        username: impl Into<String>,
+        password: impl Into<String>,
+        comment_tag: impl Into<String>,
+    ) -> Self {
+        Self {
+            client: Client::builder()
+                .danger_accept_invalid_certs(true)
+                .build()
+                .expect("test client build"),
+            base_url: base_url.into(),
+            username: username.into(),
+            password: password.into(),
+            comment_tag: comment_tag.into(),
+        }
+    }
+
     /// GET a list of resources.
     pub async fn list<T: DeserializeOwned>(&self, path: &str) -> Result<Vec<T>, AppError> {
         let url = format!("{}{}", self.base_url, path);
@@ -136,10 +185,20 @@ impl RouterOsClient {
     }
 
     /// Add an address to an address-list.
+    ///
+    /// `kind` is the structured-comment label (e.g. `"vpn-client"`,
+    /// `"vpn-bypass"`) written as `<comment_tag>;kind=<kind>`. This is
+    /// **mandatory**: the legacy-object sweep in [`Provisioner::setup`]
+    /// (see `migrate_legacy_objects`) deletes every managed object whose
+    /// comment lacks a `;kind=` field. Writing a bare `managed-by=snx-edge`
+    /// comment here would make operator-added entries look legacy and get
+    /// wiped on the next `setup` (bug P0-7). An optional free-text `comment`
+    /// is appended as `;note=<comment>` so it survives the same way.
     pub async fn add_address(
         &self,
         list_name: &str,
         address: &str,
+        kind: &str,
         comment: Option<&str>,
         disabled: Option<bool>,
     ) -> Result<super::models::AddressListEntry, AppError> {
@@ -151,10 +210,16 @@ impl RouterOsClient {
             )));
         }
 
+        let tagged = format!("{};kind={kind}", self.comment_tag);
+        let tagged = match comment {
+            Some(c) => format!("{tagged};note={c}"),
+            None => tagged,
+        };
+
         let mut body = serde_json::json!({
             "list": list_name,
             "address": address,
-            "comment": comment.unwrap_or(&self.comment_tag),
+            "comment": tagged,
         });
 
         // RouterOS expects "disabled" as a string "true"/"false"
@@ -377,4 +442,29 @@ mod tests {
         ));
         assert!(!comment_is_legacy("user note", PREFIX));
     }
+
+    proptest::proptest! {
+        /// `comment_matches_tag` runs on raw RouterOS comment strings, which
+        /// are operator-controlled and may contain anything. We assert that
+        /// it returns a bool for any input — no panics on garbage, even when
+        /// the input contains `;`, `=`, or other separator characters that
+        /// could break a naive split-based implementation.
+        #[test]
+        fn comment_match_no_panic_on_garbage(
+            s in ".*",
+            tag in r"managed-by=[a-z]+",
+        ) {
+            let _ = comment_matches_tag(&s, &tag);
+            let _ = comment_is_legacy(&s, &tag);
+            let _ = comment_matches_kind(&s, &tag, "some-kind");
+        }
+    }
 }
+
+// NOTE: Per-task `TunnelManager` proptest is intentionally omitted.
+// `TunnelManager::new` wires `CheckPointTunnelConnectorFactory` directly
+// (see `apps/snx-edge-server/src/tunnel.rs`); there is no `MockFactory` in
+// the codebase and exposing one would require generic-ising the manager
+// across every call site. That is a larger refactor than the audit task
+// scopes; the existing `tunnel.rs` unit tests already cover the
+// failure-recovery / state-reset path the proptest would exercise.

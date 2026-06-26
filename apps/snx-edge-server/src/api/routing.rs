@@ -102,6 +102,7 @@ async fn add_client(
         .add_address(
             &address_list_vpn,
             &req.address,
+            "vpn-client",
             req.comment.as_deref(),
             req.disabled,
         )
@@ -169,6 +170,7 @@ async fn add_bypass(
         .add_address(
             &address_list_bypass,
             &req.address,
+            "vpn-bypass",
             req.comment.as_deref(),
             req.disabled,
         )
@@ -411,4 +413,38 @@ pub fn routes() -> Router<AppState> {
         .route("/routing/status", get(routing_status))
         .route("/routing/setup", post(setup_pbr).delete(teardown_pbr))
         .route("/routing/diagnostics", get(diagnostics))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_address;
+    use proptest::prelude::*;
+
+    proptest! {
+        /// `validate_address` is a pure parser run on user-supplied strings;
+        /// it must return `Ok` or `Err` for every input but never panic. The
+        /// proptest `.*` strategy generates arbitrary UTF-8 strings (incl.
+        /// empty, control chars, multibyte) — the only assertion is that the
+        /// function returns at all.
+        #[test]
+        fn validate_address_does_not_panic(s in ".*") {
+            let _ = validate_address(&s);
+        }
+    }
+
+    #[test]
+    fn validate_address_accepts_known_good() {
+        assert!(validate_address("192.168.1.1").is_ok());
+        assert!(validate_address("::1").is_ok());
+        assert!(validate_address("10.0.0.0/8").is_ok());
+        assert!(validate_address("fd00::/64").is_ok());
+        assert!(validate_address("192.168.1.1-192.168.1.10").is_ok());
+    }
+
+    #[test]
+    fn validate_address_rejects_garbage() {
+        assert!(validate_address("not an address").is_err());
+        assert!(validate_address("10.0.0.0/64").is_err()); // prefix > 32 for v4
+        assert!(validate_address("").is_err());
+    }
 }
