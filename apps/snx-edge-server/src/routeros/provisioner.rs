@@ -72,6 +72,12 @@ impl<'a> Provisioner<'a> {
     /// Idempotent: each step checks for an existing managed object with the
     /// matching `kind=` before creating.  Stops on the first error and
     /// returns a [`SetupReport`] describing how far it got.
+    ///
+    /// P0-9: if any step fails after earlier steps have already applied managed
+    /// objects, the partial layout is rolled back via [`teardown`](Self::teardown)
+    /// before returning — a half-applied PBR config (e.g. kill-switch without a
+    /// default route) would blackhole the LAN with no auto-recovery. The
+    /// returned [`SetupReport`] is unaffected by the rollback.
     pub async fn setup(&self, container_ip: &str) -> SetupReport {
         let tag = &self.config.comment_tag;
         let mut report = SetupReport::new();
@@ -91,40 +97,67 @@ impl<'a> Provisioner<'a> {
             tracing::warn!(error = %e, "legacy managed-object migration failed; continuing");
         }
 
-        macro_rules! step {
-            ($name:expr, $expr:expr) => {{
-                match $expr.await {
-                    Ok(()) => report.applied.push($name),
-                    Err(e) => {
-                        tracing::error!(step = $name, error = %e, "PBR setup step failed");
-                        report.failed = Some(($name, e));
-                        return report;
+        // The `step!` macro records each successful step in `report.applied`
+        // and, on the first failure, records it in `report.failed` and breaks
+        // out of `'steps` (skipping the rest, which may depend on the failed
+        // one) so the rollback below can run.
+        'steps: {
+            macro_rules! step {
+                ($name:expr, $expr:expr) => {{
+                    match $expr.await {
+                        Ok(()) => report.applied.push($name),
+                        Err(e) => {
+                            tracing::error!(step = $name, error = %e, "PBR setup step failed");
+                            report.failed = Some(($name, e));
+                            break 'steps;
+                        }
                     }
-                }
-            }};
+                }};
+            }
+
+            step!(KIND_ROUTING_TABLE, self.ensure_routing_table(tag));
+            step!(
+                KIND_MANGLE_CONN_MARK,
+                self.ensure_mangle_connection_mark(tag)
+            );
+            step!(
+                KIND_MANGLE_ROUTING_MARK,
+                self.ensure_mangle_routing_mark(tag)
+            );
+            step!(KIND_MSS_CLAMP, self.ensure_mss_clamp(tag));
+            step!(KIND_DEFAULT_ROUTE, self.ensure_vpn_route(container_ip, tag));
+            step!(KIND_KILL_SWITCH, self.ensure_killswitch(tag));
+            step!(
+                KIND_DNS_DST_NAT,
+                self.ensure_dns_redirect(container_ip, tag)
+            );
+            step!(KIND_DOT_BLOCK, self.ensure_dot_block(tag));
+            step!(KIND_FASTTRACK_BYPASS, self.ensure_fasttrack_exclusion(tag));
+            step!(KIND_RFC1918_BYPASS, self.ensure_default_bypass(tag));
+
+            tracing::info!("PBR setup completed successfully");
         }
 
-        step!(KIND_ROUTING_TABLE, self.ensure_routing_table(tag));
-        step!(
-            KIND_MANGLE_CONN_MARK,
-            self.ensure_mangle_connection_mark(tag)
-        );
-        step!(
-            KIND_MANGLE_ROUTING_MARK,
-            self.ensure_mangle_routing_mark(tag)
-        );
-        step!(KIND_MSS_CLAMP, self.ensure_mss_clamp(tag));
-        step!(KIND_DEFAULT_ROUTE, self.ensure_vpn_route(container_ip, tag));
-        step!(KIND_KILL_SWITCH, self.ensure_killswitch(tag));
-        step!(
-            KIND_DNS_DST_NAT,
-            self.ensure_dns_redirect(container_ip, tag)
-        );
-        step!(KIND_DOT_BLOCK, self.ensure_dot_block(tag));
-        step!(KIND_FASTTRACK_BYPASS, self.ensure_fasttrack_exclusion(tag));
-        step!(KIND_RFC1918_BYPASS, self.ensure_default_bypass(tag));
+        // P0-9: never leave a half-applied PBR layout on the router. On any
+        // step failure, roll back the objects already created by tearing down
+        // everything carrying our managed tag. `teardown` matches purely on the
+        // tag, so it removes exactly the objects the steps above applied (each
+        // was tagged `;kind=`); it is safe even though setup stopped early.
+        // The rollback never mutates `report`, so the caller still sees how far
+        // setup got and which step failed.
+        if report.failed.is_some() {
+            tracing::warn!(
+                failed = ?report.failed,
+                "PBR setup failed mid-way; rolling back applied objects"
+            );
+            if let Err(e) = self.teardown().await {
+                tracing::error!(
+                    error = %e,
+                    "rollback teardown failed; manual cleanup may be required"
+                );
+            }
+        }
 
-        tracing::info!("PBR setup completed successfully");
         report
     }
 

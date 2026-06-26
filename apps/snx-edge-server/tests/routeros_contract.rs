@@ -200,27 +200,89 @@ async fn setup_marks_only_corp_destinations_and_clamps_mss() {
     );
 }
 
+/// P0-9 regression: when an `ensure_*` step fails mid-setup, `setup` must roll
+/// back the objects it already applied (by calling `teardown`) so the router is
+/// never left with a half-applied PBR layout — e.g. a kill-switch blackhole
+/// without the default route alongside it, which would blackhole the whole LAN
+/// with no auto-recovery.
+///
+/// The returned [`SetupReport`] is **unchanged** by the rollback: the caller
+/// still sees the step that failed and everything applied before it.
+///
+/// Mocking notes: wiremock mocks are static, but `teardown` re-lists every
+/// path to discover what to delete. So the GETs on the two paths that received
+/// a successful create return EMPTY during setup (so the idempotency checks
+/// create the object) and then return the *applied* managed object on the
+/// rollback list, so `delete_managed` finds it and issues a DELETE. We stage
+/// this with `up_to_n_times` + a fallback, mirroring the legacy-migration test.
 #[tokio::test]
-async fn provisioner_setup_partial_failure_returns_partial() {
+async fn provisioner_setup_rolls_back_on_partial_failure() {
     let server = MockServer::start().await;
-    mount_empty_lists(&server).await;
 
-    // Accept creates for the first three steps' resource paths.
-    // Routing-table is a `/routing/table` PUT (step 1).
-    Mock::given(method("PUT"))
+    // `/routing/table`: GET #1 (legacy sweep) + GET #2 (ensure_routing_table)
+    // are empty; GET #3 (rollback `delete_managed`) returns the applied table
+    // so it gets deleted.
+    Mock::given(method("GET"))
         .and(path("/rest/routing/table"))
-        .respond_with(ResponseTemplate::new(200).set_body_json::<Value>(json!({".id": "*1"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json::<Value>(json!([])))
+        .up_to_n_times(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/rest/routing/table"))
+        .respond_with(ResponseTemplate::new(200).set_body_json::<Value>(json!([
+            {".id": "*ab", "name": "vpn-route", "comment": format!("{TAG};kind={KIND_ROUTING_TABLE}")},
+        ])))
         .mount(&server)
         .await;
 
-    // The mangle endpoint serves both step 2 (conn-mark) and step 3
-    // (routing-mark). We need the *second* PUT (routing-mark) to fail with
-    // 500 while the first still succeeds. Wiremock matches in registration
-    // order; we register a "first PUT succeeds" mock with `up_to_n_times(1)`
-    // before a catch-all 500 fallback.
+    // `/ip/firewall/mangle`: GET #1 (legacy sweep) + #2 (conn-mark ensure) +
+    // #3 (routing-mark ensure, whose PUT then 500s) are empty; GET #4 (rollback
+    // `delete_managed`) returns the applied conn-mark rule so it gets deleted.
+    Mock::given(method("GET"))
+        .and(path("/rest/ip/firewall/mangle"))
+        .respond_with(ResponseTemplate::new(200).set_body_json::<Value>(json!([])))
+        .up_to_n_times(3)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/rest/ip/firewall/mangle"))
+        .respond_with(ResponseTemplate::new(200).set_body_json::<Value>(json!([
+            {".id": "*cd", "chain": "prerouting", "comment": format!("{TAG};kind={KIND_MANGLE_CONN_MARK}")},
+        ])))
+        .mount(&server)
+        .await;
+
+    // The remaining paths are never written to before the failure, so they stay
+    // empty for both the legacy sweep and the rollback list.
+    for p in [
+        "/rest/ip/firewall/filter",
+        "/rest/ip/firewall/nat",
+        "/rest/ip/route",
+        "/rest/ip/firewall/address-list",
+    ] {
+        Mock::given(method("GET"))
+            .and(path(p))
+            .respond_with(ResponseTemplate::new(200).set_body_json::<Value>(json!([])))
+            .mount(&server)
+            .await;
+    }
+
+    // Step 1 (routing-table) PUT succeeds.
+    Mock::given(method("PUT"))
+        .and(path("/rest/routing/table"))
+        .respond_with(ResponseTemplate::new(200).set_body_json::<Value>(json!({".id": "*ab"})))
+        .mount(&server)
+        .await;
+
+    // The mangle endpoint serves step 2 (conn-mark) and step 3 (routing-mark).
+    // The *second* PUT (routing-mark) must fail with 500 while the first
+    // succeeds. Wiremock prefers the first-mounted still-active mock, so we
+    // register a "first PUT succeeds" mock with `up_to_n_times(1)` before a
+    // catch-all 500 fallback.
     Mock::given(method("PUT"))
         .and(path("/rest/ip/firewall/mangle"))
-        .respond_with(ResponseTemplate::new(200).set_body_json::<Value>(json!({".id": "*1"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json::<Value>(json!({".id": "*cd"})))
         .up_to_n_times(1)
         .mount(&server)
         .await;
@@ -230,20 +292,60 @@ async fn provisioner_setup_partial_failure_returns_partial() {
         .mount(&server)
         .await;
 
+    // Accept any DELETE to `<path>/<id>`; the rollback DELETEs are asserted
+    // against the recorded requests below.
+    Mock::given(method("DELETE"))
+        .and(wiremock::matchers::path_regex(r".*/\*[0-9a-fA-F]+$"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+
     let client = client_for(&server);
     let cfg = config();
     let prov = Provisioner::new(&client, &cfg);
 
     let report = prov.setup(CONTAINER_IP).await;
 
+    // The report itself is unchanged by the rollback: the failing step and the
+    // steps applied before it are still reported verbatim.
     let (step, _err) = report
         .failed
         .as_ref()
         .expect("expected setup to fail at the routing-mark step");
     assert_eq!(*step, KIND_MANGLE_ROUTING_MARK);
-    assert_eq!(report.applied.len(), 2, "expected first two steps to be applied before the failure, got {:?}", report.applied);
-    assert_eq!(report.applied[0], KIND_ROUTING_TABLE);
-    assert_eq!(report.applied[1], KIND_MANGLE_CONN_MARK);
+    assert_eq!(
+        report.applied,
+        vec![KIND_ROUTING_TABLE, KIND_MANGLE_CONN_MARK],
+        "the two steps applied before the failure must still be reported, got {:?}",
+        report.applied,
+    );
+
+    // The rollback must have DELETEd exactly the two managed objects that were
+    // applied before the failure — no half-applied object left behind, and no
+    // extra deletes.
+    let requests = server
+        .received_requests()
+        .await
+        .expect("wiremock recording enabled");
+    let deletes: Vec<String> = requests
+        .iter()
+        .filter(|r| r.method.as_str().eq_ignore_ascii_case("DELETE"))
+        .map(|r| r.url.path().to_string())
+        .collect();
+
+    assert!(
+        deletes.iter().any(|u| u == "/rest/ip/firewall/mangle/*cd"),
+        "rollback must DELETE the applied conn-mark rule, deletes={deletes:?}",
+    );
+    assert!(
+        deletes.iter().any(|u| u == "/rest/routing/table/*ab"),
+        "rollback must DELETE the applied routing table, deletes={deletes:?}",
+    );
+    assert_eq!(
+        deletes.len(),
+        2,
+        "rollback must delete exactly the applied managed objects (no leftover, no extras), deletes={deletes:?}",
+    );
 }
 
 #[tokio::test]
