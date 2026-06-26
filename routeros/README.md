@@ -4,10 +4,12 @@ Reference scripts for deploying the snx-edge-server container on MikroTik router
 
 ## Prerequisites
 
-- MikroTik router with **RouterOS 7.4+**
+- MikroTik router with **RouterOS ≥7.23 stable** (7.22 breaks ip-rule for containers; ≤7.11 does not support TUN in containers)
 - Container support enabled (`/system/device-mode/update container=yes`, reboot required)
+- **SSL/SNX (TUN) mode** required for Check Point VPN
 - USB storage mounted as `usb1` (for container root and volumes)
 - ARM64 (hAP ax3, RB5009, etc.) or x86_64 (CHR) architecture
+- Container runs as **user=0:0** (root); `/dev/net/tun` is exposed by default — no `--cap-add` or special `--device` flags required
 
 ## Setup
 

@@ -39,7 +39,7 @@ Headless Check Point VPN client running inside a MikroTik container with a remot
 |---|---|---|
 | CPU | ARMv8 (ARM64) or x86_64 | ARMv8 / x86_64 |
 | RAM | 256 MB free | 512 MB+ |
-| RouterOS | 7.4 with container support | 7.10+ |
+| RouterOS | ≥7.23 stable with container support | ≥7.23 stable (7.22 breaks ip-rule for containers; ≤7.11 lacks TUN support) |
 | Storage | ~50 MB for image + config | 200 MB |
 
 ARMv7 is **not supported** — `snxcore`'s OpenSSL/SQLite stack requires a 64-bit toolchain. The server itself uses around 50 MB of RAM at idle; the rest is Alpine OS overhead, plus headroom for active VPN sessions.
@@ -50,7 +50,7 @@ Recommended MikroTik models: **hAP ax²**, **hAP ax³**, **RB4011** series, **CC
 
 ### Prerequisites
 
-- MikroTik router with RouterOS 7.4+ and container support enabled
+- MikroTik router with RouterOS ≥7.23 stable and container support enabled
 - Check Point VPN gateway credentials
 - Docker (for local testing) or MikroTik's container runtime
 
@@ -88,18 +88,18 @@ docker compose up -d
 
 The server will be available at `http://localhost:8080`. The default admin account is created from `SNX_EDGE_ADMIN_USER` / `SNX_EDGE_ADMIN_PASSWORD` on first start.
 
-### Required container capabilities
+### Container runtime
 
-The container runs with the minimum capability set:
+For **Docker/Compose**, the container runs with minimum capabilities:
 
 | Capability | Why |
 |---|---|
 | `NET_ADMIN` | iptables MASQUERADE, TUN device control, `net.ipv4.ip_forward` |
 | `NET_RAW` | TUN device packet inspection |
 
-All other Linux capabilities are dropped (`cap_drop: ALL`), and `no-new-privileges:true` blocks setuid escalation. The compose file deliberately avoids `privileged: true`.
+All other Linux capabilities are dropped (`cap_drop: ALL`), and `no-new-privileges:true` blocks setuid escalation.
 
-> **MikroTik note:** RouterOS's container runtime exposes its own `mounts` / `cap-add` syntax in `/container/config`. The capability set is the same (`NET_ADMIN`, `NET_RAW`), but the wire format differs from Docker Compose. See the RouterOS container documentation for the equivalent fields.
+> **RouterOS Container runtime:** Unlike Docker, RouterOS Container automatically exposes `/dev/net/tun` to containers running as `user=0:0` (root). No `--cap-add`, `--cap-drop`, or `--device` flags are needed — set `user="0:0"` in `/container/add`, and TUN support works out of the box. This requires RouterOS ≥7.23 stable.
 
 ## Building from Source
 

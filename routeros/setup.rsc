@@ -30,6 +30,13 @@
 /ip/firewall/nat/add chain=srcnat src-address=172.19.0.0/24 action=masquerade
 
 # --- 2. RouterOS REST API User ---
+# REST-клиент контейнера ходит на https://<host>/rest — включаем www-ssl.
+# Генерируем self-signed cert (клиент использует tls_skip_verify=true для него).
+/certificate/add name=snx-edge-rest common-name=snx-edge-rest key-usage=tls-server
+/certificate/sign snx-edge-rest
+:delay 2s
+/ip/service/set www-ssl certificate=snx-edge-rest disabled=no
+
 # Create a dedicated user group with minimal permissions
 /user/group/add name=snx-edge-api \
     policy=read,write,api,rest-api,!ftp,!local,!ssh,!reboot,!policy,!test,!winbox,!password,!web,!sniff,!sensitive,!romon
@@ -42,6 +49,7 @@
 /container/envs/add name=snx-env key=SNX_EDGE_JWT_SECRET value="CHANGE_ME_MIN_32_CHARS"
 /container/envs/add name=snx-env key=SNX_EDGE_ADMIN_USER value="admin"
 /container/envs/add name=snx-env key=SNX_EDGE_ADMIN_PASSWORD value="CHANGE_ME"
+# REST API работает по HTTPS с self-signed сертификатом; в конфиге нужно tls_skip_verify=true
 /container/envs/add name=snx-env key=ROUTEROS_HOST value="172.19.0.1"
 /container/envs/add name=snx-env key=ROUTEROS_USER value="snx-edge"
 /container/envs/add name=snx-env key=ROUTEROS_PASSWORD value="CHANGE_ME"
@@ -59,12 +67,17 @@
 /file/mkdir usb1/snx-edge/logs
 
 # --- 6. Container ---
+# RouterOS Container не поддерживает --cap-add/--device. /dev/net/tun доступен
+# контейнеру по умолчанию; для создания TUN-интерфейса контейнер должен
+# работать от root (user=0:0). Требуется RouterOS >= 7.23 (на 7.22 ip-rule
+# для контейнеров сломаны; на <=7.11 TUN в контейнере не работает).
 /container/add \
     name=snx-edge \
     remote-image=ghcr.io/happykust/snx-edge-server:latest \
     interface=veth-snx envlist=snx-env \
     root-dir=usb1/snx-edge \
     mounts=snx-config,snx-data,snx-logs \
+    user="0:0" \
     start-on-boot=yes logging=yes
 
 # ============================================================
