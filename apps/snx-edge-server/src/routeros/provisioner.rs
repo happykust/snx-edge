@@ -338,6 +338,36 @@ impl<'a> Provisioner<'a> {
         })
     }
 
+    // === Reconciler-facing default-route control ===
+
+    /// Ensure the distance-1 default route through the container exists.
+    ///
+    /// Idempotent wrapper over [`ensure_vpn_route`](Self::ensure_vpn_route);
+    /// called by the reconciler when the tunnel comes up so corp traffic has a
+    /// live next hop into the container alongside the always-present blackhole.
+    pub async fn set_default_route_present(&self, gateway: &str) -> Result<(), AppError> {
+        self.ensure_vpn_route(gateway, &self.config.comment_tag).await
+    }
+
+    /// Remove the managed distance-1 default route, leaving only the blackhole
+    /// (fail-closed). Called by the reconciler when the tunnel goes down.
+    ///
+    /// Matches on the structured `kind=default-route` comment so the blackhole
+    /// (`kind=kill-switch`) and any other managed routes are left untouched.
+    pub async fn clear_default_route(&self) -> Result<(), AppError> {
+        let tag = &self.config.comment_tag;
+        let routes: Vec<RouteEntry> = self.client.list_managed("/ip/route").await?;
+        for r in routes.iter().filter(|r| {
+            r.comment
+                .as_deref()
+                .map(|c| comment_matches_kind(c, tag, KIND_DEFAULT_ROUTE))
+                .unwrap_or(false)
+        }) {
+            self.client.delete("/ip/route", &r.id).await?;
+        }
+        Ok(())
+    }
+
     // === Private helpers for idempotent rule creation ===
 
     async fn ensure_routing_table(&self, tag: &str) -> Result<(), AppError> {

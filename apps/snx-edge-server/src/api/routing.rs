@@ -355,7 +355,7 @@ async fn diagnostics(
 /// Returns an `Internal` error if the command fails to spawn, exits non-zero,
 /// or produces output we can't parse — the previous silent fallback to
 /// `172.19.0.2` would mask a real misconfiguration of the docker network.
-fn detect_container_ip() -> Result<String, AppError> {
+pub(crate) fn detect_container_ip() -> Result<String, AppError> {
     let output = std::process::Command::new("ip")
         .args(["-4", "-o", "addr", "show", "eth0"])
         .output()

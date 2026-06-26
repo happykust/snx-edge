@@ -4,6 +4,7 @@ mod db;
 mod db_secrets;
 mod error;
 mod log_layer;
+mod reconciler;
 mod routeros;
 mod state;
 mod tunnel;
@@ -83,6 +84,11 @@ async fn main() -> anyhow::Result<()> {
     // Spawn the signal listener once: it cancels the shared token, which
     // every other shutdown-aware component observes.
     spawn_signal_listener(shutdown.clone());
+
+    // Spawn the reconciler: it reacts to tunnel connection-state changes by
+    // applying/clearing the dynamic SNAT (MASQUERADE on the VPN interface) and
+    // the RouterOS default route. It exits on the shared shutdown token.
+    tokio::spawn(reconciler::run(app_state.clone()));
 
     let router = api::router(app_state.clone());
 
