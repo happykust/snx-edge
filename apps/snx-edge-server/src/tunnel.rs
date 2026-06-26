@@ -145,6 +145,19 @@ pub fn build_tunnel_params(vpn: &VpnConfig) -> snxcore::model::params::TunnelPar
     params
 }
 
+/// Status to apply when the tunnel event channel closes with no explicit
+/// Connected/Disconnected transition. `None` when an intentional `disconnect()`
+/// already owns the transition.
+fn terminal_status_on_channel_close(disconnect_initiated: bool) -> Option<ConnectionStatus> {
+    if disconnect_initiated {
+        None
+    } else {
+        Some(ConnectionStatus::Error {
+            message: "tunnel ended unexpectedly".to_string(),
+        })
+    }
+}
+
 // === Tunnel Manager ===
 
 /// Manages VPN tunnel lifecycle using snxcore.
@@ -316,6 +329,12 @@ impl TunnelManager {
         let mtu = *self.last_mtu.read().await;
 
         let event_handle = tokio::spawn(async move {
+            // Tracks whether a `break` inside the loop already performed a
+            // terminal status transition (Disconnected / Error). When the loop
+            // instead ends because the event channel closed (the tunnel
+            // run-loop exited on its own), this stays false and the
+            // channel-close fallback below applies a terminal status.
+            let mut terminal_handled = false;
             while let Some(event) = evt_rx.recv().await {
                 // If `disconnect()` is already running, it owns the status
                 // transition; we must not race it. Drop the event and exit.
@@ -339,6 +358,7 @@ impl TunnelManager {
                                 status: "error".to_string(),
                             });
                         }
+                        terminal_handled = true;
                         break;
                     }
                 }
@@ -362,6 +382,7 @@ impl TunnelManager {
                         let _ = broadcast_tx.send(ServerEvent::ConnectionStatus {
                             status: "disconnected".to_string(),
                         });
+                        terminal_handled = true;
                         break;
                     }
                     TunnelEvent::Rekeyed(addr) => {
@@ -376,6 +397,22 @@ impl TunnelManager {
                         tracing::debug!(?event, "unhandled tunnel event");
                     }
                 }
+            }
+
+            // Event channel closed without a terminal transition (e.g. the
+            // tunnel run-loop ended on its own). Avoid leaving a stale
+            // `Connected`. An intentional `disconnect()` already owns the
+            // transition, so the helper returns `None` in that case.
+            if !terminal_handled
+                && let Some(s) =
+                    terminal_status_on_channel_close(disconnect_flag.load(Ordering::SeqCst))
+            {
+                *status.lock().expect("status mutex poisoned") = s;
+                *connector.lock().await = None;
+                *session_ref.lock().await = None;
+                let _ = broadcast_tx.send(ServerEvent::ConnectionStatus {
+                    status: "error".to_string(),
+                });
             }
         });
 
@@ -527,8 +564,22 @@ mod tests {
     //! `tunnel_type` and `transport_type`.  An snxcore upgrade that renames
     //! a `Debug`-derived variant must NOT silently change our public API —
     //! that's exactly the bug an explicit `match` was added to prevent.
-    use super::{ConnectionStatus, TunnelManager, VpnConfig, transport_type_str, tunnel_type_str};
+    use super::{
+        ConnectionStatus, TunnelManager, VpnConfig, terminal_status_on_channel_close,
+        transport_type_str, tunnel_type_str,
+    };
     use snxcore::model::params::{TransportType, TunnelType};
+
+    #[test]
+    fn channel_close_yields_error_unless_user_disconnected() {
+        assert_eq!(
+            terminal_status_on_channel_close(false),
+            Some(ConnectionStatus::Error {
+                message: "tunnel ended unexpectedly".to_string()
+            })
+        );
+        assert_eq!(terminal_status_on_channel_close(true), None);
+    }
 
     #[test]
     fn tunnel_type_strings_are_stable() {
