@@ -91,6 +91,12 @@ async fn main() -> anyhow::Result<()> {
     // the RouterOS default route. It exits on the shared shutdown token.
     tokio::spawn(reconciler::run(app_state.clone()));
 
+    // Spawn the supervisor: on boot it optionally provisions the RouterOS PBR
+    // layout and initiates the persisted desired profile (holding at MFA for
+    // the operator's OTP); thereafter it re-initiates the connection with
+    // backoff when the tunnel drops. It exits on the shared shutdown token.
+    tokio::spawn(supervisor::run(app_state.clone()));
+
     let router = api::router(app_state.clone());
 
     if let (Some(cert_path), Some(key_path)) = (&tls_cert, &tls_key) {
