@@ -7,6 +7,7 @@ mod log_layer;
 mod reconciler;
 mod routeros;
 mod state;
+mod supervisor;
 mod tunnel;
 
 use snx_edge_server::net;
