@@ -628,6 +628,63 @@ async fn connect_records_desired_then_disconnect_clears() {
     );
 }
 
+/// The supervisor's durable auto-reconnect suspension latch defaults to `false`
+/// and an explicit `POST /tunnel/connect` clears it, re-arming auto-reconnect
+/// for the new session even after a prior give-up latched it. The clear happens
+/// before the tunnel dial, so it holds even though the connect itself 400s.
+#[tokio::test]
+async fn connect_clears_reconnect_suspension() {
+    use std::sync::atomic::Ordering;
+
+    let (app, state, token, _dir) = setup_with_state().await;
+
+    // Default must be un-suspended.
+    assert!(
+        !state.reconnect_suspended.load(Ordering::SeqCst),
+        "reconnect_suspended must default to false"
+    );
+
+    // Simulate a prior give-up having latched the suspension.
+    state.reconnect_suspended.store(true, Ordering::SeqCst);
+
+    let resp = app
+        .clone()
+        .oneshot(auth_post(
+            "/api/v1/profiles",
+            &token,
+            json!({
+                "name": "Resume VPN",
+                "config": {
+                    "server": "vpn.test.com",
+                    "login_type": "password",
+                    "username": "user1",
+                    "password": "pass123"
+                }
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let profile_id = resp_json(resp).await["id"].as_str().unwrap().to_string();
+
+    // Connect 400s at the tunnel layer (no real gateway), but the latch clear
+    // runs with the desired-state writes, before the dial.
+    let resp = app
+        .oneshot(auth_post(
+            "/api/v1/tunnel/connect",
+            &token,
+            json!({"profile_id": profile_id}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    assert!(
+        !state.reconnect_suspended.load(Ordering::SeqCst),
+        "explicit connect must clear the reconnect suspension latch"
+    );
+}
+
 // === SSE wire-format tests ===
 
 /// Pull just the first chunk off a streaming response body.

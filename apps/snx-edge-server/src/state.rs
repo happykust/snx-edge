@@ -51,6 +51,15 @@ pub struct AppState {
     /// In-memory generation cache used by the require_auth middleware. See
     /// `TokenGenCache` doc for details.
     pub token_gen_cache: TokenGenCache,
+    /// In-session latch that durably suspends supervisor auto-reconnect after
+    /// the pre-MFA failure cap is hit (`supervisor::initiate_with_backoff`
+    /// give-up). Once set, the steady-state loop stops re-arming on tunnel
+    /// `Error` events — including the supervisor's own failed-connect events,
+    /// which would otherwise re-trigger a fresh backoff burst forever. Cleared
+    /// by an explicit API `connect` (re-arms for that session) or by the tunnel
+    /// actually reaching `Connected` (a real session un-suspends future drops).
+    /// Not persisted: desired-state stays in the DB; only this latch is volatile.
+    pub reconnect_suspended: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl AppState {
@@ -112,6 +121,7 @@ impl AppState {
             shutdown,
             routeros_client: Arc::new(RwLock::new(None)),
             token_gen_cache: Arc::new(RwLock::new(HashMap::new())),
+            reconnect_suspended: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 

@@ -18,6 +18,7 @@
 
 use snx_edge_types::events::ServerEvent;
 use snx_edge_types::tunnel::ConnectionStatus;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use crate::state::AppState;
@@ -184,11 +185,29 @@ pub async fn run(state: AppState) {
                     // would return `Idle`, so the `let Some` guard is exactly
                     // the no-desired-profile short-circuit.
                     let status = state.tunnel.status().await.connection;
+                    // A genuine `Connected` un-suspends: a session that actually
+                    // came up means future unexpected drops should retry again.
+                    if let ConnectionStatus::Connected(_) = status
+                        && decide(&status, true) == SupervisorAction::Hold
+                    {
+                        state.reconnect_suspended.store(false, Ordering::SeqCst);
+                    }
                     if let Some(p) = desired_profile(&state).await
                         && decide(&status, true) == SupervisorAction::Reconnect
                     {
-                        tracing::info!("supervisor: reconnecting after unexpected drop");
-                        initiate_with_backoff(&state, &p).await;
+                        // Gate on the suspension latch so our OWN failed-connect
+                        // events (which buffer as `Error` and drain back here)
+                        // can no longer re-arm a fresh backoff burst after a
+                        // give-up. Only an explicit API `connect` or a real
+                        // `Connected` clears the latch.
+                        if state.reconnect_suspended.load(Ordering::SeqCst) {
+                            tracing::debug!(
+                                "supervisor: drop ignored, auto-reconnect suspended (explicit connect required)"
+                            );
+                        } else {
+                            tracing::info!("supervisor: reconnecting after unexpected drop");
+                            initiate_with_backoff(&state, &p).await;
+                        }
                     }
                 }
                 Ok(_) => {}
@@ -232,10 +251,15 @@ async fn initiate_with_backoff(state: &AppState, profile_id: &str) {
                 let d = backoff_delay(failures);
                 failures = failures.saturating_add(1);
                 if should_give_up(failures) {
+                    // Durably latch the suspension so the steady-state loop will
+                    // not re-arm on our own buffered `Error` events (the bug this
+                    // safeguard previously failed to prevent). Cleared only by an
+                    // explicit API `connect` or by the tunnel reaching `Connected`.
+                    state.reconnect_suspended.store(true, Ordering::SeqCst);
                     tracing::warn!(
-                        attempts = failures,
+                        failures,
                         profile_id = %profile_id,
-                        "supervisor: auto-reconnect suspended after repeated failures; manual reconnect required"
+                        "supervisor: auto-reconnect suspended after {failures} failed attempts; an explicit connect re-arms it"
                     );
                     return;
                 }

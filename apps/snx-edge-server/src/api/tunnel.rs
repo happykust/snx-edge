@@ -40,6 +40,11 @@ async fn connect(
         .set_app_state("desired_profile_id", &req.profile_id)
         .await?;
     state.db.set_app_state("auto_connect", "true").await?;
+    // Re-arm supervisor auto-reconnect: an explicit operator connect clears any
+    // durable suspension latched after a prior give-up (see supervisor.rs).
+    state
+        .reconnect_suspended
+        .store(false, std::sync::atomic::Ordering::SeqCst);
 
     state
         .tunnel
