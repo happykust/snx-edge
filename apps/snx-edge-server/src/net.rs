@@ -59,7 +59,10 @@ pub fn apply_vpn_masquerade(iface: &str) -> anyhow::Result<()> {
     }
     let out = run_iptables(&masquerade_add_args(iface))?;
     if !out.status.success() {
-        anyhow::bail!("iptables -A failed: {}", String::from_utf8_lossy(&out.stderr));
+        anyhow::bail!(
+            "iptables -A failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
     tracing::info!(interface = iface, "VPN MASQUERADE applied");
     Ok(())
@@ -149,9 +152,18 @@ mod tests {
         assert_eq!(
             args,
             vec![
-                "-t", "nat", "-A", "POSTROUTING",
-                "-o", "tun0", "-j", "MASQUERADE",
-                "-m", "comment", "--comment", "managed-by=snx-edge",
+                "-t",
+                "nat",
+                "-A",
+                "POSTROUTING",
+                "-o",
+                "tun0",
+                "-j",
+                "MASQUERADE",
+                "-m",
+                "comment",
+                "--comment",
+                "managed-by=snx-edge",
             ]
         );
     }

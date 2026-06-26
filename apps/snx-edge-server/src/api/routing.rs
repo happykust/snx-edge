@@ -215,7 +215,9 @@ fn validate_corp_cidr(address: &str) -> Result<(), AppError> {
 
     match address.split_once('/') {
         Some((ip_part, prefix_part)) => {
-            ip_part.parse::<std::net::Ipv4Addr>().map_err(|_| invalid())?;
+            ip_part
+                .parse::<std::net::Ipv4Addr>()
+                .map_err(|_| invalid())?;
             let prefix: u8 = prefix_part.parse().map_err(|_| invalid())?;
             if prefix > 32 {
                 return Err(invalid());
@@ -224,7 +226,9 @@ fn validate_corp_cidr(address: &str) -> Result<(), AppError> {
         }
         // Bare host IPv4 — implied /32 on RouterOS.
         None => {
-            address.parse::<std::net::Ipv4Addr>().map_err(|_| invalid())?;
+            address
+                .parse::<std::net::Ipv4Addr>()
+                .map_err(|_| invalid())?;
             Ok(())
         }
     }

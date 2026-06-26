@@ -358,4 +358,3 @@ fn load_client_ca_store(path: &str) -> anyhow::Result<rustls::RootCertStore> {
     }
     Ok(root_store)
 }
-
