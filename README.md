@@ -20,11 +20,12 @@ Headless Check Point VPN client running inside a MikroTik container with a remot
 - **Management REST API** — full control over VPN lifecycle, configuration, routing
 - **Server-Sent Events** — real-time status updates pushed to all connected clients
 - **RouterOS Integration** — automated PBR setup via RouterOS REST API (mangle, routes, NAT, DNS protection)
+- **Split-tunnel** — only operator-nominated corporate subnets (the `vpn-corp` address list) egress through the VPN; all other traffic keeps its normal path
 - **Multi-user RBAC** — admin / operator / viewer roles with granular permissions
 - **GTK4 Tray Client** — libadwaita-based desktop app with profile editor, routing management, log viewer
 - **Cross-compilation** — ARM64, ARMv7, x86_64 targets for MikroTik hardware
 - **MFA Support** — challenge-response flow for multi-factor authentication
-- **Kill Switch** — firewall rules prevent traffic leaks if the tunnel drops
+- **Kill Switch** — firewall rules fail closed for corp traffic if the tunnel drops, without blocking normal internet
 
 ## Components
 
@@ -87,6 +88,43 @@ docker compose up -d
 ```
 
 The server will be available at `http://localhost:8080`. The default admin account is created from `SNX_EDGE_ADMIN_USER` / `SNX_EDGE_ADMIN_PASSWORD` on first start.
+
+### 5. Set up split-tunnel routing
+
+snx-edge runs in **split-tunnel** mode: only traffic destined for the corporate subnets you nominate is sent through the Check Point tunnel; everything else keeps its normal internet path. Once the server is running, configure routing on the router. Step 1 (`routing setup`) requires an `admin` token; adding corp subnets and LAN clients (steps 2–3) can be done with an `admin` or `operator` token:
+
+1. **Provision the PBR layout** — routing table, mangle marks, kill-switch, DNS dst-NAT, and bypasses. Run once:
+
+   ```bash
+   snx-edge-ctl routing setup
+   ```
+
+2. **Add the corporate destination subnets** that must egress through the tunnel. These populate the `vpn-corp` address list (config key `[routeros].address_list_corp`). There is **no `ctl routing corp` subcommand yet** — call the REST endpoint directly:
+
+   ```bash
+   # Obtain an access token
+   TOKEN=$(curl -fsS http://localhost:8080/api/v1/auth/login \
+     -H 'Content-Type: application/json' \
+     -d '{"username":"admin","password":"<password>"}' | jq -r .access_token)
+
+   # Add a corp subnet (IPv4 CIDR a.b.c.d/n or a bare IPv4 host)
+   curl -fsS -X POST http://localhost:8080/api/v1/routing/corp \
+     -H "Authorization: Bearer $TOKEN" \
+     -H 'Content-Type: application/json' \
+     -d '{"address":"10.20.0.0/16"}'
+   ```
+
+3. **Add the LAN client source addresses** whose traffic is eligible for policy-based routing (the `vpn-clients` list):
+
+   ```bash
+   snx-edge-ctl routing clients add 192.168.88.0/24
+   ```
+
+How it behaves:
+
+- **Corp-only egress** — only packets whose destination is in `vpn-corp` are marked and routed into the VPN; all other traffic is untouched.
+- **Kill switch fails closed** — while the tunnel is down, corp-destined traffic hits a blackhole route instead of leaking to the public internet; normal internet traffic is never blocked. The reconciler engages dynamic SNAT and the distance-1 default route only while the tunnel is up.
+- **Split-DNS** — RouterOS dst-NATs client DNS (`:53`) to an in-container forwarder (dnsmasq) that resolves corporate domains via the corp DNS servers learned from the tunnel and forwards everything else to the fallback upstream.
 
 ### Container runtime
 
@@ -154,7 +192,7 @@ All endpoints are prefixed with `/api/v1`. Authentication uses JWT Bearer tokens
 | **Auth** | `POST /auth/login`, `POST /auth/refresh` |
 | **Tunnel** | `POST /tunnel/connect`, `POST /tunnel/disconnect`, `GET /tunnel/status` |
 | **Profiles** | CRUD on `/profiles`, cert upload, import/export |
-| **Routing** | `/routing/clients`, `/routing/bypass`, `/routing/setup`, `/routing/diagnostics` |
+| **Routing** | `/routing/clients`, `/routing/corp`, `/routing/bypass`, `/routing/setup`, `/routing/status`, `/routing/diagnostics` |
 | **Users** | CRUD on `/users`, `/users/me`, `/users/sessions` |
 | **Events** | `GET /events` (SSE stream) |
 | **Logs** | `GET /logs` (SSE stream), `GET /logs/history` |
@@ -165,18 +203,18 @@ All endpoints are prefixed with `/api/v1`. Authentication uses JWT Bearer tokens
 | Role | Capabilities |
 |---|---|
 | **admin** | Full access: VPN, config, routing setup/teardown, user management |
-| **operator** | VPN connect/disconnect, routing client/bypass management, logs |
+| **operator** | VPN connect/disconnect, routing client/corp/bypass management, logs |
 | **viewer** | Read-only: status, config, routes, logs |
 
 ## RouterOS Integration
 
 snx-edge-server manages MikroTik routing rules via the RouterOS REST API:
 
-- **Address lists** — `vpn-clients` (hosts routed through VPN) and `vpn-bypass` (exceptions)
-- **Mangle rules** — mark connections and routes for policy-based routing
+- **Address lists** — `vpn-clients` (LAN client source addresses eligible for PBR), `vpn-corp` (corporate destination subnets routed through the VPN — split-tunnel), and `vpn-bypass` (destinations that never use the tunnel)
+- **Mangle rules** — mark connections and routes for policy-based routing, scoped to `vpn-corp` destinations
 - **Routing table** — dedicated `vpn-route` table with gateway pointing to the container
-- **Kill switch** — firewall rules to prevent traffic leaks
-- **DNS protection** — redirect DNS queries from VPN clients, block DoT
+- **Kill switch** — blackhole route fails corp traffic closed when the tunnel is down, without blocking normal internet
+- **DNS protection** — dst-NAT client DNS to the in-container split-DNS forwarder, block DoT
 
 All managed rules are tagged with `managed-by=snx-edge` comments for safe cleanup.
 

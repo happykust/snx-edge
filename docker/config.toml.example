@@ -43,7 +43,18 @@ user_env = "ROUTEROS_USER"
 password_env = "ROUTEROS_PASSWORD"
 tls_skip_verify = false
 comment_tag = "managed-by=snx-edge"
+# Address lists that drive the split-tunnel policy-based routing. snx-edge only
+# reads them; the operator populates them via the API / ctl after `routing setup`.
+#   address_list_vpn:    LAN/VPN client SOURCE addresses eligible for PBR.
+#   address_list_corp:   corporate DESTINATION subnets that must egress through
+#                        the Check Point tunnel. SPLIT-TUNNEL — only traffic to
+#                        these dst subnets is marked and routed into the VPN;
+#                        all other traffic keeps its normal internet path, and
+#                        the kill-switch fails *closed* for these subnets when
+#                        the tunnel is down. Populate via POST /api/v1/routing/corp.
+#   address_list_bypass: destinations that must NEVER use the tunnel.
 address_list_vpn = "vpn-clients"
+address_list_corp = "vpn-corp"
 address_list_bypass = "vpn-bypass"
 routing_table = "vpn-route"
 connection_mark = "vpn-conn"
