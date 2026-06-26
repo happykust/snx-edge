@@ -158,6 +158,25 @@ fn terminal_status_on_channel_close(disconnect_initiated: bool) -> Option<Connec
     }
 }
 
+/// Parse a single `/sys/class/net/*/statistics/*` counter value.
+///
+/// These files hold one unsigned decimal integer; anything unexpected
+/// (blank file, garbage, missing newline trimming) maps to 0 rather than
+/// erroring — the byte counters are advisory telemetry, not load-bearing.
+fn parse_stat(content: &str) -> u64 {
+    content.trim().parse().unwrap_or(0)
+}
+
+/// `(tx_bytes, rx_bytes)` for `iface` from /sys, 0 on any read/parse failure.
+fn read_iface_bytes(iface: &str) -> (u64, u64) {
+    let read = |f: &str| {
+        std::fs::read_to_string(format!("/sys/class/net/{iface}/statistics/{f}"))
+            .map(|s| parse_stat(&s))
+            .unwrap_or(0)
+    };
+    (read("tx_bytes"), read("rx_bytes"))
+}
+
 // === Tunnel Manager ===
 
 /// Manages VPN tunnel lifecycle using snxcore.
@@ -171,8 +190,6 @@ pub struct TunnelManager {
     /// `with_status_reset_on_err` helper below).
     status: Arc<std::sync::Mutex<ConnectionStatus>>,
     event_tx: broadcast::Sender<ServerEvent>,
-    tx_bytes: Arc<Mutex<u64>>,
-    rx_bytes: Arc<Mutex<u64>>,
     /// Server name from the last connect attempt (used by GET /server/info
     /// when the tunnel is disconnected).
     last_server: Arc<RwLock<Option<String>>>,
@@ -196,8 +213,6 @@ impl TunnelManager {
             session: Arc::new(Mutex::new(None)),
             status: Arc::new(std::sync::Mutex::new(ConnectionStatus::Disconnected)),
             event_tx,
-            tx_bytes: Arc::new(Mutex::new(0)),
-            rx_bytes: Arc::new(Mutex::new(0)),
             last_server: Arc::new(RwLock::new(None)),
             last_mtu: Arc::new(RwLock::new(default_mtu())),
             tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -211,18 +226,25 @@ impl TunnelManager {
 
     pub async fn status(&self) -> TunnelStatus {
         let connection = self.read_status();
-        let uptime_seconds = if let ConnectionStatus::Connected(ref info) = connection {
-            info.since
-                .map(|s| (Utc::now() - s).num_seconds().max(0) as u64)
-        } else {
-            None
+        let (uptime_seconds, tx_bytes, rx_bytes) = match &connection {
+            ConnectionStatus::Connected(info) => {
+                let uptime = info
+                    .since
+                    .map(|s| (Utc::now() - s).num_seconds().max(0) as u64);
+                let (tx, rx) = read_iface_bytes(&info.interface_name);
+                (uptime, tx, rx)
+            }
+            ConnectionStatus::Disconnected
+            | ConnectionStatus::Connecting
+            | ConnectionStatus::Mfa(_)
+            | ConnectionStatus::Error { .. } => (None, 0, 0),
         };
 
         TunnelStatus {
             connection,
             uptime_seconds,
-            tx_bytes: *self.tx_bytes.lock().await,
-            rx_bytes: *self.rx_bytes.lock().await,
+            tx_bytes,
+            rx_bytes,
         }
     }
 
@@ -301,9 +323,6 @@ impl TunnelManager {
         let (cmd_tx, cmd_rx) = mpsc::channel::<snxcore::tunnel::TunnelCommand>(16);
         // Event channel: tunnel sends events (connected, disconnected)
         let (evt_tx, mut evt_rx) = mpsc::channel::<TunnelEvent>(16);
-
-        *self.tx_bytes.lock().await = 0;
-        *self.rx_bytes.lock().await = 0;
 
         let tunnel = {
             let mut guard = self.connector.lock().await;
@@ -565,10 +584,18 @@ mod tests {
     //! a `Debug`-derived variant must NOT silently change our public API —
     //! that's exactly the bug an explicit `match` was added to prevent.
     use super::{
-        ConnectionStatus, TunnelManager, VpnConfig, terminal_status_on_channel_close,
+        ConnectionStatus, TunnelManager, VpnConfig, parse_stat, terminal_status_on_channel_close,
         transport_type_str, tunnel_type_str,
     };
     use snxcore::model::params::{TransportType, TunnelType};
+
+    #[test]
+    fn parse_stat_handles_value_blank_and_garbage() {
+        assert_eq!(parse_stat("12345\n"), 12345);
+        assert_eq!(parse_stat("  678 "), 678);
+        assert_eq!(parse_stat(""), 0);
+        assert_eq!(parse_stat("not-a-number"), 0);
+    }
 
     #[test]
     fn channel_close_yields_error_unless_user_disconnected() {
