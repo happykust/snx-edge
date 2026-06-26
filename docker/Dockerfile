@@ -77,7 +77,8 @@ RUN chown snxedge:snxedge /etc/snx-edge/config.toml.example
 EXPOSE 8080
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD curl -fsS http://localhost:8080/api/v1/health || exit 1
+    CMD curl -fsSk https://localhost:8080/api/v1/health \
+     || curl -fsS http://localhost:8080/api/v1/health || exit 1
 
 # PID 1 must be root for OpenRC; the server process itself runs as `snxedge`
 # via `command_user` in the init script.
