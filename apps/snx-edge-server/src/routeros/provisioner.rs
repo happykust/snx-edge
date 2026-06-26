@@ -74,7 +74,7 @@ impl<'a> Provisioner<'a> {
     /// returns a [`SetupReport`] describing how far it got.
     ///
     /// P0-9: if any step fails after earlier steps have already applied managed
-    /// objects, the partial layout is rolled back via [`teardown`](Self::teardown)
+    /// objects, the partial layout is rolled back via [`rollback`](Self::rollback)
     /// before returning — a half-applied PBR config (e.g. kill-switch without a
     /// default route) would blackhole the LAN with no auto-recovery. The
     /// returned [`SetupReport`] is unaffected by the rollback.
@@ -139,21 +139,26 @@ impl<'a> Provisioner<'a> {
         }
 
         // P0-9: never leave a half-applied PBR layout on the router. On any
-        // step failure, roll back the objects already created by tearing down
-        // everything carrying our managed tag. `teardown` matches purely on the
-        // tag, so it removes exactly the objects the steps above applied (each
-        // was tagged `;kind=`); it is safe even though setup stopped early.
-        // The rollback never mutates `report`, so the caller still sees how far
-        // setup got and which step failed.
+        // step failure, roll back ONLY the objects this run created, identified
+        // by `report.applied` (the `KIND_*` labels of the steps that succeeded).
+        // We deliberately do NOT call `teardown` here: `teardown` matches purely
+        // on the bare tag and would also delete operator-managed kinded
+        // address-list entries (`kind=vpn-client`, `kind=vpn-corp`, operator
+        // `kind=vpn-bypass`). Since `setup` is documented idempotent/re-runnable,
+        // a single transient RouterOS 5xx on a re-run would otherwise destroy all
+        // operator corp/client subnets (Task 1.2 regression). Operator kinds are
+        // never step labels, so they can never appear in `applied` and always
+        // survive. The rollback never mutates `report`, so the caller still sees
+        // how far setup got and which step failed.
         if report.failed.is_some() {
             tracing::warn!(
                 failed = ?report.failed,
                 "PBR setup failed mid-way; rolling back applied objects"
             );
-            if let Err(e) = self.teardown().await {
+            if let Err(e) = self.rollback(&report.applied).await {
                 tracing::error!(
                     error = %e,
-                    "rollback teardown failed; manual cleanup may be required"
+                    "rollback failed; manual cleanup may be required"
                 );
             }
         }
@@ -178,6 +183,69 @@ impl<'a> Provisioner<'a> {
 
         tracing::info!("PBR teardown completed: {total} rules removed");
         Ok(total)
+    }
+
+    /// Roll back **only** the managed objects this `setup` run created.
+    ///
+    /// Mirrors [`teardown`](Self::teardown)'s per-path structure and order
+    /// (dependents first) so a partially applied layout unwinds in the reverse
+    /// of how it was built. The crucial difference: `teardown` deletes anything
+    /// carrying the bare tag, whereas this deletes an object only when its
+    /// comment carries one of `applied_kinds` — the `KIND_*` step labels recorded
+    /// in [`SetupReport::applied`].
+    ///
+    /// This is what keeps operator-managed kinded address-list entries safe:
+    /// `kind=vpn-client` / `kind=vpn-corp` / operator `kind=vpn-bypass` are never
+    /// `setup` steps, so they can never appear in `applied` and are therefore
+    /// never rolled back. (`kind=rfc1918-bypass` IS a setup step, so rolling it
+    /// back when this run created it is correct.)
+    async fn rollback(&self, applied_kinds: &[&str]) -> Result<usize, AppError> {
+        let mut total = 0;
+
+        // Same order as `teardown`: remove dependent rules first.
+        for path in [
+            "/ip/firewall/filter",
+            "/ip/firewall/nat",
+            "/ip/firewall/mangle",
+            "/ip/route",
+            "/ip/firewall/address-list",
+            "/routing/table",
+        ] {
+            total += self.delete_applied(path, applied_kinds).await?;
+        }
+
+        tracing::info!("PBR rollback completed: {total} objects removed");
+        Ok(total)
+    }
+
+    /// Delete every object at `path` whose comment matches our tag **and** one
+    /// of `kinds`. The kinded-comment counterpart of
+    /// [`RouterOsClient::delete_managed`](crate::routeros::client::RouterOsClient::delete_managed),
+    /// which matches the tag alone.
+    async fn delete_applied(&self, path: &str, kinds: &[&str]) -> Result<usize, AppError> {
+        #[derive(serde::Deserialize)]
+        struct IdEntry {
+            #[serde(rename = ".id")]
+            id: String,
+            #[serde(default)]
+            comment: Option<String>,
+        }
+
+        let tag = &self.config.comment_tag;
+        let all: Vec<IdEntry> = self.client.list(path).await?;
+        let mut count = 0;
+        for entry in all {
+            let matches = entry
+                .comment
+                .as_deref()
+                .map(|c| kinds.iter().any(|k| comment_matches_kind(c, tag, k)))
+                .unwrap_or(false);
+            if matches {
+                self.client.delete(path, &entry.id).await?;
+                count += 1;
+            }
+        }
+        Ok(count)
     }
 
     /// Sweep for objects carrying the bare legacy `managed-by=...` comment
@@ -381,7 +449,8 @@ impl<'a> Provisioner<'a> {
     /// called by the reconciler when the tunnel comes up so corp traffic has a
     /// live next hop into the container alongside the always-present blackhole.
     pub async fn set_default_route_present(&self, gateway: &str) -> Result<(), AppError> {
-        self.ensure_vpn_route(gateway, &self.config.comment_tag).await
+        self.ensure_vpn_route(gateway, &self.config.comment_tag)
+            .await
     }
 
     /// Remove the managed distance-1 default route, leaving only the blackhole

@@ -84,9 +84,7 @@ async fn mount_accept_all_creates(server: &MockServer) {
     ] {
         Mock::given(method("PUT"))
             .and(path(p))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json::<Value>(json!({".id": "*1"})),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json::<Value>(json!({".id": "*1"})))
             .mount(server)
             .await;
     }
@@ -188,8 +186,14 @@ async fn setup_marks_only_corp_destinations_and_clamps_mss() {
         .iter()
         .find(|b| b["action"] == "change-mss")
         .expect("a change-mss mangle rule must be created (P0-8 MSS clamp)");
-    assert_eq!(mss["chain"], "forward", "mss clamp lives on forward, body={mss:?}");
-    assert_eq!(mss["tcp-flags"], "syn", "mss clamp only on SYN, body={mss:?}");
+    assert_eq!(
+        mss["chain"], "forward",
+        "mss clamp lives on forward, body={mss:?}"
+    );
+    assert_eq!(
+        mss["tcp-flags"], "syn",
+        "mss clamp only on SYN, body={mss:?}"
+    );
     assert_eq!(
         mss["new-mss"], "clamp-to-pmtu",
         "mss clamp must clamp to PMTU, body={mss:?}",
@@ -200,21 +204,24 @@ async fn setup_marks_only_corp_destinations_and_clamps_mss() {
     );
 }
 
-/// P0-9 regression: when an `ensure_*` step fails mid-setup, `setup` must roll
-/// back the objects it already applied (by calling `teardown`) so the router is
-/// never left with a half-applied PBR layout — e.g. a kill-switch blackhole
-/// without the default route alongside it, which would blackhole the whole LAN
-/// with no auto-recovery.
+/// P0-9 + Task 1.2 regression: when an `ensure_*` step fails mid-setup, `setup`
+/// must roll back ONLY the objects it applied *this run* (scoped to the `KIND_*`
+/// labels in `report.applied`) so the router is never left with a half-applied
+/// PBR layout — e.g. a kill-switch blackhole without the default route alongside
+/// it, which would blackhole the whole LAN with no auto-recovery — while leaving
+/// operator-managed kinded address-list entries (`kind=vpn-client`/`vpn-corp`)
+/// intact. The old tag-only `teardown()` rollback would have wiped those too,
+/// breaking corp access on a transient mid-setup 5xx during a re-run.
 ///
 /// The returned [`SetupReport`] is **unchanged** by the rollback: the caller
 /// still sees the step that failed and everything applied before it.
 ///
-/// Mocking notes: wiremock mocks are static, but `teardown` re-lists every
-/// path to discover what to delete. So the GETs on the two paths that received
-/// a successful create return EMPTY during setup (so the idempotency checks
-/// create the object) and then return the *applied* managed object on the
-/// rollback list, so `delete_managed` finds it and issues a DELETE. We stage
-/// this with `up_to_n_times` + a fallback, mirroring the legacy-migration test.
+/// Mocking notes: wiremock mocks are static, but `rollback` re-lists every path
+/// to discover what to delete. So the GETs on the two paths that received a
+/// successful create return EMPTY during setup (so the idempotency checks create
+/// the object) and then return the *applied* managed object on the rollback
+/// pass, so `delete_applied` finds it and issues a DELETE. We stage this with
+/// `up_to_n_times` + a fallback, mirroring the legacy-migration test.
 #[tokio::test]
 async fn provisioner_setup_rolls_back_on_partial_failure() {
     let server = MockServer::start().await;
@@ -259,7 +266,6 @@ async fn provisioner_setup_rolls_back_on_partial_failure() {
         "/rest/ip/firewall/filter",
         "/rest/ip/firewall/nat",
         "/rest/ip/route",
-        "/rest/ip/firewall/address-list",
     ] {
         Mock::given(method("GET"))
             .and(path(p))
@@ -267,6 +273,22 @@ async fn provisioner_setup_rolls_back_on_partial_failure() {
             .mount(&server)
             .await;
     }
+
+    // Task 1.2 regression guard: the address-list already holds OPERATOR-managed
+    // kinded entries (`kind=vpn-client`, `kind=vpn-corp`) before this re-run of
+    // `setup`. They are NOT setup steps, so their kinds can never appear in
+    // `report.applied`. The fixed rollback (scoped to applied kinds) must leave
+    // them untouched; the old tag-only `teardown()` rollback would have wiped
+    // them, breaking corp access on a transient mid-setup 5xx. This GET serves
+    // both the legacy sweep (kinded → not legacy → not swept) and the rollback.
+    Mock::given(method("GET"))
+        .and(path("/rest/ip/firewall/address-list"))
+        .respond_with(ResponseTemplate::new(200).set_body_json::<Value>(json!([
+            {".id": "*c11e47", "list": "vpn-clients", "address": "10.99.0.5", "comment": format!("{TAG};kind=vpn-client")},
+            {".id": "*c02b",   "list": "vpn-corp",    "address": "10.50.0.0/16", "comment": format!("{TAG};kind=vpn-corp")},
+        ])))
+        .mount(&server)
+        .await;
 
     // Step 1 (routing-table) PUT succeeds.
     Mock::given(method("PUT"))
@@ -341,10 +363,24 @@ async fn provisioner_setup_rolls_back_on_partial_failure() {
         deletes.iter().any(|u| u == "/rest/routing/table/*ab"),
         "rollback must DELETE the applied routing table, deletes={deletes:?}",
     );
+
+    // Task 1.2: operator-managed kinded address-list entries MUST survive the
+    // rollback — their kinds (`vpn-client`/`vpn-corp`) are never setup steps, so
+    // they never appear in `report.applied`. This is the regression that fails
+    // against the old tag-only `teardown()` rollback (which would delete both).
+    assert!(
+        !deletes.iter().any(|u| u.ends_with("/*c11e47")),
+        "operator vpn-client entry must NOT be deleted by rollback, deletes={deletes:?}",
+    );
+    assert!(
+        !deletes.iter().any(|u| u.ends_with("/*c02b")),
+        "operator vpn-corp entry must NOT be deleted by rollback, deletes={deletes:?}",
+    );
+
     assert_eq!(
         deletes.len(),
         2,
-        "rollback must delete exactly the applied managed objects (no leftover, no extras), deletes={deletes:?}",
+        "rollback must delete exactly the applied managed objects (no leftover, no extras, no operator entries), deletes={deletes:?}",
     );
 }
 
@@ -568,11 +604,10 @@ async fn provisioner_teardown_removes_only_managed() {
     assert_eq!(removed, 9, "expected 9 managed objects removed");
 
     // Verify only managed IDs were targeted by DELETE.
-    let managed_ids: std::collections::HashSet<&str> = [
-        "*1", "*3", "*4", "*6", "*7", "*9", "*10", "*11", "*13",
-    ]
-    .into_iter()
-    .collect();
+    let managed_ids: std::collections::HashSet<&str> =
+        ["*1", "*3", "*4", "*6", "*7", "*9", "*10", "*11", "*13"]
+            .into_iter()
+            .collect();
     let user_ids: std::collections::HashSet<&str> = ["*2", "*5", "*8", "*12"].into_iter().collect();
 
     let requests = server.received_requests().await.unwrap();

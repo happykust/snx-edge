@@ -97,7 +97,9 @@ fn is_valid_dns_name(domain: &str) -> bool {
     domain.split('.').all(|label| {
         !label.is_empty()
             && label.len() <= 63
-            && label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
             && !label.starts_with('-')
             && !label.ends_with('-')
     })
@@ -281,7 +283,14 @@ async fn apply(state: &AppState, action: Action) -> anyhow::Result<()> {
         Action::Disengage => {
             // Clear MASQUERADE for any prior tunnel iface, then drop the
             // default route so corp traffic fails closed against the blackhole.
-            net::cleanup_managed_iptables_rules()?;
+            // The route removal is the actual kill-switch and must not be
+            // skippable by an iptables failure: if `?`-propagated, an iptables
+            // error would abort `apply` before `clear_default_route`, leaving
+            // corp traffic routing to a tunnel-down container (fail-OPEN). So
+            // log and proceed rather than propagate.
+            if let Err(e) = net::cleanup_managed_iptables_rules() {
+                tracing::warn!(error = %e, "failed to clear VPN MASQUERADE; proceeding to remove default route");
+            }
             // Building accessor, not a cache peek: after `invalidate_routeros_client()`
             // (e.g. a config update) the cache is `None`, and peeking it would skip
             // the route clear while MASQUERADE was just removed — leaking corp
@@ -335,7 +344,9 @@ mod tests {
             Some(Action::Disengage)
         );
         assert_eq!(
-            decide(&ConnectionStatus::Error { message: "x".into() }),
+            decide(&ConnectionStatus::Error {
+                message: "x".into()
+            }),
             Some(Action::Disengage)
         );
     }
