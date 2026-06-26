@@ -754,6 +754,7 @@ mod tests {
                 comment_tag: String::new(),
                 address_list_vpn: String::new(),
                 address_list_bypass: String::new(),
+                address_list_corp: String::new(),
                 routing_table: String::new(),
                 connection_mark: String::new(),
                 routing_mark: String::new(),

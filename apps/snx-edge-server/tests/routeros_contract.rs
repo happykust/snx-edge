@@ -17,8 +17,8 @@ use snx_edge_server::config::RouterOsConfig;
 use snx_edge_server::routeros::client::RouterOsClient;
 use snx_edge_server::routeros::provisioner::{
     KIND_DEFAULT_ROUTE, KIND_DNS_DST_NAT, KIND_DOT_BLOCK, KIND_FASTTRACK_BYPASS, KIND_KILL_SWITCH,
-    KIND_MANGLE_CONN_MARK, KIND_MANGLE_ROUTING_MARK, KIND_RFC1918_BYPASS, KIND_ROUTING_TABLE,
-    Provisioner,
+    KIND_MANGLE_CONN_MARK, KIND_MANGLE_ROUTING_MARK, KIND_MSS_CLAMP, KIND_RFC1918_BYPASS,
+    KIND_ROUTING_TABLE, Provisioner,
 };
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -35,6 +35,7 @@ fn config() -> RouterOsConfig {
         comment_tag: TAG.into(),
         address_list_vpn: "vpn-clients".into(),
         address_list_bypass: "vpn-bypass".into(),
+        address_list_corp: "vpn-corp".into(),
         routing_table: "vpn-route".into(),
         connection_mark: "vpn-conn".into(),
         routing_mark: "vpn-route".into(),
@@ -110,8 +111,8 @@ async fn provisioner_setup_full_happy_path() {
     );
     assert_eq!(
         report.applied.len(),
-        9,
-        "expected 9 applied steps, got {:?}",
+        10,
+        "expected 10 applied steps, got {:?}",
         report.applied,
     );
     // Sanity: the kind labels appear in the canonical order.
@@ -121,6 +122,7 @@ async fn provisioner_setup_full_happy_path() {
             KIND_ROUTING_TABLE,
             KIND_MANGLE_CONN_MARK,
             KIND_MANGLE_ROUTING_MARK,
+            KIND_MSS_CLAMP,
             KIND_DEFAULT_ROUTE,
             KIND_KILL_SWITCH,
             KIND_DNS_DST_NAT,
@@ -128,6 +130,73 @@ async fn provisioner_setup_full_happy_path() {
             KIND_FASTTRACK_BYPASS,
             KIND_RFC1918_BYPASS,
         ],
+    );
+}
+
+/// Split-tunnel marking (Task 1.4 + P0-8): the connection-mark rule must
+/// match `src ∈ vpn-clients AND dst ∈ vpn-corp` (positive corp dst-list, no
+/// `!bypass`), and a `change-mss` SYN clamp must be installed on the `forward`
+/// chain for marked traffic so the ~1350-byte tunnel MTU does not blackhole
+/// PMTUD.
+#[tokio::test]
+async fn setup_marks_only_corp_destinations_and_clamps_mss() {
+    let server = MockServer::start().await;
+    mount_empty_lists(&server).await;
+    mount_accept_all_creates(&server).await;
+
+    let client = client_for(&server);
+    let cfg = config();
+    let prov = Provisioner::new(&client, &cfg);
+
+    let report = prov.setup(CONTAINER_IP).await;
+    assert!(
+        report.failed.is_none(),
+        "expected setup to succeed, got {:?}",
+        report.failed,
+    );
+
+    // Collect every PUT body sent to the mangle endpoint.
+    let requests = server
+        .received_requests()
+        .await
+        .expect("wiremock recording enabled");
+    let mangle_puts: Vec<Value> = requests
+        .iter()
+        .filter(|r| {
+            r.method.as_str().eq_ignore_ascii_case("PUT")
+                && r.url.path() == "/rest/ip/firewall/mangle"
+        })
+        .map(|r| serde_json::from_slice::<Value>(&r.body).expect("PUT body is JSON"))
+        .collect();
+
+    // (a) mark-connection matches src=vpn-clients AND dst=vpn-corp.
+    let conn_mark = mangle_puts
+        .iter()
+        .find(|b| b["action"] == "mark-connection")
+        .expect("a mark-connection mangle rule must be created");
+    assert_eq!(
+        conn_mark["src-address-list"], "vpn-clients",
+        "conn-mark must match VPN clients as source, body={conn_mark:?}",
+    );
+    assert_eq!(
+        conn_mark["dst-address-list"], "vpn-corp",
+        "split-tunnel: conn-mark must positively match corp dst-list, body={conn_mark:?}",
+    );
+
+    // (b) change-mss SYN clamp on the forward chain for marked traffic.
+    let mss = mangle_puts
+        .iter()
+        .find(|b| b["action"] == "change-mss")
+        .expect("a change-mss mangle rule must be created (P0-8 MSS clamp)");
+    assert_eq!(mss["chain"], "forward", "mss clamp lives on forward, body={mss:?}");
+    assert_eq!(mss["tcp-flags"], "syn", "mss clamp only on SYN, body={mss:?}");
+    assert_eq!(
+        mss["new-mss"], "clamp-to-pmtu",
+        "mss clamp must clamp to PMTU, body={mss:?}",
+    );
+    assert_eq!(
+        mss["connection-mark"], "vpn-conn",
+        "mss clamp only applies to marked corp traffic, body={mss:?}",
     );
 }
 
@@ -200,12 +269,13 @@ async fn provisioner_setup_idempotent_on_re_run() {
         .mount(&server)
         .await;
 
-    // Mangle list serves both ensure_* helpers; include both kinds.
+    // Mangle list serves all three ensure_* helpers; include every kind.
     Mock::given(method("GET"))
         .and(path("/rest/ip/firewall/mangle"))
         .respond_with(ResponseTemplate::new(200).set_body_json::<Value>(json!([
             {".id": "*1", "chain": "prerouting", "comment": format!("{TAG};kind={KIND_MANGLE_CONN_MARK}")},
             {".id": "*2", "chain": "prerouting", "comment": format!("{TAG};kind={KIND_MANGLE_ROUTING_MARK}")},
+            {".id": "*3", "chain": "forward", "action": "change-mss", "comment": format!("{TAG};kind={KIND_MSS_CLAMP}")},
         ])))
         .mount(&server)
         .await;
@@ -266,7 +336,7 @@ async fn provisioner_setup_idempotent_on_re_run() {
         "first run should be no-op, got {:?}",
         report1.failed
     );
-    assert_eq!(report1.applied.len(), 9);
+    assert_eq!(report1.applied.len(), 10);
 
     let report2 = prov.setup(CONTAINER_IP).await;
     assert!(
@@ -274,7 +344,7 @@ async fn provisioner_setup_idempotent_on_re_run() {
         "second run should be no-op, got {:?}",
         report2.failed
     );
-    assert_eq!(report2.applied.len(), 9);
+    assert_eq!(report2.applied.len(), 10);
 
     // Now look at the recorded requests: we should see GETs but zero PUTs.
     let requests = server

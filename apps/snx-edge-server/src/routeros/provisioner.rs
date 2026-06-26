@@ -17,6 +17,7 @@ pub const KIND_DNS_DST_NAT: &str = "dns-dst-nat";
 pub const KIND_DOT_BLOCK: &str = "dot-block";
 pub const KIND_FASTTRACK_BYPASS: &str = "fasttrack-bypass";
 pub const KIND_RFC1918_BYPASS: &str = "rfc1918-bypass";
+pub const KIND_MSS_CLAMP: &str = "mss-clamp";
 
 /// Build a structured comment of the form `<tag_prefix>;kind=<kind>`.
 fn comment_for_kind(tag_prefix: &str, kind: &str) -> String {
@@ -112,6 +113,7 @@ impl<'a> Provisioner<'a> {
             KIND_MANGLE_ROUTING_MARK,
             self.ensure_mangle_routing_mark(tag)
         );
+        step!(KIND_MSS_CLAMP, self.ensure_mss_clamp(tag));
         step!(KIND_DEFAULT_ROUTE, self.ensure_vpn_route(container_ip, tag));
         step!(KIND_KILL_SWITCH, self.ensure_killswitch(tag));
         step!(
@@ -405,15 +407,53 @@ impl<'a> Provisioner<'a> {
         }) {
             return Ok(());
         }
+        // Split-tunnel: mark only connections whose source is a VPN client
+        // *and* whose destination is in the operator-supplied corp address
+        // list. This is a positive match — unlike the old full-tunnel logic
+        // that marked everything except the RFC1918 bypass list — so only
+        // corp subnets are steered into the tunnel; all other traffic keeps
+        // its normal main-table route.
         let body = serde_json::json!({
             "chain": "prerouting",
             "src-address-list": self.config.address_list_vpn,
-            "dst-address-list": format!("!{}", self.config.address_list_bypass),
+            "dst-address-list": self.config.address_list_corp,
             "connection-state": "new",
             "action": "mark-connection",
             "new-connection-mark": self.config.connection_mark,
             "passthrough": "yes",
             "comment": comment_for_kind(tag, KIND_MANGLE_CONN_MARK),
+        });
+        let _: serde_json::Value = self.client.create("/ip/firewall/mangle", &body).await?;
+        Ok(())
+    }
+
+    /// Clamp the TCP MSS of marked (corp-bound) connections to the path MTU.
+    ///
+    /// P0-8: the Check Point tunnel MTU (~1350) is well below the LAN's 1500,
+    /// so without this clamp large packets toward corp hosts depend on PMTUD,
+    /// which routinely blackholes when ICMP "fragmentation needed" is filtered.
+    /// Rewriting the SYN MSS to `clamp-to-pmtu` makes both ends negotiate a
+    /// safe segment size up-front. Scoped to the VPN connection-mark so only
+    /// tunnelled corp traffic is touched.
+    async fn ensure_mss_clamp(&self, tag: &str) -> Result<(), AppError> {
+        let existing: Vec<MangleRule> = self.client.list_managed("/ip/firewall/mangle").await?;
+        if existing.iter().any(|m| {
+            m.comment
+                .as_deref()
+                .map(|c| comment_matches_kind(c, tag, KIND_MSS_CLAMP))
+                .unwrap_or(false)
+        }) {
+            return Ok(());
+        }
+        let body = serde_json::json!({
+            "chain": "forward",
+            "connection-mark": self.config.connection_mark,
+            "protocol": "tcp",
+            "tcp-flags": "syn",
+            "action": "change-mss",
+            "new-mss": "clamp-to-pmtu",
+            "passthrough": "yes",
+            "comment": comment_for_kind(tag, KIND_MSS_CLAMP),
         });
         let _: serde_json::Value = self.client.create("/ip/firewall/mangle", &body).await?;
         Ok(())
@@ -554,6 +594,11 @@ impl<'a> Provisioner<'a> {
     }
 
     async fn ensure_default_bypass(&self, tag: &str) -> Result<(), AppError> {
+        // Under split-tunnel the connection-mark rule now positively matches
+        // the corp dst-list, so this RFC1918 bypass list no longer influences
+        // which traffic is marked. It is kept as defensive belt-and-suspenders
+        // (e.g. operators may reference it elsewhere) but is effectively inert
+        // for marking purposes.
         let existing = self
             .client
             .list_address_list(&self.config.address_list_bypass)

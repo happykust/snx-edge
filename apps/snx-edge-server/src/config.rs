@@ -144,6 +144,8 @@ pub struct RouterOsConfig {
     pub address_list_vpn: String,
     #[serde(default = "default_address_list_bypass")]
     pub address_list_bypass: String,
+    #[serde(default = "default_address_list_corp")]
+    pub address_list_corp: String,
     #[serde(default = "default_routing_table")]
     pub routing_table: String,
     #[serde(default = "default_connection_mark")]
@@ -313,6 +315,12 @@ impl AppConfig {
         set_str(
             doc,
             "routeros",
+            "address_list_corp",
+            &self.routeros.address_list_corp,
+        );
+        set_str(
+            doc,
+            "routeros",
             "routing_table",
             &self.routeros.routing_table,
         );
@@ -450,6 +458,9 @@ fn default_address_list_vpn() -> String {
 }
 fn default_address_list_bypass() -> String {
     "vpn-bypass".to_string()
+}
+fn default_address_list_corp() -> String {
+    "vpn-corp".to_string()
 }
 fn default_routing_table() -> String {
     "vpn-route".to_string()
@@ -631,6 +642,7 @@ buffer_size = 100
                 comment_tag: "managed-by=snx-edge".to_string(),
                 address_list_vpn: "vpn-clients".to_string(),
                 address_list_bypass: "vpn-bypass".to_string(),
+                address_list_corp: "vpn-corp".to_string(),
                 routing_table: "vpn-route".to_string(),
                 connection_mark: "vpn-conn".to_string(),
                 routing_mark: "vpn-route".to_string(),
