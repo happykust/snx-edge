@@ -402,12 +402,13 @@ async fn provisioner_setup_idempotent_on_re_run() {
         .mount(&server)
         .await;
 
-    // Filter — DoT block + FastTrack.
+    // Filter — DoT block (tcp/853 + udp/853) + FastTrack.
     Mock::given(method("GET"))
         .and(path("/rest/ip/firewall/filter"))
         .respond_with(ResponseTemplate::new(200).set_body_json::<Value>(json!([
-            {".id": "*1", "chain": "forward", "action": "drop", "comment": format!("{TAG};kind={KIND_DOT_BLOCK}")},
-            {".id": "*2", "chain": "forward", "action": "fasttrack-connection", "comment": format!("{TAG};kind={KIND_FASTTRACK_BYPASS}")},
+            {".id": "*1", "chain": "forward", "action": "drop", "protocol": "tcp", "dst-port": "853", "comment": format!("{TAG};kind={KIND_DOT_BLOCK}")},
+            {".id": "*2", "chain": "forward", "action": "drop", "protocol": "udp", "dst-port": "853", "comment": format!("{TAG};kind={KIND_DOT_BLOCK}")},
+            {".id": "*3", "chain": "forward", "action": "fasttrack-connection", "comment": format!("{TAG};kind={KIND_FASTTRACK_BYPASS}")},
         ])))
         .mount(&server)
         .await;

@@ -584,24 +584,37 @@ impl<'a> Provisioner<'a> {
     }
 
     async fn ensure_dot_block(&self, tag: &str) -> Result<(), AppError> {
+        // Block DNS-over-TLS so VPN clients can't bypass the container's
+        // split-DNS forwarder over an encrypted channel. Drop both tcp/853
+        // (classic DoT) and udp/853 (DoT-over-QUIC / DoQ). RouterOS filter rules
+        // are single-protocol, so this is two rules — each checked-before-create
+        // by its DoT-block kind tag *and* protocol to stay idempotent.
+        //
+        // P2 (documented, intentionally NOT done here): full DoH on tcp/443
+        // cannot be dropped wholesale without breaking all HTTPS. Selectively
+        // dropping known public DoH resolver IPs is left as a future task.
         let existing: Vec<FilterRule> = self.client.list_managed("/ip/firewall/filter").await?;
-        if existing.iter().any(|r| {
-            r.comment
-                .as_deref()
-                .map(|c| comment_matches_kind(c, tag, KIND_DOT_BLOCK))
-                .unwrap_or(false)
-        }) {
-            return Ok(());
+        for proto in ["tcp", "udp"] {
+            let already = existing.iter().any(|r| {
+                r.comment
+                    .as_deref()
+                    .map(|c| comment_matches_kind(c, tag, KIND_DOT_BLOCK))
+                    .unwrap_or(false)
+                    && r.protocol.as_deref() == Some(proto)
+            });
+            if already {
+                continue;
+            }
+            let body = serde_json::json!({
+                "chain": "forward",
+                "src-address-list": self.config.address_list_vpn,
+                "dst-port": "853",
+                "protocol": proto,
+                "action": "drop",
+                "comment": comment_for_kind(tag, KIND_DOT_BLOCK),
+            });
+            let _: serde_json::Value = self.client.create("/ip/firewall/filter", &body).await?;
         }
-        let body = serde_json::json!({
-            "chain": "forward",
-            "src-address-list": self.config.address_list_vpn,
-            "dst-port": "853",
-            "protocol": "tcp",
-            "action": "drop",
-            "comment": comment_for_kind(tag, KIND_DOT_BLOCK),
-        });
-        let _: serde_json::Value = self.client.create("/ip/firewall/filter", &body).await?;
         Ok(())
     }
 

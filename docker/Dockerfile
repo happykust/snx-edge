@@ -19,10 +19,13 @@ RUN cargo build --release -p snx-edge-server
 # ---- Runtime ----
 FROM alpine:${ALPINE_VERSION}
 
-# curl is used for the HEALTHCHECK; libcap is required for setcap on the binary.
+# curl is used for the HEALTHCHECK; libcap is required for setcap on the binary;
+# dnsmasq is the in-container split-DNS forwarder (started by the init script).
+# busybox (Alpine base) already provides `kill`/`pidof` used to (re)load dnsmasq.
 RUN apk add --no-cache \
     ca-certificates \
     curl \
+    dnsmasq \
     iproute2 \
     iptables \
     ip6tables \
@@ -65,6 +68,11 @@ RUN setcap cap_net_admin,cap_net_raw=eip /usr/local/bin/snx-edge-server
 # Install OpenRC init script
 COPY docker/snx-edge.initd /etc/init.d/snx-edge
 RUN chmod +x /etc/init.d/snx-edge && rc-update add snx-edge default
+
+# Static base config for the in-container split-DNS forwarder. dnsmasq is NOT
+# added to a runlevel; the snx-edge init script starts it (so it comes up after
+# net and the runtime servers-file exists).
+COPY docker/dnsmasq.conf /etc/dnsmasq.conf
 
 # Create required directories owned by snxedge
 RUN mkdir -p /etc/snx-edge/profiles /var/lib/snx-edge /var/log/snx-edge && \

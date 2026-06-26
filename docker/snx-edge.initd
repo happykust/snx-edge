@@ -34,4 +34,17 @@ start_pre() {
     # Ensure required directories exist and are writable by the snxedge user.
     mkdir -p /var/log/snx-edge /etc/snx-edge/profiles /var/lib/snx-edge
     chown -R snxedge:snxedge /var/log/snx-edge /etc/snx-edge /var/lib/snx-edge
+
+    # Split-DNS: ensure the runtime servers-file dnsmasq reads exists and is
+    # writable by snxedge (the server rewrites it from the tunnel ConnectionInfo).
+    if [ ! -f /var/lib/snx-edge/corp-servers.conf ]; then
+        : > /var/lib/snx-edge/corp-servers.conf
+    fi
+    chown snxedge:snxedge /var/lib/snx-edge/corp-servers.conf
+
+    # Start the in-container DNS forwarder (target of RouterOS' :53 dst-nat).
+    # dnsmasq daemonizes itself; guard with pidof so restarts stay idempotent.
+    if ! pidof dnsmasq > /dev/null 2>&1; then
+        dnsmasq --conf-file=/etc/dnsmasq.conf
+    fi
 }
