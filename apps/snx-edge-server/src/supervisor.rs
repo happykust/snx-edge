@@ -56,6 +56,17 @@ pub fn decide(status: &ConnectionStatus, has_desired: bool) -> SupervisorAction 
     }
 }
 
+/// Cap on consecutive pre-MFA reconnect failures before the supervisor stops
+/// auto-retrying. With [`backoff_delay`] this is ~6 min of cumulative backoff
+/// (2+4+8+16+32+60·5) — after that a permanently-bad/unreachable profile is
+/// treated as durably broken and a manual reconnect is required to re-arm.
+const MAX_RECONNECT_ATTEMPTS: u32 = 10;
+
+/// True once consecutive pre-MFA reconnect failures reach the cap.
+fn should_give_up(consecutive_failures: u32) -> bool {
+    consecutive_failures >= MAX_RECONNECT_ATTEMPTS
+}
+
 /// Exponential backoff delay for the given (zero-based) attempt: 2, 4, 8, …
 /// seconds, capped at 60. Pure: no I/O, no clock.
 pub fn backoff_delay(attempt: u32) -> Duration {
@@ -117,6 +128,13 @@ async fn try_connect(state: &AppState, profile_id: &str) {
 /// the authoritative status and, if the tunnel dropped while a desired profile
 /// is set, re-initiate the connection with backoff.
 pub async fn run(state: AppState) {
+    // Subscribe before the boot block so a ConnectionStatus event emitted
+    // during boot (e.g. by the boot auto-connect landing at the MFA gate) is
+    // buffered rather than missed. Processing such a buffered event is a no-op:
+    // the loop re-reads the authoritative status (Mfa => Hold), so there is no
+    // double-connect.
+    let mut rx = state.event_tx.subscribe();
+
     // --- Boot ---
     {
         let auto_setup = state.config.read().await.routeros.auto_setup;
@@ -155,7 +173,6 @@ pub async fn run(state: AppState) {
     }
 
     // --- Steady state ---
-    let mut rx = state.event_tx.subscribe();
     loop {
         tokio::select! {
             _ = state.shutdown.cancelled() => break,
@@ -183,27 +200,45 @@ pub async fn run(state: AppState) {
 }
 
 /// Initiate a connect, retrying transient pre-MFA failures with backoff until
-/// the status reaches a hold state (Mfa/Connected/Connecting) or shutdown.
+/// the status reaches a hold state (Mfa/Connected/Connecting), shutdown, or the
+/// safeguard cap on consecutive failures.
 ///
 /// After each attempt the *authoritative* tunnel status decides the next step:
 /// `Hold` (incl. the MFA gate — we stop and wait for the human's OTP) or `Idle`
 /// ends the loop; only a terminal `Error`/`Disconnected` (→ `Reconnect`) sleeps
-/// for [`backoff_delay`] and tries again. Shutdown-aware at both the top of the
-/// loop and inside the sleep.
+/// for [`backoff_delay`] and tries again. To avoid a perpetual background retry
+/// against a permanently-bad/unreachable profile, consecutive `Reconnect`
+/// outcomes are counted and once they reach [`MAX_RECONNECT_ATTEMPTS`]
+/// ([`should_give_up`]) the loop gives up — reaching the MFA gate (or any other
+/// hold state) is a success and never increments the counter, so only failures
+/// *before* the MFA gate can trip the cap. Giving up leaves the persisted
+/// desired-state untouched so a later explicit connect can re-arm. Shutdown-aware
+/// at both the top of the loop and inside the sleep.
 async fn initiate_with_backoff(state: &AppState, profile_id: &str) {
-    let mut attempt = 0u32;
+    let mut failures = 0u32;
     loop {
         if state.shutdown.is_cancelled() {
             return;
         }
         try_connect(state, profile_id).await;
         // Status is authoritative after connect(): Mfa/Connected/Connecting
-        // => hold (Mfa holds for the operator's OTP).
+        // => hold (Mfa holds for the operator's OTP) and returns without ever
+        // touching `failures`.
         match decide(&state.tunnel.status().await.connection, true) {
             SupervisorAction::Hold | SupervisorAction::Idle => return,
             SupervisorAction::Reconnect => {
-                let d = backoff_delay(attempt);
-                attempt = attempt.saturating_add(1);
+                // Still terminal after a connect attempt → a genuine pre-MFA
+                // failure. Count it, and bail out once the cap is reached.
+                let d = backoff_delay(failures);
+                failures = failures.saturating_add(1);
+                if should_give_up(failures) {
+                    tracing::warn!(
+                        attempts = failures,
+                        profile_id = %profile_id,
+                        "supervisor: auto-reconnect suspended after repeated failures; manual reconnect required"
+                    );
+                    return;
+                }
                 tokio::select! {
                     _ = state.shutdown.cancelled() => return,
                     _ = tokio::time::sleep(d) => {}
@@ -273,6 +308,14 @@ mod tests {
             SupervisorAction::Hold
         );
         assert_eq!(decide(&mfa(), true), SupervisorAction::Hold);
+    }
+
+    #[test]
+    fn give_up_only_once_failures_reach_cap() {
+        assert!(!should_give_up(0));
+        assert!(!should_give_up(9));
+        assert!(should_give_up(10));
+        assert!(should_give_up(11));
     }
 
     #[test]

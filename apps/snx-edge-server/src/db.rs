@@ -439,7 +439,6 @@ impl UserDb {
 
     /// Persisted key/value app state (desired tunnel profile, auto-connect
     /// flag). Upserts on the primary key so repeated writes overwrite.
-    #[allow(dead_code)] // consumed by the WIP reconnect supervisor
     pub async fn set_app_state(&self, key: &str, value: &str) -> Result<(), AppError> {
         let conn = self.conn.lock().await;
         conn.execute(
@@ -452,7 +451,6 @@ impl UserDb {
 
     /// Read a persisted app-state value. Returns `Ok(None)` when the key is
     /// absent; genuine DB failures map to `AppError::Internal` via `From`.
-    #[allow(dead_code)] // consumed by the WIP reconnect supervisor
     pub async fn get_app_state(&self, key: &str) -> Result<Option<String>, AppError> {
         let conn = self.conn.lock().await;
         match conn.query_row(
@@ -470,7 +468,6 @@ impl UserDb {
     }
 
     /// Delete a persisted app-state key. A no-op if the key is absent.
-    #[allow(dead_code)] // consumed by the WIP reconnect supervisor
     pub async fn delete_app_state(&self, key: &str) -> Result<(), AppError> {
         let conn = self.conn.lock().await;
         conn.execute("DELETE FROM app_state WHERE key = ?1", params![key])?;
