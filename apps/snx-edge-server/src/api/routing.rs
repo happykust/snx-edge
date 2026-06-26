@@ -197,6 +197,105 @@ async fn remove_bypass(
     Ok(StatusCode::NO_CONTENT)
 }
 
+// === VPN Corp subnets (dst address-list for split-tunnel marking) ===
+
+/// Validate that `address` is an IPv4 corp subnet for the `vpn-corp`
+/// split-tunnel list: either CIDR `a.b.c.d/n` (`n` in `0..=32`) or a bare
+/// IPv4 host (RouterOS treats this as an implied `/32`).
+///
+/// This is intentionally stricter than [`validate_address`]: corp subnets are
+/// routed via the IPv4 PBR table, so IPv6 and ranges are rejected here. The
+/// bare-host leniency mirrors what `add_client`/`add_bypass` already accept.
+fn validate_corp_cidr(address: &str) -> Result<(), AppError> {
+    let invalid = || {
+        AppError::BadRequest(format!(
+            "invalid corp subnet: expected IPv4 CIDR (a.b.c.d/n, n in 0..=32) or host IPv4, got: {address}"
+        ))
+    };
+
+    match address.split_once('/') {
+        Some((ip_part, prefix_part)) => {
+            ip_part.parse::<std::net::Ipv4Addr>().map_err(|_| invalid())?;
+            let prefix: u8 = prefix_part.parse().map_err(|_| invalid())?;
+            if prefix > 32 {
+                return Err(invalid());
+            }
+            Ok(())
+        }
+        // Bare host IPv4 — implied /32 on RouterOS.
+        None => {
+            address.parse::<std::net::Ipv4Addr>().map_err(|_| invalid())?;
+            Ok(())
+        }
+    }
+}
+
+/// GET /api/v1/routing/corp
+async fn list_corp(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<Vec<AddressListEntry>>, AppError> {
+    if !has_permission(&claims, "routing.corp.read") && !has_permission(&claims, "routing.read") {
+        return Err(AppError::Forbidden("permission required".to_string()));
+    }
+
+    let client = state.routeros_client().await?;
+    let address_list_corp = {
+        let config = state.config.read().await;
+        config.routeros.address_list_corp.clone()
+    };
+    let entries = client.list_address_list(&address_list_corp).await?;
+    Ok(Json(entries))
+}
+
+/// POST /api/v1/routing/corp
+async fn add_corp(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    Json(req): Json<AddClientRequest>,
+) -> Result<(StatusCode, Json<AddressListEntry>), AppError> {
+    if !has_permission(&claims, "routing.corp.create") {
+        return Err(AppError::Forbidden("permission required".to_string()));
+    }
+
+    validate_corp_cidr(&req.address)?;
+
+    let client = state.routeros_client().await?;
+    let address_list_corp = {
+        let config = state.config.read().await;
+        config.routeros.address_list_corp.clone()
+    };
+    let entry = client
+        .add_address(
+            &address_list_corp,
+            &req.address,
+            "vpn-corp",
+            req.comment.as_deref(),
+            None,
+        )
+        .await?;
+
+    let _ = state.event_tx.send(ServerEvent::RoutingChanged);
+    Ok((StatusCode::CREATED, Json(entry)))
+}
+
+/// DELETE /api/v1/routing/corp/{id}
+async fn remove_corp(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, AppError> {
+    if !has_permission(&claims, "routing.corp.delete") {
+        return Err(AppError::Forbidden("permission required".to_string()));
+    }
+
+    let client = state.routeros_client().await?;
+    client.remove_address(&id).await?;
+
+    let _ = state.event_tx.send(ServerEvent::RoutingChanged);
+    Ok(StatusCode::NO_CONTENT)
+}
+
 // === PBR Setup / Teardown / Status / Diagnostics ===
 
 /// GET /api/v1/routing/status
@@ -409,6 +508,9 @@ pub fn routes() -> Router<AppState> {
         // VPN bypass address-list
         .route("/routing/bypass", get(list_bypass).post(add_bypass))
         .route("/routing/bypass/{id}", delete(remove_bypass))
+        // VPN corp subnets address-list (split-tunnel dst marking)
+        .route("/routing/corp", get(list_corp).post(add_corp))
+        .route("/routing/corp/{id}", delete(remove_corp))
         // PBR management
         .route("/routing/status", get(routing_status))
         .route("/routing/setup", post(setup_pbr).delete(teardown_pbr))
@@ -417,7 +519,7 @@ pub fn routes() -> Router<AppState> {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_address;
+    use super::{validate_address, validate_corp_cidr};
     use proptest::prelude::*;
 
     proptest! {
@@ -446,5 +548,33 @@ mod tests {
         assert!(validate_address("not an address").is_err());
         assert!(validate_address("10.0.0.0/64").is_err()); // prefix > 32 for v4
         assert!(validate_address("").is_err());
+    }
+
+    #[test]
+    fn validate_corp_cidr_accepts_ipv4_cidr_and_bare_host() {
+        assert!(validate_corp_cidr("10.20.0.0/16").is_ok());
+        assert!(validate_corp_cidr("0.0.0.0/0").is_ok());
+        assert!(validate_corp_cidr("192.168.1.0/24").is_ok());
+        // Bare IPv4 host is accepted (implied /32), mirroring add_client/bypass.
+        assert!(validate_corp_cidr("192.168.1.1").is_ok());
+    }
+
+    #[test]
+    fn validate_corp_cidr_rejects_non_ipv4_and_garbage() {
+        assert!(validate_corp_cidr("not-a-cidr").is_err());
+        assert!(validate_corp_cidr("").is_err());
+        assert!(validate_corp_cidr("10.0.0.0/33").is_err()); // prefix > 32
+        assert!(validate_corp_cidr("10.0.0.0/abc").is_err()); // bad prefix
+        assert!(validate_corp_cidr("fd00::/64").is_err()); // IPv6 rejected
+        assert!(validate_corp_cidr("10.0.0.1-10.0.0.5").is_err()); // ranges rejected
+    }
+
+    proptest! {
+        /// `validate_corp_cidr` is a pure parser on user input; it must return
+        /// `Ok`/`Err` for any string but never panic.
+        #[test]
+        fn validate_corp_cidr_does_not_panic(s in ".*") {
+            let _ = validate_corp_cidr(&s);
+        }
     }
 }

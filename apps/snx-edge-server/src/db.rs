@@ -679,6 +679,7 @@ impl UserDb {
                 "profiles.read",
                 "routing.clients.*",
                 "routing.bypass.*",
+                "routing.corp.*",
                 "routing.diagnostics",
                 "logs.*",
             ],

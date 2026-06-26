@@ -1025,6 +1025,142 @@ async fn profile_encryption_create_get_round_trip_and_legacy_compat() {
     );
 }
 
+// === Task 1.6: corp subnets (vpn-corp) for split-tunnel marking ===
+
+/// `POST /api/v1/routing/corp` must validate the CIDR *before* touching
+/// RouterOS. A malformed address is rejected with 400 with no network call,
+/// while a well-formed IPv4 CIDR passes validation and then fails at the
+/// (unreachable, in tests) RouterOS layer — i.e. anything but a 400.
+#[tokio::test]
+async fn corp_subnet_add_validates_cidr() {
+    let (app, token, _dir) = setup().await;
+
+    // Invalid CIDR → 400 BadRequest, short-circuited before RouterOS.
+    let resp = app
+        .clone()
+        .oneshot(auth_post(
+            "/api/v1/routing/corp",
+            &token,
+            json!({"address": "not-a-cidr"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // Valid IPv4 CIDR → passes validation; RouterOS is unreachable in tests
+    // (config points at 127.0.0.1, no REST server) so the handler reaches the
+    // RouterOS layer and returns a 5xx (502 Bad Gateway) — crucially NOT 400.
+    let resp = app
+        .oneshot(auth_post(
+            "/api/v1/routing/corp",
+            &token,
+            json!({"address": "10.20.0.0/16"}),
+        ))
+        .await
+        .unwrap();
+    assert_ne!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "valid CIDR must pass validation and reach the RouterOS layer"
+    );
+    assert!(
+        resp.status().is_server_error(),
+        "valid CIDR should fail at the unreachable RouterOS layer, got {}",
+        resp.status()
+    );
+}
+
+/// RBAC: the `operator` role must be able to manage corp subnets (split-tunnel
+/// intent). Operator holds `routing.corp.*` but NOT `routing.read`, so a `GET
+/// /api/v1/routing/corp` must pass the permission gate and reach the
+/// (unreachable, in tests) RouterOS layer — i.e. anything but 403 FORBIDDEN.
+/// For symmetry, a `viewer` (no `routing.corp.create`) must be 403 on create.
+#[tokio::test]
+async fn corp_subnet_rbac_operator_authorized() {
+    let (app, token, _dir) = setup().await;
+
+    // Create operator
+    app.clone()
+        .oneshot(auth_post(
+            "/api/v1/users",
+            &token,
+            json!({"username": "op_corp", "password": "operator123", "role": "operator"}),
+        ))
+        .await
+        .unwrap();
+
+    // Login as operator
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/login")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"username": "op_corp", "password": "operator123"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = resp_json(resp).await;
+    let operator_token = body["access_token"].as_str().unwrap();
+
+    // Operator can list corp subnets: the request passes RBAC and reaches the
+    // RouterOS layer (unreachable in tests → 5xx). Crucially NOT 403.
+    let resp = app
+        .clone()
+        .oneshot(auth_get("/api/v1/routing/corp", operator_token))
+        .await
+        .unwrap();
+    assert_ne!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "operator must be authorized to list corp subnets, got {}",
+        resp.status()
+    );
+
+    // Symmetry: a viewer lacks `routing.corp.create` → 403 on create.
+    app.clone()
+        .oneshot(auth_post(
+            "/api/v1/users",
+            &token,
+            json!({"username": "viewer_corp", "password": "viewer12345", "role": "viewer"}),
+        ))
+        .await
+        .unwrap();
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/login")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"username": "viewer_corp", "password": "viewer12345"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = resp_json(resp).await;
+    let viewer_token = body["access_token"].as_str().unwrap();
+    let resp = app
+        .oneshot(auth_post(
+            "/api/v1/routing/corp",
+            viewer_token,
+            json!({"address": "10.20.0.0/16"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "viewer must be forbidden from creating corp subnets"
+    );
+}
+
 // === Task 5.5: bcrypt transparent rehash ===
 
 /// Plant a user with a cost-10 bcrypt hash directly in the DB, log in via
