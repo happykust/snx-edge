@@ -32,6 +32,15 @@ async fn connect(
         ));
     }
 
+    // Record the operator intent the supervisor reads (`KEY_DESIRED` /
+    // `KEY_AUTO_CONNECT` in supervisor.rs) BEFORE dialing the tunnel, so an
+    // unexpected drop mid-connect still leaves the supervisor able to reconnect.
+    state
+        .db
+        .set_app_state("desired_profile_id", &req.profile_id)
+        .await?;
+    state.db.set_app_state("auto_connect", "true").await?;
+
     state
         .tunnel
         .connect(&vpn_config)
@@ -51,6 +60,12 @@ async fn disconnect(
             "permission 'tunnel.disconnect' required".to_string(),
         ));
     }
+
+    // Clear the desired intent BEFORE tearing the tunnel down: a deliberate
+    // user disconnect must stop the supervisor from auto-reconnecting (an
+    // unexpected drop leaves these keys set so it does reconnect).
+    state.db.delete_app_state("desired_profile_id").await?;
+    state.db.delete_app_state("auto_connect").await?;
 
     state
         .tunnel

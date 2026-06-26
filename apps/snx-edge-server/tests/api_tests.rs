@@ -6,6 +6,20 @@ use tower::ServiceExt;
 /// Helper to build the test app and get an admin JWT token.
 /// Returns (router, token, _tempdir_guard) — keep the guard alive to prevent cleanup.
 async fn setup() -> (axum::Router, String, tempfile::TempDir) {
+    let (app, _state, token, dir) = setup_with_state().await;
+    (app, token, dir)
+}
+
+/// Like [`setup`] but also returns the live [`AppState`] so a test can assert
+/// directly against `state.db` (e.g. persisted app-state keys). The router is
+/// built from a clone, so the returned state and the running app share the same
+/// SQLite-backed [`UserDb`].
+async fn setup_with_state() -> (
+    axum::Router,
+    snx_edge_server::state::AppState,
+    String,
+    tempfile::TempDir,
+) {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("test.db");
     let config_path = dir.path().join("config.toml");
@@ -61,7 +75,7 @@ buffer_size = 100
     )
     .await
     .unwrap();
-    let app = snx_edge_server::api::router(state);
+    let app = snx_edge_server::api::router(state.clone());
 
     // Login to get admin token
     let login_resp = app
@@ -85,7 +99,7 @@ buffer_size = 100
     let token_resp: Value = serde_json::from_slice(&body).unwrap();
     let token = token_resp["access_token"].as_str().unwrap().to_string();
 
-    (app, token, dir)
+    (app, state, token, dir)
 }
 
 fn auth_get(uri: &str, token: &str) -> Request<Body> {
@@ -519,6 +533,99 @@ async fn test_connect_with_profile() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     let body = resp_json(resp).await;
     assert!(body["detail"].as_str().unwrap().contains("error"));
+}
+
+/// `POST /tunnel/connect` records the desired-state keys the supervisor reads
+/// (`desired_profile_id` + `auto_connect`) *before* it dials the tunnel, so the
+/// intent persists even though the connect itself fails here (no real gateway).
+/// `POST /tunnel/disconnect` then clears both keys — a deliberate user
+/// disconnect must stop the supervisor from reconnecting.
+#[tokio::test]
+async fn connect_records_desired_then_disconnect_clears() {
+    let (app, state, token, _dir) = setup_with_state().await;
+
+    // Create a profile to target.
+    let resp = app
+        .clone()
+        .oneshot(auth_post(
+            "/api/v1/profiles",
+            &token,
+            json!({
+                "name": "Desired VPN",
+                "config": {
+                    "server": "vpn.test.com",
+                    "login_type": "password",
+                    "username": "user1",
+                    "password": "pass123"
+                }
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let profile = resp_json(resp).await;
+    let profile_id = profile["id"].as_str().unwrap().to_string();
+
+    // Precondition: no desired state persisted yet.
+    assert_eq!(
+        state.db.get_app_state("desired_profile_id").await.unwrap(),
+        None
+    );
+    assert_eq!(state.db.get_app_state("auto_connect").await.unwrap(), None);
+
+    // Connect: fails at the tunnel layer (no real VPN server → 400), but the
+    // desired-state write happens BEFORE tunnel.connect, so it must persist.
+    let resp = app
+        .clone()
+        .oneshot(auth_post(
+            "/api/v1/tunnel/connect",
+            &token,
+            json!({"profile_id": profile_id}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    assert_eq!(
+        state
+            .db
+            .get_app_state("desired_profile_id")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(profile_id.as_str()),
+        "connect must record the desired profile id"
+    );
+    assert_eq!(
+        state
+            .db
+            .get_app_state("auto_connect")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("true"),
+        "connect must opt into auto-connect"
+    );
+
+    // Disconnect: status is `Error` after the failed connect (not
+    // `Disconnected`), so the tunnel teardown succeeds (200) and the handler
+    // clears both keys first.
+    let resp = app
+        .oneshot(auth_post("/api/v1/tunnel/disconnect", &token, json!({})))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    assert_eq!(
+        state.db.get_app_state("desired_profile_id").await.unwrap(),
+        None,
+        "disconnect must clear the desired profile id"
+    );
+    assert_eq!(
+        state.db.get_app_state("auto_connect").await.unwrap(),
+        None,
+        "disconnect must clear the auto-connect flag"
+    );
 }
 
 // === SSE wire-format tests ===
