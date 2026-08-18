@@ -224,6 +224,11 @@ enum RoutingAction {
         #[command(subcommand)]
         action: Option<ClientAction>,
     },
+    /// Manage corporate destination subnets routed through the VPN (split-tunnel)
+    Corp {
+        #[command(subcommand)]
+        action: Option<CorpAction>,
+    },
     /// Manage bypass addresses
     Bypass {
         #[command(subcommand)]
@@ -248,6 +253,23 @@ enum ClientAction {
         comment: Option<String>,
     },
     /// Remove a client by RouterOS ID
+    Remove {
+        /// RouterOS entry ID
+        id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum CorpAction {
+    /// Add a corporate destination subnet
+    Add {
+        /// IPv4 CIDR (a.b.c.d/n) or a bare IPv4 host
+        address: String,
+        /// Comment
+        #[arg(long)]
+        comment: Option<String>,
+    },
+    /// Remove a corp subnet by RouterOS ID
     Remove {
         /// RouterOS entry ID
         id: String,
@@ -797,6 +819,20 @@ async fn cmd_routing(cli: &Cli, mode: OutputMode, action: &RoutingAction) -> any
                 output::print_ok(mode, &format!("Client {} removed.", id));
             }
         },
+        RoutingAction::Corp { action } => match action {
+            None => {
+                let entries = client.list_corp().await?;
+                output::print_list(mode, &entries);
+            }
+            Some(CorpAction::Add { address, comment }) => {
+                let entry = client.add_corp(address, comment.as_deref()).await?;
+                output::print_item(mode, &entry);
+            }
+            Some(CorpAction::Remove { id }) => {
+                client.remove_corp(id).await?;
+                output::print_ok(mode, &format!("Corp subnet {} removed.", id));
+            }
+        },
         RoutingAction::Bypass { action } => match action {
             None => {
                 let entries = client.list_bypass().await?;
@@ -1075,6 +1111,55 @@ mod tests {
                 action: RoutingAction::Diagnostics
             }
         ));
+    }
+
+    #[test]
+    fn test_parse_routing_corp_subcommands() {
+        let cli = Cli::try_parse_from(["snx-edge-ctl", "routing", "corp"]).unwrap();
+        match cli.command {
+            Commands::Routing {
+                action: RoutingAction::Corp { action },
+            } => {
+                assert!(action.is_none());
+            }
+            _ => panic!("expected Routing Corp command"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "snx-edge-ctl",
+            "routing",
+            "corp",
+            "add",
+            "10.20.0.0/16",
+            "--comment",
+            "hq",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Routing {
+                action:
+                    RoutingAction::Corp {
+                        action: Some(CorpAction::Add { address, comment }),
+                    },
+            } => {
+                assert_eq!(address, "10.20.0.0/16");
+                assert_eq!(comment.as_deref(), Some("hq"));
+            }
+            _ => panic!("expected Routing Corp Add command"),
+        }
+
+        let cli = Cli::try_parse_from(["snx-edge-ctl", "routing", "corp", "remove", "*1"]).unwrap();
+        match cli.command {
+            Commands::Routing {
+                action:
+                    RoutingAction::Corp {
+                        action: Some(CorpAction::Remove { id }),
+                    },
+            } => {
+                assert_eq!(id, "*1");
+            }
+            _ => panic!("expected Routing Corp Remove command"),
+        }
     }
 
     #[test]

@@ -423,6 +423,71 @@ impl ApiClient {
         Ok(())
     }
 
+    /// Corporate destination subnets (`vpn-corp`). Only traffic whose
+    /// destination is on this list is marked into the tunnel, so this is the
+    /// list that decides what "corp" means for split-tunnel routing.
+    pub async fn list_corp(&self) -> anyhow::Result<Vec<AddressListEntry>> {
+        let resp = self
+            .auth_builder(reqwest::Method::GET, "/api/v1/routing/corp")
+            .send()
+            .await
+            .context("Failed to list corp subnets")?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("List corp subnets failed: HTTP {} - {}", status, body);
+        }
+        resp.json()
+            .await
+            .context("Failed to parse corp subnets response")
+    }
+
+    pub async fn add_corp(
+        &self,
+        address: &str,
+        comment: Option<&str>,
+    ) -> anyhow::Result<AddressListEntry> {
+        let mut body = serde_json::json!({ "address": address });
+        if let Some(c) = comment {
+            body["comment"] = serde_json::json!(c);
+        }
+
+        let resp = self
+            .auth_builder(reqwest::Method::POST, "/api/v1/routing/corp")
+            .json(&body)
+            .send()
+            .await
+            .context("Failed to add corp subnet")?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("Add corp subnet failed: HTTP {} - {}", status, body);
+        }
+        resp.json()
+            .await
+            .context("Failed to parse add corp subnet response")
+    }
+
+    pub async fn remove_corp(&self, id: &str) -> anyhow::Result<()> {
+        let resp = self
+            .auth_builder(
+                reqwest::Method::DELETE,
+                &format!("/api/v1/routing/corp/{}", id),
+            )
+            .send()
+            .await
+            .context("Failed to remove corp subnet")?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("Remove corp subnet failed: HTTP {} - {}", status, body);
+        }
+        Ok(())
+    }
+
     pub async fn list_bypass(&self) -> anyhow::Result<Vec<AddressListEntry>> {
         let resp = self
             .auth_builder(reqwest::Method::GET, "/api/v1/routing/bypass")

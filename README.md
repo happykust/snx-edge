@@ -99,19 +99,12 @@ snx-edge runs in **split-tunnel** mode: only traffic destined for the corporate 
    snx-edge-ctl routing setup
    ```
 
-2. **Add the corporate destination subnets** that must egress through the tunnel. These populate the `vpn-corp` address list (config key `[routeros].address_list_corp`). There is **no `ctl routing corp` subcommand yet** — call the REST endpoint directly:
+2. **Add the corporate destination subnets** that must egress through the tunnel. These populate the `vpn-corp` address list (config key `[routeros].address_list_corp`). Accepts an IPv4 CIDR (`a.b.c.d/n`) or a bare IPv4 host:
 
    ```bash
-   # Obtain an access token
-   TOKEN=$(curl -fsS http://localhost:8080/api/v1/auth/login \
-     -H 'Content-Type: application/json' \
-     -d '{"username":"admin","password":"<password>"}' | jq -r .access_token)
-
-   # Add a corp subnet (IPv4 CIDR a.b.c.d/n or a bare IPv4 host)
-   curl -fsS -X POST http://localhost:8080/api/v1/routing/corp \
-     -H "Authorization: Bearer $TOKEN" \
-     -H 'Content-Type: application/json' \
-     -d '{"address":"10.20.0.0/16"}'
+   snx-edge-ctl routing corp add 10.20.0.0/16 --comment "HQ"
+   snx-edge-ctl routing corp            # list what is currently routed
+   snx-edge-ctl routing corp remove '*1F'
    ```
 
 3. **Add the LAN client source addresses** whose traffic is eligible for policy-based routing (the `vpn-clients` list):

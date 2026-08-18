@@ -11,7 +11,7 @@
 
 use assert_cmd::Command;
 use predicates::prelude::*;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{body_partial_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[test]
@@ -174,6 +174,62 @@ async fn connect_exits_nonzero_on_mfa_in_quiet_mode() {
             .assert()
             .failure()
             .stderr(predicate::str::contains("MFA"));
+    })
+    .await
+    .unwrap();
+}
+
+/// `routing corp add` MUST hit `POST /api/v1/routing/corp` with the address in
+/// the body. Before this subcommand existed, the README told operators to
+/// reach for `curl` to populate `vpn-corp` — the one list that decides what
+/// "corp" means for split-tunnel marking.
+#[tokio::test]
+async fn routing_corp_add_posts_to_corp_endpoint() {
+    let server = MockServer::start().await;
+
+    let created = serde_json::json!({
+        ".id": "*1F",
+        "list": "vpn-corp",
+        "address": "10.20.0.0/16",
+        "comment": "hq"
+    });
+
+    Mock::given(method("POST"))
+        .and(path("/api/v1/routing/corp"))
+        .and(body_partial_json(serde_json::json!({
+            "address": "10.20.0.0/16",
+            "comment": "hq"
+        })))
+        .respond_with(ResponseTemplate::new(201).set_body_json(&created))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let uri = server.uri();
+    let home = tempfile::tempdir().unwrap();
+    let home_path = home.path().to_path_buf();
+
+    tokio::task::spawn_blocking(move || {
+        Command::cargo_bin("snx-edge-ctl")
+            .unwrap()
+            .env("HOME", &home_path)
+            .env("XDG_CONFIG_HOME", home_path.join(".config"))
+            .args([
+                "--server",
+                &uri,
+                "--token",
+                "test-token",
+                "--json",
+                "routing",
+                "corp",
+                "add",
+                "10.20.0.0/16",
+                "--comment",
+                "hq",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("10.20.0.0/16"));
     })
     .await
     .unwrap();
