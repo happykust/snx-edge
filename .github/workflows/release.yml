@@ -19,6 +19,8 @@ jobs:
             arch: amd64
           - target: aarch64-unknown-linux-musl
             arch: arm64
+          - target: armv7-unknown-linux-musleabihf
+            arch: armv7
 
     steps:
       - uses: actions/checkout@v4
@@ -83,6 +85,8 @@ jobs:
             platform: linux/amd64
           - arch: arm64
             platform: linux/arm64
+          - arch: armv7
+            platform: linux/arm/v7
 
     steps:
       - uses: actions/checkout@v4
@@ -185,6 +189,8 @@ jobs:
     needs: docker
     permissions:
       packages: write
+      # Required for cosign keyless signing of the manifest list.
+      id-token: write
 
     steps:
       - name: Login to GHCR
@@ -213,7 +219,23 @@ jobs:
             -t "${REGISTRY}/${IMAGE_NAME}:${VERSION}" \
             -t "${REGISTRY}/${IMAGE_NAME}:latest" \
             "${REGISTRY}/${IMAGE_NAME}:${VERSION}-amd64" \
-            "${REGISTRY}/${IMAGE_NAME}:${VERSION}-arm64"
+            "${REGISTRY}/${IMAGE_NAME}:${VERSION}-arm64" \
+            "${REGISTRY}/${IMAGE_NAME}:${VERSION}-armv7"
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign the manifest list (keyless via OIDC)
+        # Per-arch images are signed in the `docker` job, but the manifest list
+        # itself was not: anyone pulling `:latest` got an unsigned index.
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          REGISTRY: ${{ env.REGISTRY }}
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+        run: |
+          DIGEST=$(docker buildx imagetools inspect \
+            "${REGISTRY}/${IMAGE_NAME}:${VERSION}" --format '{{.Manifest.Digest}}')
+          cosign sign --yes "${REGISTRY}/${IMAGE_NAME}@${DIGEST}"
 
   release:
     name: Create GitHub Release

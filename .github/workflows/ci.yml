@@ -112,6 +112,8 @@ jobs:
             arch: amd64
           - target: aarch64-unknown-linux-musl
             arch: arm64
+          - target: armv7-unknown-linux-musleabihf
+            arch: armv7
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -166,5 +168,5 @@ jobs:
           echo "<!-- placeholder for PR build only -->" > THIRD-PARTY-LICENSES.html
           docker buildx build \
             -f docker/Dockerfile.release \
-            --platform linux/amd64,linux/arm64 \
+            --platform linux/amd64,linux/arm64,linux/arm/v7 \
             .
