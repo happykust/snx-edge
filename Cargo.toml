@@ -56,15 +56,19 @@ ksni = "0.3"
 reqwest-eventsource = "0.6"
 keyring = { version = "3", features = ["sync-secret-service"] }
 
-# TLS / mTLS
-axum-server = { version = "0.7", features = ["tls-rustls"] }
-rustls = "0.23"
+# TLS / mTLS.
+#
+# `ring` is selected explicitly on every rustls-facing crate: rustls refuses to
+# choose when several providers are compiled in, and `aws-lc-rs` needs a C
+# toolchain per target, which is exactly what breaks armv7-musl cross builds.
+axum-server = { version = "0.7", default-features = false, features = ["tls-rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 # Pinned to >=0.103.13 to address RUSTSEC-2026-0098/0099/0104 (name constraint
 # bypass and reachable panic in CRL parsing). Forced via direct workspace dep
 # because the transitive `rustls 0.23` did not pull a fixed version.
-rustls-webpki = "0.103.13"
+rustls-webpki = { version = "0.103.13", default-features = false, features = ["ring", "std"] }
 rustls-pemfile = "2"
-tokio-rustls = "0.26"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 
 # Secrets
 secrecy = "0.10"
