@@ -111,6 +111,20 @@ impl AppState {
         // Prove the key opens what is already stored before serving traffic.
         db.verify_profile_encryption().await?;
 
+        // Not a hard failure: RouterOS ships a self-signed certificate, so
+        // skipping verification on the LAN hop to the router is a normal
+        // (if imperfect) setup. It must still be visible in the log rather
+        // than an unnoticed default, since it exposes the RouterOS admin
+        // credentials to anyone able to intercept that hop.
+        if config.routeros.tls_skip_verify {
+            tracing::warn!(
+                "routeros.tls_skip_verify is enabled — the RouterOS REST connection accepts \
+                 any certificate, so RouterOS admin credentials are exposed to an attacker \
+                 who can intercept traffic to the router. Install a trusted certificate on \
+                 RouterOS and disable this once the router presents a verifiable cert."
+            );
+        }
+
         // Initialize admin user from env if database is empty
         db.ensure_admin_exists().await?;
 
