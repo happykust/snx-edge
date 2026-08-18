@@ -5,12 +5,26 @@ use reqwest::{Client, StatusCode};
 use serde_json::Value;
 use tokio::sync::RwLock;
 
+/// Invoked with a freshly rotated refresh token so the owner (`AuthManager`)
+/// can persist it. The server rotates refresh tokens on every exchange, so a
+/// rotation that is not written back to the keyring would break the next cold
+/// start.
+pub type RefreshHook = Arc<dyn Fn(String) + Send + Sync>;
+
 #[derive(Clone)]
 #[allow(dead_code)]
 pub struct ApiClient {
     client: Client,
     base_url: Arc<RwLock<String>>,
     token: Arc<RwLock<Option<String>>>,
+    refresh_token: Arc<RwLock<Option<String>>>,
+    /// `std::sync::Mutex` (not the async one) so the hook can be installed
+    /// from `AuthManager::new`, which is not async.
+    refresh_hook: Arc<std::sync::Mutex<Option<RefreshHook>>>,
+    /// Serialises token exchanges: without it, several requests hitting 401 at
+    /// once would each spend the same rotated refresh token, and all but the
+    /// first would fail — logging the user out instead of renewing.
+    refresh_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// Local view of the auth response. The wire type
@@ -26,6 +40,48 @@ pub struct TokenResponse {
     pub refresh_token: Option<String>,
 }
 
+/// Sends a request and, on `401`, renews the access token once and replays it.
+///
+/// Implemented as an extension on `RequestBuilder` so every existing call site
+/// switches over by replacing `.send()` with `.send_refreshing(self)`, keeping
+/// the surrounding error handling untouched.
+trait SendRefreshing {
+    async fn send_refreshing(self, api: &ApiClient) -> reqwest::Result<reqwest::Response>;
+}
+
+impl SendRefreshing for reqwest::RequestBuilder {
+    async fn send_refreshing(self, api: &ApiClient) -> reqwest::Result<reqwest::Response> {
+        // Cloned before sending: `RequestBuilder` is consumed by `send`, and a
+        // streaming body cannot be cloned — such a request is simply not replayed.
+        let replay = self.try_clone();
+        let stale = api.token().await;
+
+        let resp = self.send().await?;
+        if resp.status() != StatusCode::UNAUTHORIZED {
+            return Ok(resp);
+        }
+
+        let (Some(replay), Some(renewed)) = (replay, api.renew_access_token(stale).await) else {
+            return Ok(resp);
+        };
+
+        // `bearer_auth` *appends*, and the clone already carries the stale
+        // header — two Authorization headers would just be rejected again.
+        // Build the request and overwrite the header instead.
+        let Ok(mut request) = replay.build() else {
+            return Ok(resp);
+        };
+        let Ok(value) = reqwest::header::HeaderValue::from_str(&format!("Bearer {renewed}")) else {
+            return Ok(resp);
+        };
+        request
+            .headers_mut()
+            .insert(reqwest::header::AUTHORIZATION, value);
+
+        api.client.execute(request).await
+    }
+}
+
 impl ApiClient {
     pub fn new(base_url: &str) -> Self {
         Self::with_insecure(base_url, false)
@@ -39,6 +95,9 @@ impl ApiClient {
                 .expect("Failed to build HTTP client"),
             base_url: Arc::new(RwLock::new(base_url.trim_end_matches('/').to_string())),
             token: Arc::new(RwLock::new(None)),
+            refresh_token: Arc::new(RwLock::new(None)),
+            refresh_hook: Arc::new(std::sync::Mutex::new(None)),
+            refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -56,6 +115,46 @@ impl ApiClient {
 
     pub async fn token(&self) -> Option<String> {
         self.token.read().await.clone()
+    }
+
+    /// Store the refresh token used to renew an expired access token.
+    pub async fn set_refresh_token(&self, token: Option<String>) {
+        *self.refresh_token.write().await = token;
+    }
+
+    /// Install the callback that persists rotated refresh tokens.
+    pub fn set_refresh_hook(&self, hook: RefreshHook) {
+        if let Ok(mut slot) = self.refresh_hook.lock() {
+            *slot = Some(hook);
+        }
+    }
+
+    /// Exchange the stored refresh token for a new access token.
+    ///
+    /// `stale` is the access token that just got rejected. While waiting for
+    /// the lock another task may already have renewed it — in that case the
+    /// current token differs from `stale` and is returned as-is, so only one
+    /// exchange happens per expiry.
+    async fn renew_access_token(&self, stale: Option<String>) -> Option<String> {
+        let _guard = self.refresh_lock.lock().await;
+
+        let current = self.token.read().await.clone();
+        if current != stale {
+            return current;
+        }
+
+        let refresh_token = self.refresh_token.read().await.clone()?;
+        let renewed = self.refresh(&refresh_token).await.ok()?;
+
+        if let Some(rotated) = renewed.refresh_token {
+            *self.refresh_token.write().await = Some(rotated.clone());
+            let hook = self.refresh_hook.lock().ok().and_then(|h| h.clone());
+            if let Some(hook) = hook {
+                hook(rotated);
+            }
+        }
+
+        Some(renewed.access_token)
     }
 
     async fn url(&self, path: &str) -> String {
@@ -145,7 +244,7 @@ impl ApiClient {
             .request_builder(reqwest::Method::POST, "/api/v1/tunnel/connect")
             .await
             .json(&serde_json::json!({"profile_id": profile_id}))
-            .send()
+            .send_refreshing(self)
             .await
             .context("Failed to connect tunnel")?;
 
@@ -163,7 +262,7 @@ impl ApiClient {
         let resp = self
             .request_builder(reqwest::Method::POST, "/api/v1/tunnel/disconnect")
             .await
-            .send()
+            .send_refreshing(self)
             .await
             .context("Failed to disconnect tunnel")?;
 
@@ -182,7 +281,7 @@ impl ApiClient {
             .request_builder(reqwest::Method::POST, "/api/v1/tunnel/reconnect")
             .await
             .json(&serde_json::json!({"profile_id": profile_id}))
-            .send()
+            .send_refreshing(self)
             .await
             .context("Failed to reconnect tunnel")?;
 
@@ -201,7 +300,7 @@ impl ApiClient {
             .request_builder(reqwest::Method::POST, "/api/v1/tunnel/challenge")
             .await
             .json(&serde_json::json!({"code": code}))
-            .send()
+            .send_refreshing(self)
             .await
             .context("Failed to submit challenge")?;
 
@@ -219,7 +318,7 @@ impl ApiClient {
         let resp = self
             .request_builder(reqwest::Method::GET, "/api/v1/tunnel/status")
             .await
-            .send()
+            .send_refreshing(self)
             .await
             .context("Failed to get tunnel status")?;
 
@@ -235,7 +334,7 @@ impl ApiClient {
         let resp = self
             .request_builder(reqwest::Method::GET, "/api/v1/profiles")
             .await
-            .send()
+            .send_refreshing(self)
             .await
             .context("Failed to list profiles")?;
 
@@ -255,7 +354,7 @@ impl ApiClient {
                 "name": name,
                 "config": config,
             }))
-            .send()
+            .send_refreshing(self)
             .await
             .context("Failed to create profile")?;
 
@@ -274,7 +373,7 @@ impl ApiClient {
             .request_builder(reqwest::Method::PUT, &format!("/api/v1/profiles/{}", id))
             .await
             .json(body)
-            .send()
+            .send_refreshing(self)
             .await
             .context("Failed to update profile")?;
 
@@ -292,7 +391,7 @@ impl ApiClient {
         let resp = self
             .request_builder(reqwest::Method::DELETE, &format!("/api/v1/profiles/{}", id))
             .await
-            .send()
+            .send_refreshing(self)
             .await
             .context("Failed to delete profile")?;
 
@@ -310,7 +409,7 @@ impl ApiClient {
         let resp = self
             .request_builder(reqwest::Method::GET, "/api/v1/routing/clients")
             .await
-            .send()
+            .send_refreshing(self)
             .await
             .context("Failed to list routing clients")?;
 
@@ -330,7 +429,7 @@ impl ApiClient {
                 "address": address,
                 "comment": comment,
             }))
-            .send()
+            .send_refreshing(self)
             .await
             .context("Failed to add routing client")?;
 
@@ -351,7 +450,7 @@ impl ApiClient {
                 &format!("/api/v1/routing/clients/{}", id),
             )
             .await
-            .send()
+            .send_refreshing(self)
             .await
             .context("Failed to remove routing client")?;
 
@@ -367,7 +466,7 @@ impl ApiClient {
         let resp = self
             .request_builder(reqwest::Method::GET, "/api/v1/routing/bypass")
             .await
-            .send()
+            .send_refreshing(self)
             .await
             .context("Failed to list routing bypass")?;
 
@@ -387,7 +486,7 @@ impl ApiClient {
                 "address": address,
                 "comment": comment,
             }))
-            .send()
+            .send_refreshing(self)
             .await
             .context("Failed to add routing bypass")?;
 
@@ -408,7 +507,7 @@ impl ApiClient {
                 &format!("/api/v1/routing/bypass/{}", id),
             )
             .await
-            .send()
+            .send_refreshing(self)
             .await
             .context("Failed to remove routing bypass")?;
 
@@ -424,7 +523,7 @@ impl ApiClient {
         let resp = self
             .request_builder(reqwest::Method::POST, "/api/v1/routing/setup")
             .await
-            .send()
+            .send_refreshing(self)
             .await
             .context("Failed to setup routing")?;
 
@@ -442,7 +541,7 @@ impl ApiClient {
         let resp = self
             .request_builder(reqwest::Method::DELETE, "/api/v1/routing/setup")
             .await
-            .send()
+            .send_refreshing(self)
             .await
             .context("Failed to teardown routing")?;
 
@@ -458,7 +557,7 @@ impl ApiClient {
         let resp = self
             .request_builder(reqwest::Method::GET, "/api/v1/routing/diagnostics")
             .await
-            .send()
+            .send_refreshing(self)
             .await
             .context("Failed to get routing diagnostics")?;
 
@@ -476,7 +575,7 @@ impl ApiClient {
         let resp = self
             .request_builder(reqwest::Method::GET, "/api/v1/users")
             .await
-            .send()
+            .send_refreshing(self)
             .await
             .context("Failed to list users")?;
 
@@ -502,7 +601,7 @@ impl ApiClient {
                 "role": role,
                 "comment": comment,
             }))
-            .send()
+            .send_refreshing(self)
             .await
             .context("Failed to create user")?;
 
@@ -521,7 +620,7 @@ impl ApiClient {
             .request_builder(reqwest::Method::PUT, &format!("/api/v1/users/{}", id))
             .await
             .json(updates)
-            .send()
+            .send_refreshing(self)
             .await
             .context("Failed to update user")?;
 
@@ -539,7 +638,7 @@ impl ApiClient {
         let resp = self
             .request_builder(reqwest::Method::DELETE, &format!("/api/v1/users/{}", id))
             .await
-            .send()
+            .send_refreshing(self)
             .await
             .context("Failed to delete user")?;
 
@@ -561,7 +660,7 @@ impl ApiClient {
             .json(&serde_json::json!({
                 "new_password": new_password,
             }))
-            .send()
+            .send_refreshing(self)
             .await
             .context("Failed to change user password")?;
 
@@ -577,7 +676,7 @@ impl ApiClient {
         let resp = self
             .request_builder(reqwest::Method::GET, "/api/v1/users/sessions")
             .await
-            .send()
+            .send_refreshing(self)
             .await
             .context("Failed to list sessions")?;
 
@@ -596,7 +695,7 @@ impl ApiClient {
                 &format!("/api/v1/users/sessions/{}", id),
             )
             .await
-            .send()
+            .send_refreshing(self)
             .await
             .context("Failed to kick session")?;
 
@@ -612,7 +711,7 @@ impl ApiClient {
         let resp = self
             .request_builder(reqwest::Method::GET, "/api/v1/users/me")
             .await
-            .send()
+            .send_refreshing(self)
             .await
             .context("Failed to get current user")?;
 
@@ -636,7 +735,7 @@ impl ApiClient {
                 "current_password": current_password,
                 "new_password": new_password,
             }))
-            .send()
+            .send_refreshing(self)
             .await
             .context("Failed to change password")?;
 
@@ -662,7 +761,7 @@ impl ApiClient {
         let resp = self
             .request_builder(reqwest::Method::GET, &path)
             .await
-            .send()
+            .send_refreshing(self)
             .await
             .context("Failed to get logs history")?;
 
@@ -732,5 +831,137 @@ mod tests {
             .await
             .build()
             .expect("builder must produce a request");
+    }
+}
+
+#[cfg(test)]
+mod refresh_tests {
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// A 401 on any authenticated call must transparently refresh the access
+    /// token and replay the original request with the new one — otherwise the
+    /// tray dies ~15 minutes after login (access TTL) and the user has to
+    /// re-authenticate by hand.
+    ///
+    /// The two `tunnel/status` mocks are keyed on the Authorization header, so
+    /// the test also pins that the replay carries the *new* token rather than
+    /// re-sending the stale one.
+    #[tokio::test]
+    async fn unauthorized_triggers_refresh_and_replays_request() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/tunnel/status"))
+            .and(header("authorization", "Bearer stale-token"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/v1/auth/refresh"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "fresh-token",
+                "refresh_token": "rotated-refresh"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/tunnel/status"))
+            .and(header("authorization", "Bearer fresh-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "connection": { "state": "Disconnected" }
+            })))
+            .mount(&server)
+            .await;
+
+        let api = ApiClient::new(&server.uri());
+        api.set_token(Some("stale-token".into())).await;
+        api.set_refresh_token(Some("stale-refresh".into())).await;
+
+        // The rotated refresh token must reach the owner so it can be persisted.
+        let captured: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
+        let sink = captured.clone();
+        api.set_refresh_hook(Arc::new(move |token| {
+            *sink.lock().unwrap() = Some(token);
+        }));
+
+        let status = api.tunnel_status().await.expect("status after refresh");
+        assert_eq!(status["connection"]["state"], "Disconnected");
+        assert_eq!(api.token().await.as_deref(), Some("fresh-token"));
+        assert_eq!(captured.lock().unwrap().as_deref(), Some("rotated-refresh"));
+    }
+
+    /// Concurrent requests that all hit 401 must trigger exactly ONE token
+    /// exchange. The server rotates refresh tokens, so a second exchange would
+    /// present an already-spent token, fail, and log the user out — precisely
+    /// what the renewal is supposed to prevent. The tray polls status while the
+    /// UI issues its own calls, so this overlap is the normal case, not an edge.
+    #[tokio::test]
+    async fn concurrent_unauthorized_requests_refresh_only_once() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/tunnel/status"))
+            .and(header("authorization", "Bearer stale-token"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/v1/auth/refresh"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "fresh-token",
+                "refresh_token": "rotated-refresh"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/tunnel/status"))
+            .and(header("authorization", "Bearer fresh-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "connection": { "state": "Disconnected" }
+            })))
+            .mount(&server)
+            .await;
+
+        let api = ApiClient::new(&server.uri());
+        api.set_token(Some("stale-token".into())).await;
+        api.set_refresh_token(Some("stale-refresh".into())).await;
+
+        let calls = (0..4).map(|_| {
+            let api = api.clone();
+            tokio::spawn(async move { api.tunnel_status().await })
+        });
+        for call in calls {
+            assert!(call.await.unwrap().is_ok(), "every caller must succeed");
+        }
+
+        // `expect(1)` on the refresh mock is asserted when the server drops.
+        drop(server);
+    }
+
+    /// Without a stored refresh token there is nothing to exchange, so the 401
+    /// must surface to the caller instead of silently looping.
+    #[tokio::test]
+    async fn unauthorized_without_refresh_token_surfaces_the_error() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/tunnel/status"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+
+        let api = ApiClient::new(&server.uri());
+        api.set_token(Some("stale-token".into())).await;
+
+        assert!(api.tunnel_status().await.is_err());
     }
 }

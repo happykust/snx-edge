@@ -3,7 +3,7 @@ use std::{
     sync::{Arc, Mutex, OnceLock},
 };
 
-use anyhow::{Context, bail};
+use anyhow::Context;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
@@ -27,8 +27,32 @@ pub struct AuthManager {
     server_url: String,
 }
 
+/// Persist a refresh token: eager cache update, then write-through to the
+/// keyring on a blocking thread.
+async fn persist_refresh_token(server_url: String, token: String) {
+    if let Ok(mut cache) = token_cache().lock() {
+        cache.insert(server_url.clone(), token.clone());
+    }
+
+    let _ = tokio::task::spawn_blocking(move || {
+        if let Ok(entry) = keyring::Entry::new("snx-edge", &server_url) {
+            let _ = entry.set_password(&token);
+        }
+    })
+    .await;
+}
+
 impl AuthManager {
     pub fn new(api: ApiClient, server_url: &str) -> Self {
+        // The client renews expired access tokens on its own; the server
+        // rotates the refresh token on every exchange, so the rotated one has
+        // to reach the keyring or the next cold start would have nothing valid
+        // to restore from.
+        let hook_url = server_url.to_string();
+        api.set_refresh_hook(Arc::new(move |rotated| {
+            tokio::spawn(persist_refresh_token(hook_url.clone(), rotated));
+        }));
+
         Self {
             api,
             server_url: server_url.to_string(),
@@ -43,6 +67,9 @@ impl AuthManager {
         let token_resp = self.api.login(username, password).await?;
         if let Some(refresh_token) = &token_resp.refresh_token {
             self.save_refresh_token(refresh_token).await;
+            self.api
+                .set_refresh_token(Some(refresh_token.clone()))
+                .await;
         }
         Ok(())
     }
@@ -53,24 +80,14 @@ impl AuthManager {
             .await
             .context("No saved refresh token")?;
         let token_resp = self.api.refresh(&refresh_token).await?;
-        if let Some(new_refresh) = &token_resp.refresh_token {
-            self.save_refresh_token(new_refresh).await;
-        }
-        Ok(())
-    }
 
-    pub async fn ensure_authenticated(&self) -> anyhow::Result<()> {
-        if self.api.token().await.is_some() {
-            // Check if token is still valid by trying status
-            if self.api.tunnel_status().await.is_ok() {
-                return Ok(());
-            }
+        let current = token_resp.refresh_token.clone().unwrap_or(refresh_token);
+        if token_resp.refresh_token.is_some() {
+            self.save_refresh_token(&current).await;
         }
-        // Try refresh
-        if self.refresh().await.is_ok() {
-            return Ok(());
-        }
-        bail!("Not authenticated — please log in");
+        // Hand it to the client so it can renew on its own from now on.
+        self.api.set_refresh_token(Some(current)).await;
+        Ok(())
     }
 
     pub async fn logout(&self) {
@@ -103,21 +120,7 @@ impl AuthManager {
     }
 
     async fn save_refresh_token(&self, token: &str) {
-        let server_url = self.server_url.clone();
-        let token_owned = token.to_string();
-
-        // Update cache eagerly so subsequent reads are instant.
-        if let Ok(mut cache) = token_cache().lock() {
-            cache.insert(server_url.clone(), token_owned.clone());
-        }
-
-        // Write through to keyring on a blocking thread.
-        let _ = tokio::task::spawn_blocking(move || {
-            if let Ok(entry) = keyring::Entry::new("snx-edge", &server_url) {
-                let _ = entry.set_password(&token_owned);
-            }
-        })
-        .await;
+        persist_refresh_token(self.server_url.clone(), token.to_string()).await;
     }
 
     async fn delete_saved_token(&self) {
