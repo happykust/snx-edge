@@ -32,3 +32,7 @@ Thumbs.db
 # LLM working documents (audit, specs, plans) — never committed.
 # docs/ is reserved for the GitHub Pages documentation site.
 docs-llm/
+
+# Agent working directories
+.claude/
+.superpowers/
