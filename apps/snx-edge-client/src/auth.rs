@@ -136,6 +136,16 @@ impl AuthManager {
         .await;
     }
 
+    /// Test-only: seed the in-memory token cache for a server URL. Used by
+    /// unit tests to verify the cache fast-path without touching the OS
+    /// keyring (which would prompt or fail in CI).
+    #[cfg(test)]
+    fn seed_cache_for_tests(server_url: &str, token: &str) {
+        if let Ok(mut cache) = token_cache().lock() {
+            cache.insert(server_url.to_string(), token.to_string());
+        }
+    }
+
     /// Decode the JWT payload to extract the user role (if present).
     pub async fn role(&self) -> Option<String> {
         let token = self.api.token().await?;
@@ -148,5 +158,63 @@ impl AuthManager {
         json.get("role")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::ApiClient;
+
+    /// Each test uses a unique server URL key so the process-wide cache
+    /// can be poked without inter-test interference. Using the test name
+    /// guarantees uniqueness without needing `serial_test`.
+    fn unique_url(suffix: &str) -> String {
+        format!("https://test-cache-{suffix}.invalid")
+    }
+
+    #[tokio::test]
+    async fn token_cache_hit_returns_value_without_keyring_call() {
+        // Seeding the cache directly bypasses the keyring entirely. If
+        // `load_saved_token` honours the cache, the seeded value comes
+        // back; if it skipped straight to keyring, the call would block
+        // or return None depending on host configuration. We assert the
+        // cache hit and accept that as proof of the fast-path.
+        let url = unique_url("hit");
+        AuthManager::seed_cache_for_tests(&url, "cached-token");
+
+        let api = ApiClient::new(&url);
+        let auth = AuthManager::new(api, &url);
+        let token = auth.load_saved_token().await;
+
+        assert_eq!(token.as_deref(), Some("cached-token"));
+    }
+
+    #[tokio::test]
+    async fn role_returns_none_without_token() {
+        let url = unique_url("role-none");
+        let api = ApiClient::new(&url);
+        let auth = AuthManager::new(api, &url);
+        // No token has been set on the underlying ApiClient.
+        assert!(auth.role().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn role_decodes_jwt_payload() {
+        // Construct a JWT with a known payload. We don't sign it — only the
+        // payload section is decoded by `role()`.
+        use base64::Engine;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"none","typ":"JWT"}"#);
+        let payload = URL_SAFE_NO_PAD.encode(br#"{"role":"admin","sub":"u1"}"#);
+        let token = format!("{header}.{payload}.sig");
+
+        let url = unique_url("role-admin");
+        let api = ApiClient::new(&url);
+        api.set_token(Some(token)).await;
+        let auth = AuthManager::new(api, &url);
+
+        assert_eq!(auth.role().await.as_deref(), Some("admin"));
     }
 }

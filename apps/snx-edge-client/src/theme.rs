@@ -125,3 +125,46 @@ async fn run_monitor(connection: &Connection) -> anyhow::Result<()> {
 fn is_ubuntu() -> bool {
     std::env::var("XDG_CURRENT_DESKTOP").is_ok_and(|v| v == "ubuntu:GNOME")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_preference_defaults_to_light() {
+        // Many desktops report `NoPreference` even when their visible theme
+        // is light; treating that as "dark" picks the wrong tray icon set.
+        assert!(!SystemColorTheme::NoPreference.is_dark());
+    }
+
+    #[test]
+    fn dark_returns_true() {
+        assert!(SystemColorTheme::Dark.is_dark());
+    }
+
+    #[test]
+    fn light_returns_false() {
+        assert!(!SystemColorTheme::Light.is_dark());
+    }
+
+    #[test]
+    fn try_from_known_values() {
+        assert_eq!(
+            SystemColorTheme::try_from(0u32).unwrap(),
+            SystemColorTheme::NoPreference
+        );
+        assert_eq!(
+            SystemColorTheme::try_from(1u32).unwrap(),
+            SystemColorTheme::Dark
+        );
+        assert_eq!(
+            SystemColorTheme::try_from(2u32).unwrap(),
+            SystemColorTheme::Light
+        );
+    }
+
+    #[test]
+    fn try_from_unknown_value_errors() {
+        assert!(SystemColorTheme::try_from(99u32).is_err());
+    }
+}

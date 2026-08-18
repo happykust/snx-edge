@@ -110,3 +110,69 @@ pub async fn create_profile(api: &ApiClient, name: &str, config: &Value) -> anyh
 pub async fn delete_profile(api: &ApiClient, id: &str) -> anyhow::Result<()> {
     api.delete_profile(id).await
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn add_profile_round_trips_through_serialize() {
+        // Build a profile, push it through `set_profiles`, serialize the
+        // value, and confirm round-trip equality. Catches a regression
+        // where a `#[serde(default)]` change on a field would silently
+        // drop data on read.
+        let store = ProfileStore::new();
+        let p = Profile {
+            id: "abc-123".into(),
+            name: "Work VPN".into(),
+            config: serde_json::json!({"server": "vpn.example.com"}),
+            enabled: true,
+        };
+        store.set_profiles(vec![p.clone()]);
+
+        let fetched = store.get(&p.id).expect("profile must be retrievable");
+        let json = serde_json::to_string(&fetched).expect("serialise");
+        let de: Profile = serde_json::from_str(&json).expect("deserialise");
+
+        assert_eq!(de.id, p.id);
+        assert_eq!(de.name, p.name);
+        assert_eq!(de.enabled, p.enabled);
+        assert_eq!(de.config, p.config);
+    }
+
+    #[test]
+    fn unique_id_per_profile() {
+        let store = ProfileStore::new();
+        let a = Profile {
+            id: "id-a".into(),
+            name: "A".into(),
+            ..Profile::default()
+        };
+        let b = Profile {
+            id: "id-b".into(),
+            name: "B".into(),
+            ..Profile::default()
+        };
+        store.set_profiles(vec![a.clone(), b.clone()]);
+
+        assert_eq!(store.all().len(), 2);
+        assert_eq!(store.get("id-a").map(|p| p.name), Some("A".to_string()));
+        assert_eq!(store.get("id-b").map(|p| p.name), Some("B".to_string()));
+        assert!(store.get("missing").is_none());
+    }
+
+    #[test]
+    fn connected_state_round_trips() {
+        let store = ProfileStore::new();
+        store.set_profiles(vec![Profile {
+            id: "p1".into(),
+            name: "X".into(),
+            ..Profile::default()
+        }]);
+        assert!(store.get_connected().is_none());
+        store.set_connected(Some("p1".into()));
+        assert_eq!(store.get_connected().map(|p| p.id), Some("p1".to_string()));
+        store.set_connected(None);
+        assert!(store.get_connected().is_none());
+    }
+}
