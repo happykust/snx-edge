@@ -1025,6 +1025,146 @@ async fn change_password_invalidates_existing_tokens() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
+/// Demoting a user must invalidate the tokens they already hold. Otherwise an
+/// admin stripped of their role keeps admin rights in every issued token until
+/// the access TTL runs out — the operator pressed the button, the privileges
+/// stayed.
+#[tokio::test]
+async fn demoting_a_user_invalidates_existing_tokens() {
+    let (app, admin_token, _dir) = setup().await;
+
+    app.clone()
+        .oneshot(auth_post(
+            "/api/v1/users",
+            &admin_token,
+            json!({"username": "mallory", "password": "mallorypass1", "role": "admin"}),
+        ))
+        .await
+        .unwrap();
+
+    let mallory_token = login_as(&app, "mallory", "mallorypass1").await;
+    let me = resp_json(
+        app.clone()
+            .oneshot(auth_get("/api/v1/users/me", &mallory_token))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let mallory_id = me["id"].as_str().unwrap().to_string();
+
+    // Demote admin -> viewer.
+    let resp = app
+        .clone()
+        .oneshot(auth_put(
+            &format!("/api/v1/users/{mallory_id}"),
+            &admin_token,
+            json!({"role": "viewer"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = app
+        .oneshot(auth_get("/api/v1/users/me", &mallory_token))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "a demoted user must not keep using tokens minted with the old role"
+    );
+}
+
+/// Disabling a user is the "revoke access now" button; it must not leave the
+/// disabled account working until its access token expires.
+#[tokio::test]
+async fn disabling_a_user_invalidates_existing_tokens() {
+    let (app, admin_token, _dir) = setup().await;
+
+    app.clone()
+        .oneshot(auth_post(
+            "/api/v1/users",
+            &admin_token,
+            json!({"username": "bob", "password": "bobpass1234", "role": "operator"}),
+        ))
+        .await
+        .unwrap();
+
+    let bob_token = login_as(&app, "bob", "bobpass1234").await;
+    let me = resp_json(
+        app.clone()
+            .oneshot(auth_get("/api/v1/users/me", &bob_token))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let bob_id = me["id"].as_str().unwrap().to_string();
+
+    let resp = app
+        .clone()
+        .oneshot(auth_put(
+            &format!("/api/v1/users/{bob_id}"),
+            &admin_token,
+            json!({"enabled": false}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = app
+        .oneshot(auth_get("/api/v1/users/me", &bob_token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// A rename or comment edit is not a privilege change — it must NOT log the
+/// user out, or routine admin housekeeping becomes hostile.
+#[tokio::test]
+async fn editing_a_comment_keeps_existing_tokens_valid() {
+    let (app, admin_token, _dir) = setup().await;
+
+    app.clone()
+        .oneshot(auth_post(
+            "/api/v1/users",
+            &admin_token,
+            json!({"username": "carol", "password": "carolpass12", "role": "operator"}),
+        ))
+        .await
+        .unwrap();
+
+    let carol_token = login_as(&app, "carol", "carolpass12").await;
+    let me = resp_json(
+        app.clone()
+            .oneshot(auth_get("/api/v1/users/me", &carol_token))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let carol_id = me["id"].as_str().unwrap().to_string();
+
+    let resp = app
+        .clone()
+        .oneshot(auth_put(
+            &format!("/api/v1/users/{carol_id}"),
+            &admin_token,
+            json!({"comment": "night shift"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = app
+        .oneshot(auth_get("/api/v1/users/me", &carol_token))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "a comment edit must not revoke the user's session"
+    );
+}
+
 /// `POST /users/{id}/revoke-tokens` is a pure generation bump — no other
 /// side effects on the user row or sessions table.
 #[tokio::test]

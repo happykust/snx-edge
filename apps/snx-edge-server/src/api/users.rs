@@ -121,6 +121,16 @@ async fn update_user(
             req.enabled,
         )
         .await?;
+
+    // `update_user` bumps the generation when privileges shrink. Refresh the
+    // cache so the revocation lands immediately instead of after the cache TTL
+    // — a 30-second window in which a demoted admin still administers.
+    if let Ok(generation) = state.db.get_token_generation(&id).await {
+        state
+            .refresh_token_generation_cache(&id, Some(generation))
+            .await;
+    }
+
     Ok(Json(user_to_response(&state.db, &user).await))
 }
 

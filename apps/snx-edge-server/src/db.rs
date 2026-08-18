@@ -360,9 +360,25 @@ impl UserDb {
             }
         }
 
+        // A privilege change must invalidate tokens already issued to this
+        // user: the role is baked into the JWT, so a demoted admin would keep
+        // administering until the access TTL expired, and a disabled account
+        // would keep working. Cosmetic edits (comment, or re-enabling) leave
+        // the generation alone so routine housekeeping does not log people out.
+        let privileges_reduced = new_role != user.role || (user.enabled && !new_enabled);
+
         conn.execute(
-            "UPDATE users SET role = ?1, comment = ?2, enabled = ?3, updated_at = ?4 WHERE id = ?5",
-            params![new_role, new_comment, new_enabled, now.to_rfc3339(), id],
+            "UPDATE users SET role = ?1, comment = ?2, enabled = ?3, updated_at = ?4,
+                    token_generation = token_generation + ?5
+             WHERE id = ?6",
+            params![
+                new_role,
+                new_comment,
+                new_enabled,
+                now.to_rfc3339(),
+                i64::from(privileges_reduced),
+                id
+            ],
         )?;
 
         drop(conn);
