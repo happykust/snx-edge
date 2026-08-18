@@ -152,3 +152,48 @@ pub fn routes() -> Router<AppState> {
         .route("/logs", get(logs_stream))
         .route("/logs/history", get(logs_history))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use proptest::prelude::*;
+
+    fn make_entry(msg: &str) -> LogEntry {
+        LogEntry {
+            timestamp: Utc::now(),
+            level: "info".into(),
+            target: String::new(),
+            message: msg.into(),
+        }
+    }
+
+    proptest! {
+        /// Invariants of the ring buffer regardless of capacity / push count:
+        ///   1. `last_n(usize::MAX).len()` is bounded by both capacity and
+        ///      total push count — no over-allocation, no over-counting.
+        ///   2. The most recently pushed entry is the last element of
+        ///      `last_n(1)` — i.e. ordering is chronological with the newest
+        ///      entry at the tail (this is the contract `last_n` documents).
+        #[test]
+        fn log_buffer_invariants(
+            capacity in 1usize..1000,
+            push_count in 0usize..2000,
+        ) {
+            let mut b = LogBuffer::new(capacity);
+            for i in 0..push_count {
+                b.push(make_entry(&i.to_string()));
+            }
+
+            let all = b.last_n(usize::MAX);
+            prop_assert!(all.len() <= capacity);
+            prop_assert!(all.len() <= push_count);
+
+            if push_count > 0 {
+                let tail = b.last_n(1);
+                prop_assert_eq!(tail.len(), 1);
+                prop_assert_eq!(tail[0].message.clone(), (push_count - 1).to_string());
+            }
+        }
+    }
+}
