@@ -8,11 +8,6 @@
 #
 # Before running, change all values marked CHANGE_ME.
 #
-# Requirements:
-#   - RouterOS 7.4+ with container support enabled
-#   - USB storage mounted (usb1) for container root and volumes
-#   - ARM64 or x86_64 architecture
-#
 # ============================================================
 
 # --- 1. Network Infrastructure ---
