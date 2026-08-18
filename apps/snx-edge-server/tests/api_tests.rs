@@ -1025,6 +1025,131 @@ async fn change_password_invalidates_existing_tokens() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
+/// Export and import are advertised as a pair, so the output of one must be
+/// accepted by the other. Nothing pinned that before, which is how the import
+/// path stayed broken.
+#[tokio::test]
+async fn profile_survives_an_export_import_round_trip() {
+    let (app, admin_token, _dir) = setup().await;
+
+    let created = resp_json(
+        app.clone()
+            .oneshot(auth_post(
+                "/api/v1/profiles",
+                &admin_token,
+                json!({
+                    "name": "round-trip",
+                    "config": { "server": "vpn.example.com", "login_type": "vpn_Microsoft_Entra_ID" }
+                }),
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let id = created["id"].as_str().unwrap().to_string();
+
+    let export_resp = app
+        .clone()
+        .oneshot(auth_get(
+            &format!("/api/v1/profiles/{id}/export"),
+            &admin_token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(export_resp.status(), StatusCode::OK);
+    let exported = axum::body::to_bytes(export_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let exported = String::from_utf8(exported.to_vec()).unwrap();
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/profiles/import")
+        .header("authorization", format!("Bearer {admin_token}"))
+        .header("content-type", "text/plain")
+        .body(Body::from(exported.clone()))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = resp_json(resp).await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "exported TOML must import back; export was:\n{exported}\nerror: {body}"
+    );
+}
+
+/// Control for the two import gate tests below: a well-formed import must
+/// actually succeed, otherwise those tests would pass for the wrong reason.
+#[tokio::test]
+async fn import_profile_accepts_a_valid_profile() {
+    let (app, admin_token, _dir) = setup().await;
+
+    let toml_body = "name = \"good\"\nserver = \"vpn.example.com\"\n";
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/profiles/import")
+        .header("authorization", format!("Bearer {admin_token}"))
+        .header("content-type", "text/plain")
+        .body(Body::from(toml_body))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = resp_json(resp).await;
+    assert_eq!(status, StatusCode::CREATED, "body was: {body}");
+}
+
+/// Import is just another door into the profile store, so it must pass the
+/// same gates as `create`. Previously a TOML import could set
+/// `no_cert_check = true` even with `security.allow_no_cert_check = false`,
+/// turning an import into a way to disable gateway certificate verification.
+#[tokio::test]
+async fn import_profile_enforces_no_cert_check_policy() {
+    let (app, admin_token, _dir) = setup().await;
+
+    let toml_body = r#"
+name = "smuggled"
+server = "vpn.example.com"
+no_cert_check = true
+"#;
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/profiles/import")
+        .header("authorization", format!("Bearer {admin_token}"))
+        .header("content-type", "text/plain")
+        .body(Body::from(toml_body))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "import must honour security.allow_no_cert_check"
+    );
+}
+
+/// The same applies to the required-field check: an imported profile without
+/// a server is unusable, and the failure should surface at import time.
+#[tokio::test]
+async fn import_profile_requires_a_server() {
+    let (app, admin_token, _dir) = setup().await;
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/profiles/import")
+        .header("authorization", format!("Bearer {admin_token}"))
+        .header("content-type", "text/plain")
+        .body(Body::from("name = \"no-server\"\n"))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
 /// `POST /server/info` makes the server dial an arbitrary host:port of the
 /// caller's choosing. With only `tunnel.status` required, a read-only viewer
 /// could use the router as a port scanner for the network behind it — so the

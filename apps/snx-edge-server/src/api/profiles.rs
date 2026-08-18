@@ -96,6 +96,39 @@ async fn list_profiles(
 }
 
 /// POST /api/v1/profiles
+/// Gates every profile must clear, whichever door it arrives through
+/// (`POST /profiles` or `POST /profiles/import`).
+async fn validate_profile_config(
+    state: &AppState,
+    config: &serde_json::Value,
+) -> Result<(), AppError> {
+    let Some(obj) = config.as_object() else {
+        return Err(AppError::BadRequest("config must be an object".to_string()));
+    };
+
+    if obj
+        .get("server")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .is_empty()
+    {
+        return Err(AppError::BadRequest(
+            "config.server is required".to_string(),
+        ));
+    }
+
+    if config_disables_cert_check(config) && !state.config.read().await.security.allow_no_cert_check
+    {
+        return Err(AppError::BadRequest(
+            "profiles cannot disable VPN server certificate verification \
+             (security.allow_no_cert_check is disabled)"
+                .to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
 async fn create_profile(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
@@ -107,32 +140,7 @@ async fn create_profile(
         ));
     }
 
-    // Validate required fields
-    if let Some(obj) = req.config.as_object() {
-        if obj
-            .get("server")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .is_empty()
-        {
-            return Err(AppError::BadRequest(
-                "config.server is required".to_string(),
-            ));
-        }
-    } else {
-        return Err(AppError::BadRequest("config must be an object".to_string()));
-    }
-
-    // Enforce the no_cert_check security policy.
-    if config_disables_cert_check(&req.config)
-        && !state.config.read().await.security.allow_no_cert_check
-    {
-        return Err(AppError::BadRequest(
-            "profiles cannot disable VPN server certificate verification \
-             (security.allow_no_cert_check is disabled)"
-                .to_string(),
-        ));
-    }
+    validate_profile_config(&state, &req.config).await?;
 
     let profile = state.db.create_profile(&req.name, &req.config).await?;
     let _ = state.event_tx.send(ServerEvent::ConfigChanged);
@@ -359,13 +367,17 @@ async fn import_profile(
         ));
     }
 
-    // Parse TOML input
-    let toml_value: toml::Value = body
+    // Parse TOML input.
+    //
+    // `toml::Value: FromStr` parses a single TOML *value*, not a document, so
+    // every well-formed profile file was rejected as "unexpected content".
+    // `toml::Table` is the document form.
+    let toml_table: toml::Table = body
         .parse()
         .map_err(|e| AppError::BadRequest(format!("invalid TOML: {e}")))?;
 
     // Convert TOML to JSON
-    let config: serde_json::Value = serde_json::to_value(&toml_value)
+    let config: serde_json::Value = serde_json::to_value(&toml_table)
         .map_err(|e| AppError::Internal(format!("failed to convert TOML to JSON: {e}")))?;
 
     // Extract profile name from TOML or use filename-derived default
@@ -383,7 +395,10 @@ async fn import_profile(
         config
     };
 
+    validate_profile_config(&state, &config).await?;
+
     let profile = state.db.create_profile(&name, &config).await?;
+    let _ = state.event_tx.send(ServerEvent::ConfigChanged);
     Ok((StatusCode::CREATED, Json(profile_to_response(profile))))
 }
 
@@ -457,5 +472,22 @@ mod tests {
         assert!(!config_disables_cert_check(&no));
         assert!(!config_disables_cert_check(&absent));
         assert!(!config_disables_cert_check(&other_type));
+    }
+}
+
+#[cfg(test)]
+mod toml_probe {
+    /// Pins how a TOML *document* must be parsed. `toml::Value: FromStr`
+    /// parses a single TOML value, not a document, so importing a normal
+    /// profile file through it fails with "unexpected content". Parsing into
+    /// `toml::Table` is the document form.
+    #[test]
+    fn document_parses_as_table_not_as_value() {
+        let doc = "name = \"good\"\nserver = \"vpn.example.com\"\n";
+        assert!(
+            doc.parse::<toml::Value>().is_err(),
+            "if this ever starts succeeding, the import path can be simplified"
+        );
+        assert!(doc.parse::<toml::Table>().is_ok());
     }
 }
