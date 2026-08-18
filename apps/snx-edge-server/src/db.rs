@@ -765,26 +765,81 @@ impl UserDb {
 pub use snx_edge_types::profiles::Profile;
 
 impl UserDb {
-    /// Decrypt a config blob in-place using the configured key, if any. When
-    /// the blob carries the `__enc_v` marker but no key is configured we log a
-    /// loud warning and return the JSON untouched — the read path keeps
-    /// working in degraded mode (downstream callers will see the encrypted
-    /// shape) which is preferable to bricking the API after a misconfigured
-    /// restart.
+    /// Decrypt a config blob in-place using the configured key, if any.
+    ///
+    /// A blob carrying the `__enc_v` marker with no key configured is an
+    /// error, not a degraded read: returning the ciphertext would send it down
+    /// the VPN connect path in place of the password. Startup already refuses
+    /// this combination (see `verify_profile_encryption`), so reaching here
+    /// means the key was removed while running.
     fn decrypt_in_place(&self, value: &mut serde_json::Value) -> Result<(), AppError> {
         if !crate::db_secrets::is_encrypted(value) {
             return Ok(());
         }
         match self.profile_key.as_deref() {
             Some(key) => crate::db_secrets::decrypt_profile_secrets(value, key),
-            None => {
-                tracing::warn!(
-                    "profile blob is encrypted but no profile key configured; \
-                     returning ciphertext"
-                );
-                Ok(())
-            }
+            None => Err(AppError::Internal(
+                "profile is encrypted but no profile encryption key is configured; \
+                 refusing to return ciphertext"
+                    .to_string(),
+            )),
         }
+    }
+
+    /// Boot-time canary: prove the configured key actually opens the stored
+    /// profiles before the server starts serving.
+    ///
+    /// Without this, a wrong or missing key surfaces much later and much
+    /// worse: the read path hands ciphertext to the VPN connect path as if it
+    /// were the password, and the operator sees an authentication failure
+    /// against the gateway with nothing pointing at the key. Legacy plaintext
+    /// rows (no `__enc_v` marker) are ignored — they re-encrypt on next write.
+    pub async fn verify_profile_encryption(&self) -> Result<(), AppError> {
+        let encrypted_blobs: Vec<(String, String)> = {
+            let conn = self.conn.lock().await;
+            let mut stmt = conn.prepare("SELECT id, config FROM profiles")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+
+            let mut out = Vec::new();
+            for row in rows {
+                let (id, raw) = row?;
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw)
+                    && crate::db_secrets::is_encrypted(&value)
+                {
+                    out.push((id, raw));
+                }
+            }
+            out
+        };
+
+        if encrypted_blobs.is_empty() {
+            return Ok(());
+        }
+
+        let Some(key) = self.profile_key.as_deref() else {
+            return Err(AppError::Internal(format!(
+                "{} stored VPN profile(s) are encrypted but no profile encryption key is \
+                 configured — set the key environment variable to the value used when they \
+                 were written, or the stored credentials cannot be read",
+                encrypted_blobs.len()
+            )));
+        };
+
+        for (id, raw) in &encrypted_blobs {
+            let mut value: serde_json::Value = serde_json::from_str(raw)
+                .map_err(|e| AppError::Internal(format!("profile {id} is not valid JSON: {e}")))?;
+            crate::db_secrets::decrypt_profile_secrets(&mut value, key).map_err(|_| {
+                AppError::Internal(format!(
+                    "the configured profile encryption key does not decrypt stored profile \
+                     {id} — it is the wrong key. Restore the original key; re-encrypting \
+                     with a new one requires the old key first"
+                ))
+            })?;
+        }
+
+        Ok(())
     }
 
     /// Inverse of `decrypt_in_place` for write paths. When no key is
@@ -1033,6 +1088,109 @@ fn parse_json_config(s: &str) -> rusqlite::Result<serde_json::Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Open a database at `path` with the given key and store one encrypted
+    /// profile in it.
+    async fn seed_encrypted_profile(path: &str, key: [u8; 32]) {
+        let db = UserDb::new_with_key(path, Some(key)).await.unwrap();
+        db.create_profile(
+            "corp",
+            &serde_json::json!({ "server": "vpn.example.com", "password": "s3cret" }),
+        )
+        .await
+        .unwrap();
+    }
+
+    /// Booting with the wrong key must fail loudly. Silently continuing hands
+    /// ciphertext to the VPN connect path as if it were the password: the
+    /// tunnel fails with a confusing auth error and the operator has no hint
+    /// that the key is the problem.
+    #[tokio::test]
+    async fn encryption_canary_rejects_a_mismatched_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("users.db");
+        let path = path.to_str().unwrap();
+
+        seed_encrypted_profile(path, [7u8; 32]).await;
+
+        let db = UserDb::new_with_key(path, Some([9u8; 32])).await.unwrap();
+        let err = db
+            .verify_profile_encryption()
+            .await
+            .expect_err("a mismatched key must be detected at boot");
+        assert!(
+            err.to_string().contains("profile encryption key"),
+            "error should name the key: {err}"
+        );
+    }
+
+    /// Same for a key that went missing entirely: the rows stay encrypted, so
+    /// starting up as if everything were fine is not an option.
+    #[tokio::test]
+    async fn encryption_canary_rejects_a_missing_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("users.db");
+        let path = path.to_str().unwrap();
+
+        seed_encrypted_profile(path, [7u8; 32]).await;
+
+        let db = UserDb::new_with_key(path, None).await.unwrap();
+        assert!(
+            db.verify_profile_encryption().await.is_err(),
+            "encrypted rows with no key configured must fail the canary"
+        );
+    }
+
+    #[tokio::test]
+    async fn encryption_canary_passes_with_the_right_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("users.db");
+        let path = path.to_str().unwrap();
+
+        seed_encrypted_profile(path, [7u8; 32]).await;
+
+        let db = UserDb::new_with_key(path, Some([7u8; 32])).await.unwrap();
+        db.verify_profile_encryption()
+            .await
+            .expect("matching key must pass");
+    }
+
+    /// A fresh install has nothing to check — the canary must not block it.
+    #[tokio::test]
+    async fn encryption_canary_passes_on_an_empty_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("users.db");
+        let db = UserDb::new_with_key(path.to_str().unwrap(), None)
+            .await
+            .unwrap();
+        db.verify_profile_encryption()
+            .await
+            .expect("empty db is ok");
+    }
+
+    /// Plaintext (pre-encryption) rows must keep working when a key is later
+    /// configured: they carry no `__enc_v` marker and are simply re-encrypted
+    /// on the next write.
+    #[tokio::test]
+    async fn encryption_canary_tolerates_legacy_plaintext_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("users.db");
+        let path = path.to_str().unwrap();
+
+        let db = UserDb::new_with_key(path, None).await.unwrap();
+        db.create_profile(
+            "legacy",
+            &serde_json::json!({ "server": "vpn.example.com" }),
+        )
+        .await
+        .unwrap();
+        drop(db);
+
+        let db = UserDb::new_with_key(path, Some([7u8; 32])).await.unwrap();
+        db.verify_profile_encryption()
+            .await
+            .expect("legacy plaintext rows must not trip the canary");
+    }
 
     #[test]
     fn parse_dt_returns_error_on_invalid_input() {

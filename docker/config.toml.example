@@ -81,6 +81,11 @@ allow_no_cert_check = false
 # isolated host — for anything reachable by other machines, configure
 # api.tls_cert / api.tls_key instead and set this back to false.
 allow_plaintext_api = true
+# Store VPN profile credentials unencrypted. Default `false`, and the server
+# REFUSES TO START without a profile encryption key: the profiles hold your
+# gateway password. Set SNX_EDGE_PROFILE_KEY (see docker/.env.example) rather
+# than flipping this on.
+# allow_plaintext_profiles = false
 # CIDRs whose peer_addr is trusted to set X-Forwarded-For / X-Real-IP.
 # Empty list (the default) means forwarded headers are never trusted.
 # trusted_proxies = ["127.0.0.1/32"]

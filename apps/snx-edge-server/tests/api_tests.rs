@@ -45,6 +45,12 @@ password_env = "ROUTEROS_PASSWORD"
 [logging]
 level = "info"
 buffer_size = 100
+
+[security]
+# The suite drives the plaintext-profile path directly; the encrypted path has
+# its own tests that set a key explicitly.
+allow_plaintext_profiles = true
+allow_plaintext_api = true
 "#,
         db_path.to_string_lossy()
     );
@@ -784,6 +790,10 @@ buffer_size = 100
 [security]
 login_rps = 1
 login_burst = 10
+# The suite drives the plaintext-profile path directly; the encrypted path has
+# its own tests that set a key explicitly.
+allow_plaintext_profiles = true
+allow_plaintext_api = true
 "#,
         db_path.to_string_lossy()
     );

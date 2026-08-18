@@ -60,6 +60,13 @@ pub struct SecurityConfig {
     #[serde(default)]
     pub allow_no_cert_check: bool,
 
+    /// Permit storing VPN profile credentials unencrypted. Default `false`:
+    /// without a profile encryption key the gateway passwords sit in the
+    /// SQLite file in cleartext, so the server refuses to start rather than
+    /// do that by omission.
+    #[serde(default)]
+    pub allow_plaintext_profiles: bool,
+
     /// Permit serving the management API over plain HTTP on a non-loopback
     /// address. Default `false`: logins and bearer tokens would otherwise
     /// cross the LAN in the clear, and the server refuses to start rather
@@ -111,6 +118,7 @@ impl Default for SecurityConfig {
         Self {
             allow_no_cert_check: false,
             allow_plaintext_api: false,
+            allow_plaintext_profiles: false,
             trusted_proxies: Vec::new(),
             login_rps: default_login_rps(),
             login_burst: default_login_burst(),

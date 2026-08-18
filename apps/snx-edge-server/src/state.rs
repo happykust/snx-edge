@@ -88,18 +88,28 @@ impl AppState {
         // operationally fine — secrets need re-encrypting anyway).
         let profile_key = config.profile_key()?;
 
+        if profile_key.is_none() && !config.security.allow_plaintext_profiles {
+            anyhow::bail!(
+                "no profile encryption key configured ({}): VPN gateway passwords would be \
+                 stored in the SQLite database in cleartext. Set the environment variable to a \
+                 32-byte base64/hex value, or set security.allow_plaintext_profiles = true to \
+                 accept plaintext storage deliberately.",
+                config.security.profile_encryption_key_env,
+            );
+        }
+
         if profile_key.is_none() {
-            // Soft warning: legacy plaintext mode is fine for backwards
-            // compatibility, but operators should know they're in it.
             tracing::warn!(
                 env = %config.security.profile_encryption_key_env,
-                "profile encryption key not set; storing VPN profile passwords as plaintext \
-                 in the SQLite database (set the env var with a 32-byte base64/hex value to \
-                 enable at-rest encryption)"
+                "storing VPN profile passwords as plaintext in the SQLite database \
+                 (security.allow_plaintext_profiles is enabled)"
             );
         }
 
         let db = UserDb::new_with_key(&config.auth.user_db, profile_key).await?;
+
+        // Prove the key opens what is already stored before serving traffic.
+        db.verify_profile_encryption().await?;
 
         // Initialize admin user from env if database is empty
         db.ensure_admin_exists().await?;

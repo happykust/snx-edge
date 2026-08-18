@@ -80,6 +80,14 @@ $EDITOR docker/.env
 
 `docker/.env` is gitignored; never commit real secrets. Compose will refuse to start if `SNX_EDGE_JWT_SECRET`, `ROUTEROS_HOST`, `ROUTEROS_USER`, or `ROUTEROS_PASSWORD` are missing.
 
+`SNX_EDGE_PROFILE_KEY` is required too — it encrypts the VPN gateway credentials stored in SQLite, and the server refuses to start without it:
+
+```bash
+openssl rand -base64 32   # put the result in docker/.env
+```
+
+Back that key up. Losing it makes existing profiles unreadable, and the server says so at startup instead of failing later with a confusing gateway authentication error.
+
 ### 4. Run
 
 ```bash
@@ -302,7 +310,7 @@ snx-edge handles VPN credentials, JWT signing material, and RouterOS admin crede
 Production hardening checklist (see `docker/config.toml.example` for full details):
 
 - `[security].allow_no_cert_check = false` — refuse profiles that disable certificate verification of the Check Point gateway.
-- `[security].profile_encryption_key_env = "SNX_EDGE_PROFILE_KEY"` — encrypt VPN credentials at rest in SQLite.
+- `[security].profile_encryption_key_env = "SNX_EDGE_PROFILE_KEY"` — encrypt VPN credentials at rest in SQLite. Required by default: the server refuses to start without a key unless `[security].allow_plaintext_profiles = true`, and it verifies at startup that the configured key actually decrypts the stored profiles.
 - `[api].tls_cert` / `[api].tls_key` — terminate TLS on the management API. Without them the server refuses to start on a non-loopback bind unless `[security].allow_plaintext_api = true` is set deliberately; half-configured TLS (cert without key, or client-CA settings with no TLS listener) is rejected at startup rather than silently downgraded.
 - `[api].tls_client_ca` — require client certificates (mTLS) when exposing the API beyond the local subnet.
 - Set strong `SNX_EDGE_JWT_SECRET` (>= 32 random bytes; generate with `openssl rand -base64 32`).
