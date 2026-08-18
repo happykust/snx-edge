@@ -28,3 +28,7 @@ docker/.env
 # OS
 .DS_Store
 Thumbs.db
+
+# LLM working documents (audit, specs, plans) — never committed.
+# docs/ is reserved for the GitHub Pages documentation site.
+docs-llm/
