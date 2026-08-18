@@ -31,21 +31,21 @@ Headless Check Point VPN client running inside a MikroTik container with a remot
 
 | Component | Description | Runtime |
 |---|---|---|
-| **snx-edge-server** | Headless VPN client + Management API | Docker on MikroTik (Alpine, ARM64) |
+| **snx-edge-server** | Headless VPN client + Management API | Container on MikroTik (Alpine; arm64, armv7, x86_64) |
 | **snx-edge-client** | Tray app for remote management | Linux desktop (x86_64, GTK4/libadwaita) |
 
 ## Hardware Requirements
 
 | Resource | Minimum | Recommended |
 |---|---|---|
-| CPU | ARMv8 (ARM64) or x86_64 | ARMv8 / x86_64 |
+| CPU | ARM64, ARMv7 (32-bit ARM), or x86_64 | ARM64 or x86_64 |
 | RAM | 256 MB free | 512 MB+ |
 | RouterOS | ≥7.23 stable with container support | ≥7.23 stable (7.22 breaks ip-rule for containers; ≤7.11 lacks TUN support) |
 | Storage | ~50 MB for image + config | 200 MB |
 
-ARMv7 is **not supported** — `snxcore`'s OpenSSL/SQLite stack requires a 64-bit toolchain. The server itself uses around 50 MB of RAM at idle; the rest is Alpine OS overhead, plus headroom for active VPN sessions.
+All three RouterOS container architectures are supported: `arm64`, `armv7` (32-bit ARM), and `x86_64`. The server uses around 50 MB of RAM at idle; the rest is Alpine OS overhead, plus headroom for active VPN sessions.
 
-Recommended MikroTik models: **hAP ax²**, **hAP ax³**, **RB4011** series, **CCR** series, and **CHR** virtual instances. Enable the `container` package and reboot before deploying.
+There is no supported-model list: RouterOS is the same across the range, so any device that runs the `container` package on one of the three architectures above will do — from a hAP ax² or L009 at home to an RB5009, a CCR, or a CHR instance. Enable the `container` package and reboot before deploying.
 
 ## Quick Start (Docker)
 
@@ -162,13 +162,39 @@ cargo build --release -p snx-edge-server
 cargo build --release -p snx-edge-client
 ```
 
-### Cross-compilation (ARM64 for MikroTik)
+### Cross-compilation for MikroTik
+
+`snxcore` pulls OpenSSL and SQLite, which need a full musl toolchain — use `cross`, not a bare
+`cargo build --target`.
 
 ```bash
-rustup target add aarch64-unknown-linux-musl
-cargo build --release --target aarch64-unknown-linux-musl -p snx-edge-server \
-  --features snxcore/vendored-openssl,snxcore/vendored-sqlite
+cargo install cross@0.2.5 --locked
+
+# arm64 — hAP ax², RB5009, CCR, …
+cross build --release -p snx-edge-server \
+  --target aarch64-unknown-linux-musl \
+  --features snx-edge-server/vendored-openssl
+
+# armv7 — 32-bit ARM: L009, hAP ac², …
+cross build --release -p snx-edge-server \
+  --target armv7-unknown-linux-musleabihf \
+  --features snx-edge-server/vendored-openssl
+
+# x86_64 — CHR and x86 routers
+cross build --release -p snx-edge-server \
+  --target x86_64-unknown-linux-musl \
+  --features snx-edge-server/vendored-openssl
 ```
+
+If Docker runs rootless (the default on Fedora and openSUSE), export
+`CROSS_ROOTLESS_CONTAINER_ENGINE=1` first — otherwise `cross` assumes a rootful daemon and the build
+fails with `failed to create directory /target/release: Permission denied`.
+
+When building several targets in a row locally, give each one its own target directory
+(`CARGO_TARGET_DIR=target-arm64`, …). The cross images ship different glibc versions, and host build
+scripts and proc-macros compiled inside one image will not run inside another — sharing a single
+`target/` produces confusing `GLIBC_2.28 not found` or `can't find crate` failures. CI is unaffected:
+each architecture builds in its own job with its own cache.
 
 ## Configuration
 

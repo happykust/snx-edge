@@ -1,6 +1,8 @@
 # Rust
 debug/
 target/
+# Per-target dirs used when cross-building several architectures locally
+target-*/
 **/*.rs.bk
 *.pdb
 
