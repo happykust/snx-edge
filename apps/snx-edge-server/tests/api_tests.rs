@@ -1025,6 +1025,65 @@ async fn change_password_invalidates_existing_tokens() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
+/// `POST /server/info` makes the server dial an arbitrary host:port of the
+/// caller's choosing. With only `tunnel.status` required, a read-only viewer
+/// could use the router as a port scanner for the network behind it — so the
+/// endpoint needs an operator-level permission.
+#[tokio::test]
+async fn server_info_is_not_available_to_viewers() {
+    let (app, admin_token, _dir) = setup().await;
+
+    app.clone()
+        .oneshot(auth_post(
+            "/api/v1/users",
+            &admin_token,
+            json!({"username": "vic", "password": "vicpass1234", "role": "viewer"}),
+        ))
+        .await
+        .unwrap();
+
+    let viewer_token = login_as(&app, "vic", "vicpass1234").await;
+
+    let resp = app
+        .oneshot(auth_post(
+            "/api/v1/server/info",
+            &viewer_token,
+            json!({"server": "vpn.example.com"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+/// Even for an operator, the target must not be an address inside the
+/// router's own network: that is the SSRF the endpoint would otherwise offer.
+#[tokio::test]
+async fn server_info_rejects_internal_targets() {
+    let (app, admin_token, _dir) = setup().await;
+
+    for target in [
+        "127.0.0.1",
+        "10.0.0.5:443",
+        "192.168.88.1",
+        "169.254.169.254",
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(auth_post(
+                "/api/v1/server/info",
+                &admin_token,
+                json!({ "server": target }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "internal target {target} must be rejected"
+        );
+    }
+}
+
 /// Demoting a user must invalidate the tokens they already hold. Otherwise an
 /// admin stripped of their role keeps admin rights in every issued token until
 /// the access TTL runs out — the operator pressed the button, the privileges
