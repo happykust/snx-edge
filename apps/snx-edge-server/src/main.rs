@@ -41,6 +41,10 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Must run before anything touches rustls: two providers are compiled in,
+    // and rustls panics rather than pick one on its own.
+    snx_edge_server::crypto::install_crypto_provider();
+
     let cli = Cli::parse();
     let config_path = cli.config;
 

@@ -1,5 +1,6 @@
 pub mod api;
 pub mod config;
+pub mod crypto;
 pub mod db;
 pub mod db_secrets;
 pub mod error;
