@@ -769,6 +769,7 @@ mod tests {
             },
             security: crate::config::SecurityConfig {
                 allow_no_cert_check: false,
+                allow_plaintext_api: true,
                 trusted_proxies: trusted.iter().map(|s| (*s).to_string()).collect(),
                 login_rps: 1,
                 login_burst: 10,

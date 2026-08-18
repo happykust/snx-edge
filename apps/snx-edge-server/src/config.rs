@@ -60,6 +60,13 @@ pub struct SecurityConfig {
     #[serde(default)]
     pub allow_no_cert_check: bool,
 
+    /// Permit serving the management API over plain HTTP on a non-loopback
+    /// address. Default `false`: logins and bearer tokens would otherwise
+    /// cross the LAN in the clear, and the server refuses to start rather
+    /// than do that silently. Loopback binds are unaffected.
+    #[serde(default)]
+    pub allow_plaintext_api: bool,
+
     /// CIDRs whose `peer_addr` is trusted to set `X-Forwarded-For` and
     /// `X-Real-IP`.  Empty (default) means **never** trust forwarded headers
     /// — the request's TCP peer is used verbatim for audit logging.
@@ -103,6 +110,7 @@ impl Default for SecurityConfig {
     fn default() -> Self {
         Self {
             allow_no_cert_check: false,
+            allow_plaintext_api: false,
             trusted_proxies: Vec::new(),
             login_rps: default_login_rps(),
             login_burst: default_login_burst(),
@@ -197,7 +205,71 @@ impl AppConfig {
             }
         }
 
+        config.validate()?;
+
         Ok(config)
+    }
+
+    /// Reject configurations whose transport security is ambiguous.
+    ///
+    /// Every branch here used to be a silent downgrade to plaintext: a
+    /// mistyped key path, or client-cert settings without a TLS listener,
+    /// produced a running server that looked configured and was not. Failing
+    /// at startup is the only honest outcome — the alternative is credentials
+    /// on the wire under the impression they are encrypted.
+    fn validate(&self) -> anyhow::Result<()> {
+        match (&self.api.tls_cert, &self.api.tls_key) {
+            (Some(_), None) => anyhow::bail!(
+                "api.tls_cert is set but api.tls_key is missing — TLS cannot be enabled \
+                 with only half the pair"
+            ),
+            (None, Some(_)) => anyhow::bail!(
+                "api.tls_key is set but api.tls_cert is missing — TLS cannot be enabled \
+                 with only half the pair"
+            ),
+            _ => {}
+        }
+
+        let tls_enabled = self.api.tls_cert.is_some() && self.api.tls_key.is_some();
+
+        if !tls_enabled {
+            if self.api.require_client_cert.is_some() {
+                anyhow::bail!(
+                    "api.require_client_cert is set without TLS — client certificates are \
+                     presented during a TLS handshake, so this can never take effect. \
+                     Configure api.tls_cert and api.tls_key."
+                );
+            }
+            if self.api.tls_client_ca_optional.is_some() {
+                anyhow::bail!(
+                    "api.tls_client_ca_optional is set without TLS — client certificates are \
+                     presented during a TLS handshake, so this can never take effect. \
+                     Configure api.tls_cert and api.tls_key."
+                );
+            }
+        }
+
+        // A plaintext listener reachable beyond the host publishes logins and
+        // bearer tokens. Permitted, but it has to be a decision on the record.
+        if !tls_enabled && !self.security.allow_plaintext_api {
+            let exposed = match self.api.listen.parse::<std::net::SocketAddr>() {
+                Ok(addr) => !addr.ip().is_loopback(),
+                // Unparseable now, fatal later in main — treat as exposed so
+                // the clearer error wins.
+                Err(_) => true,
+            };
+            if exposed {
+                anyhow::bail!(
+                    "api.listen ({}) is not loopback and TLS is not configured — logins and \
+                     bearer tokens would cross the network in cleartext. Configure \
+                     api.tls_cert/api.tls_key, bind to 127.0.0.1, or set \
+                     security.allow_plaintext_api = true to accept the risk deliberately.",
+                    self.api.listen
+                );
+            }
+        }
+
+        Ok(())
     }
 
     /// Persists the configuration to disk, preserving formatting and
@@ -556,6 +628,119 @@ fn set_str_array(doc: &mut toml_edit::DocumentMut, section: &str, key: &str, val
 mod tests {
     use super::*;
 
+    /// Minimal config text; callers splice in the `[api]` body they need.
+    fn config_with_api(api_body: &str, security_body: &str) -> String {
+        format!(
+            r#"
+[api]
+{api_body}
+
+[auth]
+jwt_secret_env = "X"
+user_db = "/tmp/x.db"
+
+[routeros]
+
+[logging]
+
+[security]
+{security_body}
+"#
+        )
+    }
+
+    fn load_from(text: &str) -> anyhow::Result<AppConfig> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, text).unwrap();
+        AppConfig::load(path.to_str().unwrap())
+    }
+
+    /// A half-configured TLS block used to silently start a plaintext
+    /// listener, so an operator who fumbled a path shipped credentials in the
+    /// clear while believing TLS was on. It must refuse to start instead.
+    #[test]
+    fn tls_cert_without_key_is_rejected() {
+        let err = load_from(&config_with_api(
+            r#"listen = "127.0.0.1:8080"
+tls_cert = "/etc/snx-edge/tls/server.crt""#,
+            "",
+        ))
+        .expect_err("cert without key must fail");
+        assert!(
+            err.to_string().contains("tls_key"),
+            "error must name the missing key: {err}"
+        );
+    }
+
+    #[test]
+    fn tls_key_without_cert_is_rejected() {
+        let err = load_from(&config_with_api(
+            r#"listen = "127.0.0.1:8080"
+tls_key = "/etc/snx-edge/tls/server.key""#,
+            "",
+        ))
+        .expect_err("key without cert must fail");
+        assert!(
+            err.to_string().contains("tls_cert"),
+            "error must name the missing cert: {err}"
+        );
+    }
+
+    /// Client-cert verification is meaningless without a TLS listener: there
+    /// is no handshake to present a certificate in.
+    #[test]
+    fn client_ca_without_tls_is_rejected() {
+        let err = load_from(&config_with_api(
+            r#"listen = "127.0.0.1:8080"
+require_client_cert = "/etc/snx-edge/tls/ca.crt""#,
+            "",
+        ))
+        .expect_err("mTLS without TLS must fail");
+        assert!(
+            err.to_string().contains("require_client_cert"),
+            "error must name the offending key: {err}"
+        );
+    }
+
+    /// Binding plaintext to a non-loopback address publishes logins and
+    /// bearer tokens to the LAN. Allowed, but only deliberately.
+    #[test]
+    fn plaintext_on_non_loopback_requires_opt_in() {
+        let err = load_from(&config_with_api(r#"listen = "0.0.0.0:8080""#, ""))
+            .expect_err("plaintext on a public bind must fail");
+        assert!(
+            err.to_string().contains("allow_plaintext_api"),
+            "error must point at the opt-in: {err}"
+        );
+
+        load_from(&config_with_api(
+            r#"listen = "0.0.0.0:8080""#,
+            "allow_plaintext_api = true",
+        ))
+        .expect("explicit opt-in must be accepted");
+    }
+
+    /// Loopback plaintext is the local-development and healthcheck case —
+    /// nothing leaves the host, so it stays allowed by default.
+    #[test]
+    fn plaintext_on_loopback_is_allowed() {
+        load_from(&config_with_api(r#"listen = "127.0.0.1:8080""#, ""))
+            .expect("loopback plaintext must be accepted");
+    }
+
+    #[test]
+    fn complete_tls_config_is_accepted() {
+        load_from(&config_with_api(
+            r#"listen = "0.0.0.0:8443"
+tls_cert = "/etc/snx-edge/tls/server.crt"
+tls_key = "/etc/snx-edge/tls/server.key"
+require_client_cert = "/etc/snx-edge/tls/ca.crt""#,
+            "",
+        ))
+        .expect("complete TLS + mTLS must be accepted");
+    }
+
     #[test]
     fn save_preserves_comments_in_existing_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -655,7 +840,12 @@ buffer_size = 100
                 max_file_size: "10MB".to_string(),
                 max_files: 3,
             },
-            security: SecurityConfig::default(),
+            // This test exercises the save/load round trip, not the network
+            // posture — the bind is 0.0.0.0, so opt in explicitly.
+            security: SecurityConfig {
+                allow_plaintext_api: true,
+                ..SecurityConfig::default()
+            },
             shutdown: ShutdownConfig::default(),
         };
 
